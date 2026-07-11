@@ -163,9 +163,24 @@ mod test_hooks {
     /// on 10GB cross-machine transfers -- made DETERMINISTIC on a 1MB localhost
     /// transfer. The sender then sits in AWAIT_ACK on a dead link (the corpse
     /// cascade). Models `premature_close` in proofs/transport_lifecycle_model.py.
-    /// No-op on default/release (compiled out).
+    /// No-op on default/release (compiled out). `=1` fires on EVERY completion;
+    /// `=once` fires exactly once then falls through to a normal ack -- so an `up`
+    /// daemon receiver (which stays alive) can be re-dialed and RECOVER (deliver on
+    /// the second attempt) instead of looping drop -> re-dial -> drop. The latch is
+    /// a process-global AtomicBool, mirroring corrupt_once.
     pub fn premature_close_after_ack() -> bool {
-        std::env::var("FILAMENT_TEST_PREMATURE_CLOSE").map(|v| v == "1").unwrap_or(false)
+        matches!(std::env::var("FILAMENT_TEST_PREMATURE_CLOSE").as_deref(), Ok("1") | Ok("once"))
+    }
+    static PREMATURE_FIRED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    pub fn premature_close_once() -> bool {
+        std::env::var("FILAMENT_TEST_PREMATURE_CLOSE").as_deref() == Ok("once")
+    }
+    pub fn premature_already_fired() -> bool {
+        PREMATURE_FIRED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn premature_mark_fired() {
+        PREMATURE_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// truncation/ack gate corruption injector. `FILAMENT_TEST_CORRUPT_RECV=<id>`
@@ -207,6 +222,9 @@ mod test_hooks {
     #[inline] pub fn drop_peer_left() -> bool { false }
     #[inline] pub fn suppress_delivery_ack() -> bool { false }
     #[inline] pub fn premature_close_after_ack() -> bool { false }
+    #[inline] pub fn premature_close_once() -> bool { false }
+    #[inline] pub fn premature_already_fired() -> bool { false }
+    #[inline] pub fn premature_mark_fired() {}
     #[inline] pub fn corrupt_recv_target() -> Option<String> { None }
 }
 
@@ -9595,12 +9613,19 @@ async fn recv_cmd(
                                         // lost on a healthy link, the sender must then end
                                         // UNCONFIRMED, never a false success. No-op on
                                         // default/release builds (hook compiled out).
-                                        if test_hooks::premature_close_after_ack() {
+                                        if test_hooks::premature_close_after_ack()
+                                            && !(test_hooks::premature_close_once() && test_hooks::premature_already_fired())
+                                        {
                                             // BUG-ACKLOSS reproducer: tear the link DOWN at the
                                             // instant the ack is due, so the sender never sees it
                                             // and its transport observes ApplicationClosed(0,"").
                                             // Deterministically reproduces the teardown race +
                                             // corpse cascade on a tiny transfer (no-op on release).
+                                            // In `=once` mode this fires only the FIRST time, so a
+                                            // daemon receiver recovers (delivers) on the re-dial.
+                                            if test_hooks::premature_close_once() {
+                                                test_hooks::premature_mark_fired();
+                                            }
                                             ui::say(&ui::paint(ui::Tone::Warn, &format!("    [test] {nm} PREMATURE-CLOSE at ack (reproducing ack-loss / corpse)")));
                                             conn.drop_link(&pid);
                                         } else if test_hooks::suppress_delivery_ack() {
