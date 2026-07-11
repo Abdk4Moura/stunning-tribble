@@ -92,20 +92,24 @@ link cleanly closed).
 spontaneous transport death* — the only deaths are the ones the code inflicts on
 itself). Over **all 2³ fix combinations**:
 
-> **The lifecycle is correct ⟺ `role ∧ (teardown ∨ guard)`.**
+> **The lifecycle is correct ⟺ `role ∧ teardown`.**
 
-That is: you need a dialer, **and** you must either *avoid* the self-inflicted
-death (correct teardown) **or** *recover* from it (liveness-aware re-dial).
-`role` and `(teardown ∨ guard)` are each **necessary**; together they are
-**sufficient**. `teardown` is the primary fix (clean, direct, zero detours);
-`guard` is the safety net.
+That is: you need a dialer, **and** the receiver must not drop its own link at the
+ack (correct teardown). `guard` does **not** rescue GoodNet — this is the subtle
+part, confirmed against a live 5 GB run (the model *predicted* `teardown ∨ guard`
+until reality falsified it). When the receiver closes prematurely it is **done**:
+it will not re-accept, so the sender's re-dial has no peer to answer ("peer did
+not come back within 45 s"). `guard` can only recover a link killed by a *real
+fault* where the receiver is still present — not a self-inflicted receiver-gone
+close. So under GoodNet `teardown` is **necessary even with `guard` on**.
 
 **Tier 1 — Degraded** (GoodNet minus reliability: up to *K* genuine mid-transfer
-transport deaths — real NAT rebind / drop):
+transport deaths — real NAT rebind / drop, *receiver still present*):
 
 > With real drops, **`guard` becomes independently necessary** — correct teardown
-> cannot resurrect a transport the *network* killed. With all fixes on, the
-> lifecycle **self-heals** to the clean terminal in bounded steps.
+> cannot resurrect a transport the *network* killed, but the receiver is still
+> there to answer a re-dial. All fixes on → the lifecycle **self-heals** to the
+> clean terminal in bounded steps. Net: `role ∧ teardown ∧ guard`.
 
 Exhaustive over a bounded model = a definitive result for that bound: the checker
 finds **every** corpse / lost-ack / stuck state, not just one we tripped over.
@@ -113,14 +117,17 @@ finds **every** corpse / lost-ack / stuck state, not just one we tripped over.
 ### Latest result
 
 ```
-GoodNet   role+guard+teardown   -> PROVEN (24 states)     | theorem clean <=> role∧(teardown∨guard): holds on all 8
+GoodNet   role+teardown         -> PROVEN (24 states)     | theorem clean <=> role∧teardown: holds on all 8
+GoodNet   role+guard (no teardown) -> COUNTEREXAMPLE       | guard can't rescue a receiver-gone close (matches live 5GB run)
 Degraded  all fixes, K=1        -> PROVEN (67 states)     | guard independently necessary (drop it -> counterexample)
 Degraded  all fixes, K=2        -> PROVEN (110 states)
 ```
 
-The exact counterexample the checker replays for the buggy config is the bug we
-hit: `dial → up → offer → accept → deliver&verify → send_ack → premature_close`
-⇒ `T=DEAD, X=AWAIT_ACK` — stuck, "delivery not confirmed".
+The exact counterexample the checker replays: `dial → up → offer → accept →
+deliver&verify → send_ack → premature_close` ⇒ `T=DEAD, X=AWAIT_ACK, rx_gone` —
+stuck, "delivery not confirmed", **even with the liveness guard on**. That
+`rx_gone` (receiver tore down its own link and is gone) is the faithfulness fix
+that made the model agree with the live system.
 
 ## 4. State ↔ code
 

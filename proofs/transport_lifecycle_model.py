@@ -91,15 +91,20 @@ IN_FLIGHT = {X_OFFERED, X_STREAM, X_AWAIT}   # a transfer needing a live transpo
 R_IDLE, R_RECV, R_VERIFIED, R_ACKED, R_DONE = \
     'R_IDLE', 'R_RECV', 'R_VERIFIED', 'R_ACKED', 'R_DONE'
 
-# A state: (T, X, R, ack, ep, fb)
-#   ack  delivery-ack bytes on the wire, not yet consumed by the sender (0/1)
-#   ep   which of the two back-to-back transfers we are in (1 or 2)
-#   fb   remaining fault budget (Degraded tier); 0 under GoodNet
-State = namedtuple('State', 'T X R ack ep fb')
+# A state: (T, X, R, ack, ep, fb, rx_gone)
+#   ack     delivery-ack bytes on the wire, not yet consumed by the sender (0/1)
+#   ep      which of the two back-to-back transfers we are in (1 or 2)
+#   fb      remaining fault budget (Degraded tier); 0 under GoodNet
+#   rx_gone the receiver tore down its OWN link and is DONE (premature_close): it
+#           will not re-accept, so the sender cannot re-establish. Distinguishes a
+#           SELF-INFLICTED close (unrecoverable by re-dial) from a real FAULT
+#           (receiver still present -> re-dialable). This is the faithfulness fix
+#           that made the model match the live 5GB result -- see can_redial_dead.
+State = namedtuple('State', 'T X R ack ep fb rx_gone')
 
 
 def initial(fb):
-    return State(T_NONE, X_IDLE, R_IDLE, 0, 1, fb)
+    return State(T_NONE, X_IDLE, R_IDLE, 0, 1, fb, False)
 
 
 # The FINAL good terminal: BOTH transfers delivered+verified and the link cleanly
@@ -116,10 +121,19 @@ def can_dial_fresh(s, cfg):
 
 
 def can_redial_dead(s, cfg):
-    """Re-dial a link whose transport DIED while a transfer is in flight. This is
-    the corpse-recovery path. The BUGGY guard blocks it (a link entry exists ->
-    start_direct_inner early-returns); the liveness-aware guard allows it."""
-    return cfg.role and cfg.guard
+    """Re-dial a link whose transport DIED while a transfer is in flight (corpse
+    recovery). The BUGGY guard blocks it (a link entry exists -> start_direct_inner
+    early-returns); the liveness-aware guard allows it.
+
+    CRITICAL faithfulness fix (confirmed against the live 5GB run, xats event 42):
+    a receiver that tore down its OWN link and is DONE (premature_close, rx_gone)
+    cannot be re-dialed -- there is no peer left to answer the re-offer ("peer did
+    not come back within 45s"). Only a link killed by a real FAULT (receiver still
+    present, rx_gone == False) is re-dialable. So `guard` CANNOT rescue a
+    self-inflicted receiver-gone close; only correct `teardown` (not closing in the
+    first place) can. This is why guard-alone passes GoodNet in the OLD model but
+    FAILS the live premature-close case."""
+    return cfg.role and cfg.guard and not s.rx_gone
 
 
 def successors(s, cfg):
@@ -172,9 +186,11 @@ def successors(s, cfg):
     # NORMAL transition (no fault budget): on a PERFECT link this is entirely
     # self-inflicted by the code.
     if (not cfg.teardown) and s.R == R_ACKED and s.T == T_LIVE and s.X == X_AWAIT:
-        # If the ack hadn't been read yet, it is now lost (ack -> 0); the shared
-        # connection is gone, so from the sender's view the transport is DEAD.
-        add('premature_close', T=T_DEAD, ack=0)
+        # The receiver closes right after acking. The ack is lost (ack -> 0), the
+        # shared connection dies (sender's transport -> DEAD), AND the receiver is
+        # DONE: it will not re-accept, so the sender cannot re-establish (rx_gone).
+        # Only NOT closing (the teardown fix) avoids this -- guard cannot recover it.
+        add('premature_close', T=T_DEAD, ack=0, rx_gone=True)
 
     # =========================================================== clean teardown
     # The party that READ the last message closes. The last message is the
@@ -352,23 +368,25 @@ if __name__ == '__main__':
     ok = True
 
     # ---- Tier 0: GoodNet necessity matrix -- ALL 2^3 fix combinations --------
-    # THEOREM (GoodNet): the lifecycle is correct  IFF  role AND (teardown OR guard).
+    # THEOREM (GoodNet): the lifecycle is correct  IFF  role AND teardown.
     #   role      -- someone must dial, or no transport ever comes up (BUG-ROLE).
-    #   teardown  -- correct close = no SELF-INFLICTED death, so the ack always
-    #                lands (BUG-ACKLOSS avoided at the source).
-    #   guard     -- liveness-aware re-dial RECOVERS a death after the fact.
-    # On a perfect link the only deaths are self-inflicted, so EITHER avoiding
-    # them (teardown) OR recovering from them (guard) suffices -- but you need at
-    # least one, plus a dialer. The checker verifies this predicate on all 8.
+    #   teardown  -- correct close = the receiver does NOT drop its own link, so no
+    #                self-inflicted death and the ack always lands (BUG-ACKLOSS).
+    # `guard` does NOT rescue GoodNet: on a perfect link the only death is the
+    # self-inflicted premature_close, after which the RECEIVER is gone (rx_gone)
+    # and cannot be re-dialed -- guard has no peer to reconnect to. (Confirmed
+    # against the live 5GB run, xats event 42: "guard alone passes baseline, fails
+    # premature-close".) guard earns its necessity only under Degraded (real
+    # faults, receiver still present). The checker verifies this on all 8.
     print("\n[Tier 0: GoodNet -- perfect DO<->DO link, only self-inflicted deaths]")
-    print("THEOREM: clean  <=>  role AND (teardown OR guard).  Verifying all 8:")
+    print("THEOREM: clean  <=>  role AND teardown.  Verifying all 8:")
     goodnet = {}
     for role, guard, teardown in product((True, False), repeat=3):
         cfg = Cfg(role, guard, teardown)
         r, _ = check(cfg, 0, 'GoodNet')
         goodnet[cfg] = r
         clean = banner(r)
-        predicted = cfg.role and (cfg.teardown or cfg.guard)
+        predicted = cfg.role and cfg.teardown
         if clean != predicted:
             print(f"        !! THEOREM VIOLATED: predicted clean={predicted}, got {clean}")
             ok = False
@@ -378,15 +396,18 @@ if __name__ == '__main__':
     # Necessity corollaries that MUST hold under GoodNet:
     print("\nnecessity under GoodNet:")
     role_off = not is_clean(goodnet[ALLFIX._replace(role=False)])
-    both_off = not is_clean(goodnet[Cfg(True, False, False)])
-    print(f"  role is necessary (drop role -> break)           : {role_off}")
-    print(f"  (teardown OR guard) necessary (drop both -> break): {both_off}")
-    ok &= role_off and both_off
+    # teardown necessary EVEN WITH guard on: guard cannot rescue a receiver-gone close.
+    teardown_off = not is_clean(goodnet[ALLFIX._replace(teardown=False)])
+    print(f"  role is necessary (drop role -> break)                 : {role_off}")
+    print(f"  teardown necessary even WITH guard (guard can't rescue): {teardown_off}")
+    ok &= role_off and teardown_off
 
     # ---- illustrative counterexample traces (the actual bugs) ----------------
-    print_trace(goodnet[Cfg(True, False, False)],
-                lambda s: s.T == T_DEAD and s.X == X_AWAIT,
-                "BUG-ACKLOSS -> BUG-CORPSE (buggy teardown + existence-guard)")
+    # guard ON, teardown OFF: guard STILL cannot recover -- the money shot matching
+    # the live premature-close result (receiver gone -> no re-dial possible).
+    print_trace(goodnet[Cfg(True, True, False)],
+                lambda s: s.T == T_DEAD and s.X == X_AWAIT and s.rx_gone,
+                "BUG-ACKLOSS: guard ON but receiver GONE -> unrecoverable (needs teardown)")
     print_trace(goodnet[Cfg(False, True, True)],
                 lambda s: s.T == T_NONE and s.X == X_IDLE and len(successors(s, Cfg(False, True, True))) == 0,
                 "BUG-ROLE (nobody dials; no transport ever comes up)")
