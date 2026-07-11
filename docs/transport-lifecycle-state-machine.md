@@ -141,9 +141,29 @@ that made the model agree with the live system.
 | `role` | `net::polite_role` (CONTRACT.md "newer initiates") |
 | aggregate liveness | `detect_stall` `min(idle)` over primary + workers (multi-stream) — `T=LIVE` abstracts "alive if ANY connection moved a byte" |
 
+## Honest boundary (a transition the model assumes the code must guarantee)
+
+The `premature_close`/`transport_dies` transitions assume that closing/dropping a
+link **actually tears the connection down** (`T → DEAD`, observed by the peer as
+`ConnectionLost`). The code must make that true. A known way it is *not* true: a
+detached keepalive task that clones the `quinn::Connection` (`direct.rs`
+`keep_endpoint_alive`, and the per-worker `pending()` endpoint keeps) **outlives**
+the `DirectTransport`, so `drop_link` drops the transport but the connection keeps
+pinging and never closes — a **zombie** (alive at the transport, no data), the
+verify-before-accept / silence-watchdog "zombie link" class, *not* the modeled
+`T=DEAD`. Recovery
+gates on `is_dead()`, which stays false, so it never fires. Two things keep reality
+faithful to the model here: (1) the teardown path must use an **explicit**
+`conn.close(0, "done")` (which closes regardless of stray clones), not a bare drop;
+and (2) the keepalive must be **abortable** — own the endpoint/connection in the
+`Link` (lifetime = the Link) or store its `JoinHandle` and abort it in `drop_link`
+— so a drop-based teardown also produces a real `ConnectionLost`. Until both hold,
+a `drop_link` can silently leak the connection instead of reaching `T=DEAD`.
+
 ## Discipline
 
 A change to the transport lifecycle (`start_direct_inner`, the teardown path, the
-role assignment, `detect_stall`) must keep this proof green. If you change the
-FSM, update `proofs/transport_lifecycle_model.py` + this table **first**, then
-make CI pass — the same model-first rule the establishment proof enforces.
+role assignment, `detect_stall`, the keepalive ownership) must keep this proof
+green. If you change the FSM, update `proofs/transport_lifecycle_model.py` + this
+table **first**, then make CI pass — the same model-first rule the establishment
+proof enforces.
