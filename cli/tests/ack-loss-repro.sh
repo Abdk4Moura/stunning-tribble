@@ -84,12 +84,24 @@ else
   tail -n 4 "$WORK/baseline-send.log"; exit 2
 fi
 
-# 3. premature-close: receiver drops the link at the ack -> reproduce the loss.
+# 3. premature-close: receiver drops its link at the ack. NOTE the receiver here
+#    is `recv`, which then EXITS -> the receiver VANISHES (rx_gone in the model).
+#    Per proofs/transport_lifecycle_model.py a vanished peer CANNOT be recovered,
+#    so the CORRECT outcome is a PROMPT clean "not confirmed" (the sender detects
+#    the dead connection), NOT "delivered". The BUG is a HANG: the keepalive leak
+#    (a detached task holding a Connection clone) means is_dead() never fires, so
+#    the sender waits out the whole P4 no-ack window. So the signal here is
+#    PROMPTNESS, not delivery. (True recovery -> delivered needs a receiver that
+#    STAYS ALIVE; use an `up` daemon receiver -- ROBUST mode, exercise once the
+#    abortable-keepalive + wait_idle fix lands.)
+t0=$SECONDS
 round "FILAMENT_TEST_PREMATURE_CLOSE=1" premature || exit 2
+dt=$((SECONDS - t0))
 if confirmed "$WORK/premature-send.log"; then
-  echo "  premature-close at ack    : delivered anyway       [ROBUST -- fix present]"
+  echo "  premature-close (recv)    : delivered (${dt}s)      [receiver recovered -- unexpected for a vanishing recv]"
 else
-  echo "  premature-close at ack    : NOT confirmed          [REPRODUCED -- bug present]"
-  echo "    sender tail:"; grep -iE "confirm|ack|closed|lost|stall|delivered|corpse" "$WORK/premature-send.log" | tail -n 4 | sed 's/^/      /'
+  echo "  premature-close (recv)    : not confirmed (${dt}s)  [correct for a vanished receiver]"
+  echo "    want PROMPT (sender detected the dead conn); a full-window time = the keepalive-leak HANG."
+  grep -iE "confirm|closed|lost|dead|stall|repair|corpse" "$WORK/premature-send.log" | tail -n 4 | sed 's/^/      /'
 fi
 echo "== done (1 MB, localhost, deterministic) =="
