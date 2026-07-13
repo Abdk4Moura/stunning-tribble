@@ -3216,7 +3216,17 @@ pub(crate) fn ssh_transport_args(info: &PeerSshInfo, server: &str, peer: &str, r
     args
 }
 
+/// Build the L3 direct destination for sshfs/rsync (login@peer.mesh). The mesh
+/// overlay (TUN) and its `.mesh` MagicDNS entries are Linux-only, so on other
+/// platforms there is no L3 path: return `None` and let the caller fall back to
+/// the L2 tunnel (same semantics as "peer isn't on the mesh").
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn l3_dest(_info: &PeerSshInfo) -> Option<String> {
+    None
+}
+
 /// Build the L3 direct destination for sshfs/rsync (login@peer.mesh).
+#[cfg(target_os = "linux")]
 pub(crate) fn l3_dest(info: &PeerSshInfo) -> Option<String> {
     let peer = info.host.strip_prefix("filament-").unwrap_or(&info.host);
     let (mesh_host, addr) = l3_mesh_addr(peer, info.rport)?;
