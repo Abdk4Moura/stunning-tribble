@@ -6146,21 +6146,31 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
         }
         out.ok_or_else(|| anyhow!("{inner} not found in archive"))?
     } else {
-        bail!("zip self-update not supported yet; download {base}/{asset} manually");
+        // Windows: unpack the .zip archive. Use the zip crate for a pure-Rust
+        // reader (no system dependency on tar/powershell).
+        use std::io::Read;
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes))
+            .map_err(|e| anyhow!("zip reader: {e}"))?;
+        let mut found = None;
+        for i in 0..archive.len() {
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| anyhow!("zip entry {i}: {e}"))?;
+            if entry.name().ends_with(inner) {
+                let mut v = Vec::new();
+                entry.read_to_end(&mut v)?;
+                found = Some(v);
+                break;
+            }
+        }
+        found.ok_or_else(|| anyhow!("{inner} not found in zip archive"))?
     };
 
-    // Atomic replace: write next to the current exe, then rename over it.
+    // Atomic replace: write staging file next to current exe, then swap.
     let me = std::env::current_exe()?;
     let staging = me.with_extension("update-staging");
     std::fs::write(&staging, &new_bin)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))?;
-    }
-    // Preserve any CAP_NET_ADMIN grant across the update: replacing the binary
-    // drops the file capability, which would silently break L3 on a non-root
-    // daemon until a manual re-setcap. If the OLD binary carried it, re-apply it.
+    // Preserve any CAP_NET_ADMIN grant across the update (Linux only).
     #[cfg(target_os = "linux")]
     let had_cap = std::process::Command::new("getcap")
         .arg(&me)
@@ -6168,7 +6178,26 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("cap_net_admin"))
         .unwrap_or(false);
-    std::fs::rename(&staging, &me).with_context(|| format!("replacing {}", me.display()))?;
+    // On Unix, rename over the running binary (the kernel keeps the old inode
+    // alive for the running process). On Windows, rename the running exe out of
+    // the way first (MoveFile on the same volume succeeds even on an in-use .exe),
+    // then put the new binary in place. The .old file is cleaned up on next update.
+    #[cfg(windows)]
+    {
+        let old = me.with_extension("old");
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(&me, &old)
+            .with_context(|| format!("renaming {} -> {}", me.display(), old.display()))?;
+        std::fs::rename(&staging, &me)
+            .with_context(|| format!("installing new {}", me.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::rename(&staging, &me)
+            .with_context(|| format!("replacing {}", me.display()))?;
+    }
     println!("updated to {latest_ver} -> {}", me.display());
     #[cfg(target_os = "linux")]
     if had_cap {
