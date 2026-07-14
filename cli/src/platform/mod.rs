@@ -334,8 +334,10 @@ impl ServiceHost {
             }
             #[cfg(target_os = "windows")]
             ServiceHost::WindowsService => {
+                // Quote the exe inside binPath so a spaced install path (e.g.
+                // C:\Program Files\...) is parsed as one program, not split.
                 let status = std::process::Command::new("sc")
-                    .args(["create", "filament", "binPath=", &format!("{} up{}", exe.display(), shell_args),
+                    .args(["create", "filament", "binPath=", &format!("\"{}\" up{}", exe.display(), shell_args),
                            "start=", "auto", "obj=", "LocalSystem"])
                     .status()?;
                 if !status.success() {
@@ -360,7 +362,7 @@ impl ServiceHost {
 </plist>"#,
                     exe.display(), shell_args
                 ))?;
-                let _ = std::process::Command::new("launchctl").args(["bootstrap", "system", plist]).status();
+                let _ = std::process::Command::new("launchctl").args(["bootstrap", "system"]).arg(plist).status();
             }
             _ => anyhow::bail!("system install not supported"),
         }
@@ -543,7 +545,7 @@ fn install_launch_agent(exe: &Path, shell_args: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn add_firewall_rule(exe: &Path) {
+pub fn add_firewall_rule(exe: &Path) {
     let _ = std::process::Command::new("netsh")
         .args(["advfirewall", "firewall", "add", "rule",
             "name=Filament QUIC", "dir=in", "action=allow",

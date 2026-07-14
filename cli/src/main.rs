@@ -2047,7 +2047,7 @@ async fn up_cmd(
             }
         }
         #[cfg(target_os = "windows")]
-        add_firewall_rule(&exe);
+        platform::add_firewall_rule(&exe);
         return Ok(());
     }
     if let Some(pid) = daemon_alive() {
