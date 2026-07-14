@@ -141,8 +141,17 @@ This is the whole answer to "kernelspace on Windows without much ado": the user
 never touches wintun or Administrator; the LocalSystem service creates the adapter
 for them. Requirements:
 
-- **Self-elevate the install step only** (UAC relaunch on Windows, pkexec/sudo on
-  Linux). After install, nothing needs elevation.
+- **Elevate with a GUI prompt, and fall back on decline.** `filament up --install`
+  triggers the OS elevation dialog (UAC on Windows via ShellExecute "runas",
+  polkit/pkexec on Linux) so the user grants admin from a popup, not by opening an
+  admin shell. If they approve, the privileged service installs (kernel TUN,
+  autostart at boot). If they decline, do not fail: fall back to a user-level
+  autostart that runs `filament up` in userspace (a per-user Scheduled Task at
+  logon on Windows, a `systemd --user` unit on Linux, a LaunchAgent on macOS), so
+  the user still gets always-on, just in the userspace tier with no admin. So
+  `--install` has two outcomes by consent: privileged-and-kernel, or
+  unprivileged-and-userspace, and never a hard failure. After install, nothing
+  needs elevation.
 - **Add the inbound firewall rule** during install (netsh on Windows) so direct
   QUIC is not silently blocked.
 - **Security:** a privileged always-on daemon plus `--shell` spawns shells as
