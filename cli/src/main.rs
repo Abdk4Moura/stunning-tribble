@@ -6108,6 +6108,15 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
         return Ok(());
     }
 
+    // Package-manager installs (brew, winget, scoop, cargo) must be updated
+    // via their manager, not by writing over the binary.
+    let source = platform::InstallSource::detect();
+    if source != platform::InstallSource::SelfInstalled {
+        let hint = source.upgrade_hint();
+        println!("filament was installed via a package manager — update with: {hint}");
+        return Ok(());
+    }
+
     let target = release_target().ok_or_else(|| anyhow!("no prebuilt binary for this platform; build from source"))?;
     let (asset, inner) = if cfg!(windows) {
         (format!("filament-{target}.zip"), "filament.exe")
