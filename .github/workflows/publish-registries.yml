@@ -4,9 +4,11 @@ name: publish-registries
 # Each job is independent and skips cleanly if its token secret is unset, so you
 # can enable them one at a time.
 #
-# Secrets:
-#   CARGO_REGISTRY_TOKEN — crates.io API token (Account Settings → API Tokens)
-#   NPM_TOKEN            — npm automation token (npmjs.com → Access Tokens)
+# Auth:
+#   crates.io — CARGO_REGISTRY_TOKEN secret (Account Settings → API Tokens)
+#   npm       — Trusted Publishing via OIDC (no token). Configure a Trusted
+#               Publisher for `filament-cli` on npmjs.com pointing at this repo
+#               and workflow (Abdk4Moura/filament → publish-registries.yml).
 
 on:
   release:
@@ -43,29 +45,32 @@ jobs:
   npm:
     if: startsWith(github.event.release.tag_name, 'cli-v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC for npm Trusted Publishing (no long-lived token)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
-      - name: npm publish filament-cli
+      - name: Use an npm that supports Trusted Publishing (OIDC)
+        run: npm install -g npm@latest
+      - name: npm publish filament-cli (Trusted Publishing)
         working-directory: packaging/npm
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::notice::NPM_TOKEN not set — skipping npm publish."
-            exit 0
-          fi
           # Validate the tag before it flows into `npm version`.
           echo "$TAG" | grep -qE '^cli-v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$' \
             || { echo "::error::unexpected tag format: '$TAG'"; exit 1; }
           version="${TAG#cli-v}"
           # Set the package version to the release version (source keeps 0.0.0).
           npm version "$version" --no-git-tag-version --allow-same-version
+          # Trusted Publishing: npm authenticates via the OIDC id-token — no
+          # NPM_TOKEN. Requires a Trusted Publisher for filament-cli configured on
+          # npmjs.com pointing at this repo + workflow. Provenance is automatic.
           npm publish --access public || {
-            echo "::warning::npm publish failed (already published this version?)"; exit 0;
+            echo "::warning::npm publish failed — is the Trusted Publisher set on npmjs.com for filament-cli -> Abdk4Moura/filament -> publish-registries.yml?"; exit 0;
           }
