@@ -50,6 +50,10 @@ jobs:
         env:
           RUST_MIN_STACK: 8388608
 
+      - name: Codesign binary (macOS)
+        if: runner.os == 'macOS'
+        run: codesign --force --sign - cli/target/release/filament
+
       - name: Cache target dir (deps + fingerprints)
         uses: actions/cache@v4
         with:
@@ -132,7 +136,7 @@ jobs:
           FILAMENT_WORKTREE: ${{ github.workspace }}
           RUST_MIN_STACK: 8388608
           FILAMENT_LOG: trace
-          FILAMENT_HARNESS_ASYNC_MODE: ${{ runner.os == 'macOS' && 'threading' || 'eventlet' }}
+          FILAMENT_DIRECT_FLAG: ${{ runner.os == 'macOS' && '0' || '1' }}
         timeout-minutes: 15
 
   # Security gate: confirm capability_harness is ABSENT in release builds.

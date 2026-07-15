@@ -100,7 +100,7 @@ impl Harness {
             let mut b = Command::new(python_cmd())
                 .arg(&app_path)
                 .env("PORT", port.to_string())
-                .env("FIL_ASYNC_MODE", std::env::var("FILAMENT_HARNESS_ASYNC_MODE").unwrap_or_else(|_| "eventlet".into()))
+                .env("FIL_ASYNC_MODE", "eventlet")
                 .env("FIL_SELF_MONKEYPATCH", "1")
                 .env("FIL_CLAIM_LIMIT", "1000000")
                 .stdout(Stdio::piped())
@@ -289,10 +289,12 @@ fn pair_and_transfer_smoke() {
     let bin = h.filament_bin().to_path_buf();
     let server = h.server_url();
 
+    let direct_flag = std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+
     // Spawn send; drain stderr continuously in background to avoid SIGPIPE.
     // Also watch for the minted code prefix.
     let mut send_proc = Command::new(&bin)
-        .env("FILAMENT_DIRECT", "1")
+        .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", "1")
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
@@ -329,7 +331,7 @@ fn pair_and_transfer_smoke() {
     let recv_dir = h.b_dir.join("received");
     std::fs::create_dir_all(&recv_dir).expect("create recv dir");
     let mut recv_proc = Command::new(&bin)
-        .env("FILAMENT_DIRECT", "1")
+        .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", "1")
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.b_dir)
