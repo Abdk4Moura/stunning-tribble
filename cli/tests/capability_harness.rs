@@ -285,7 +285,9 @@ fn pair_and_transfer_smoke() {
 
     // Mint the send code: spawn in background, read code from stdout
     let mut send_proc = Command::new(&bin)
+        .env("FILAMENT_DIRECT", "1")
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", "1")
+        .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
         .arg("send")
         .arg(&test_file)
@@ -318,7 +320,9 @@ fn pair_and_transfer_smoke() {
     let recv_dir = h.b_dir.join("received");
     std::fs::create_dir_all(&recv_dir).expect("create recv dir");
     let mut recv_proc = Command::new(&bin)
+        .env("FILAMENT_DIRECT", "1")
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", "1")
+        .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.b_dir)
         .arg("recv")
         .arg(&full_code)
