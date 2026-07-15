@@ -20,6 +20,12 @@ const CODE_WORD: &str = "gigantic-element-tango";
 // ---------------------------------------------------------------- helpers ---
 
 fn binary() -> PathBuf {
+    // Try release first (Windows CI builds --release to avoid stack overflow)
+    let release = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target").join("release").join("filament");
+    if release.exists() {
+        return release;
+    }
     let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
