@@ -22,10 +22,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Build filament (test-hooks)
+        working-directory: cli
+        run: cargo build --features test-hooks --release
+        env:
+          RUST_MIN_STACK: 8388608
+
+      - name: Cache target dir (deps + fingerprints)
+        uses: actions/cache@v4
+        with:
+          path: |
+            cli/target/release/.fingerprint/
+            cli/target/release/deps/
+            cli/target/release/build/
+            cli/target/release/libfilament_cli*
+          key: ${{ runner.os }}-target-${{ hashFiles('cli/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ hashFiles('cli/Cargo.lock') }}-
+            ${{ runner.os }}-target-
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: filament-${{ runner.os }}
+          path: cli/target/release/filament${{ runner.os == 'Windows' && '.exe' || '' }}
+          if-no-files-found: error
+
   capability-smoke:
     name: smoke (${{ matrix.os }})
+    needs: build
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -41,15 +90,39 @@ jobs:
       - name: Install Python deps
         run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
 
-      - name: Disable macOS firewall (blocks localhost)
-        if: runner.os == 'macOS'
-        run: sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off || true
+      - name: Restore cargo registry cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
 
-      - name: Build filament (test-hooks)
-        working-directory: cli
-        run: cargo build --features test-hooks --release
-        env:
-          RUST_MIN_STACK: 8388608
+      - name: Restore target dir cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            cli/target/release/.fingerprint/
+            cli/target/release/deps/
+            cli/target/release/build/
+            cli/target/release/libfilament_cli*
+          key: ${{ runner.os }}-target-${{ hashFiles('cli/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ hashFiles('cli/Cargo.lock') }}-
+            ${{ runner.os }}-target-
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: filament-${{ runner.os }}
+          path: cli/target/release/
+
+      - name: Make binary executable (non-Windows)
+        if: runner.os != 'Windows'
+        run: chmod +x cli/target/release/filament
 
       - name: Run capability harness
         working-directory: cli
@@ -58,7 +131,8 @@ jobs:
           RUST_BACKTRACE: 1
           FILAMENT_WORKTREE: ${{ github.workspace }}
           RUST_MIN_STACK: 8388608
-          FILAMENT_LOG: ${{ runner.os == 'macOS' && 'trace' || '' }}
+          FILAMENT_LOG: trace
+          FILAMENT_HARNESS_ASYNC_MODE: ${{ runner.os == 'macOS' && 'threading' || 'eventlet' }}
         timeout-minutes: 15
 
   # Security gate: confirm capability_harness is ABSENT in release builds.
