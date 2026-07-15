@@ -264,18 +264,19 @@ fn spawn_daemon_inner(
         .spawn()
         .unwrap_or_else(|e| panic!("spawn daemon {name}: {e}"));
     // Drain stdout/stderr in background threads so pipe buffers don't fill
-    let label = name.to_string();
+    let label1 = name.to_string();
+    let label2 = name.to_string();
     if let Some(stderr) = child.stderr.take() {
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines() {
-                if let Ok(l) = line { eprintln!("[{label} stderr] {l}"); }
+                if let Ok(l) = line { eprintln!("[{label1} stderr] {l}"); }
             }
         });
     }
     if let Some(stdout) = child.stdout.take() {
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
-                if let Ok(l) = line { eprintln!("[{label}] {l}"); }
+                if let Ok(l) = line { eprintln!("[{label2}] {l}"); }
             }
         });
     }
