@@ -283,7 +283,8 @@ fn pair_and_transfer_smoke() {
     let bin = h.filament_bin().to_path_buf();
     let server = h.server_url();
 
-    // Mint the send code: spawn in background, read code from stdout
+    // Spawn send; drain stderr continuously in background to avoid SIGPIPE.
+    // Also watch for the minted code prefix.
     let mut send_proc = Command::new(&bin)
         .env("FILAMENT_DIRECT", "1")
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", "1")
@@ -295,26 +296,28 @@ fn pair_and_transfer_smoke() {
         .arg(CODE_WORD)
         .arg("--server")
         .arg(&server)
-        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("send");
-    // Read send's STDERR for the minted code (ui::emit uses eprintln!)
-    let send_stderr = send_proc.stderr.take().unwrap();
-    let mut full_code: Option<String> = None;
-    let reader = BufReader::new(send_stderr);
-    for line in reader.lines() {
-        let line = line.unwrap_or_default();
-        eprintln!("[send] {line}");
-        let lower = line.to_lowercase();
-        if let Some(start) = lower.find(&CODE_WORD.to_lowercase()) {
-            let rest = &line[start..];
-            let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-            full_code = Some(line[start..start + end].to_lowercase().to_string());
-            break;
+
+    let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
+    let stderr = send_proc.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            let line = line.unwrap_or_default();
+            eprintln!("[send] {line}");
+            let lower = line.to_lowercase();
+            if let Some(start) = lower.find(&CODE_WORD.to_lowercase()) {
+                let rest = &line[start..];
+                let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+                let _ = code_tx.send(line[start..start + end].to_lowercase().to_string());
+            }
         }
-    }
-    let full_code = full_code.expect("send did not mint a code");
+    });
+
+    let full_code = code_rx.recv_timeout(Duration::from_secs(30))
+        .expect("send did not mint a code within 30s");
 
     // Receive on B
     let recv_dir = h.b_dir.join("received");
