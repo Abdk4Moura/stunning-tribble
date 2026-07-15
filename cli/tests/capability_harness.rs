@@ -341,10 +341,11 @@ fn pair_and_transfer_smoke() {
     for line in reader.lines() {
         let line = line.unwrap_or_default();
         eprintln!("[send] {line}");
-        if let Some(start) = line.find(CODE_WORD) {
-            let rest = &line[start..];
-            let end = rest.find(|c: char| !c.is_alphanumeric()).unwrap_or(rest.len());
-            full_code = Some(line[start..][..end].to_string());
+        let lower = line.to_lowercase();
+        let word_lower = CODE_WORD.to_lowercase();
+        if let Some(start) = lower.find(&word_lower) {
+            let end = line[start..].find(|c: char| !c.is_alphanumeric()).unwrap_or(line.len() - start);
+            full_code = Some(line[start..start + end].to_lowercase().to_string());
             break;
         }
     }
