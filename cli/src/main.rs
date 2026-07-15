@@ -2048,6 +2048,7 @@ async fn up_cmd(
         return Ok(());
     }
     if let Some(pid) = daemon_alive() {
+        eprintln!("[up] already-up: pidfile={:?} pid={pid} cmdline={:?}", pidfile(), std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default());
         bail!("already up (pid {pid}), `filament status` / `filament down`");
     }
     let dir = drop_dir(dir);
