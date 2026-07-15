@@ -49,7 +49,7 @@ jobs:
 
       - name: Run capability harness
         working-directory: cli
-        run: cargo test --features test-hooks --test capability_harness -- --nocapture --test-threads=1
+        run: cargo test --features test-hooks ${{ runner.os == 'Windows' && '--release' || '' }} --test capability_harness -- --nocapture --test-threads=1
         env:
           RUST_BACKTRACE: 1
           FILAMENT_WORKTREE: ${{ github.workspace }}
