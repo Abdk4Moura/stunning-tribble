@@ -6055,7 +6055,8 @@ async fn main() -> Result<()> {
                 }
                 // List the root directory
                 use crate::mount_proto::MountOp;
-                let resp = client.call(MountOp::Open { path: ".".to_string(), flags: 0 }).await?;
+                let root_enc = mount_proto::path_encode(std::path::Path::new("."));
+                let resp = client.call(MountOp::Open { path: root_enc, flags: 0 }).await?;
                 match resp.result {
                     crate::mount_proto::MountResult::Ok(v) => {
                         let fh = v["fh"].as_u64().unwrap_or(0);
@@ -6065,7 +6066,10 @@ async fn main() -> Result<()> {
                             crate::mount_proto::MountResult::Ok(v) => {
                                 if let Some(arr) = v.as_array() {
                                     for entry in arr {
-                                        let name = entry["name"].as_str().unwrap_or("?");
+                                        let name_enc = entry["name"].as_str().unwrap_or("?");
+                                        let name = mount_proto::path_decode(name_enc)
+                                            .map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "?".into()))
+                                            .unwrap_or_else(|_| "?".into());
                                         let kind = entry["stat"]["kind"].as_str().unwrap_or("file");
                                         let size = entry["stat"]["size"].as_u64().unwrap_or(0);
                                         ui::say(&format!("    {name}  ({kind}, {size}B)"));
@@ -9685,8 +9689,8 @@ async fn recv_cmd(
                         let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "mount: untrusted peer" })).await;
                         continue;
                     }
-                    let root = v["root"].as_str().unwrap_or(".");
-                    let root_path = std::path::PathBuf::from(root);
+                    let root_encoded = v["root"].as_str().unwrap_or(".");
+                    let root_path = mount_proto::path_decode(root_encoded).unwrap_or_else(|_| std::path::PathBuf::from("."));
                     let mux = l2_muxes.entry(pid.clone())
                         .or_insert_with(|| l2::Mux::new(t.clone()))
                         .clone();

@@ -231,6 +231,41 @@ const O_RDWR: i32 = 2;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use base64::Engine;
+
+/// Encode an OS-native path to a base64 string for the wire protocol.
+/// On unix this preserves raw bytes (non-UTF-8 safe); on Windows it
+/// falls back to lossy UTF-8 (Windows paths are UTF-16, so this is safe).
+pub fn path_encode(path: &std::path::Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        return base64::engine::general_purpose::STANDARD.encode(path.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        base64::engine::general_purpose::STANDARD.encode(path.to_string_lossy().as_bytes())
+    }
+}
+
+/// Decode a base64 wire path back to a native PathBuf.
+/// On unix, raw bytes → OsString → PathBuf (preserving non-UTF-8).
+/// On Windows, raw bytes → UTF-8 string → PathBuf.
+pub fn path_decode(encoded: &str) -> Result<PathBuf, MountError> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)
+        .map_err(|e| MountError { code: EINVAL, msg: format!("bad base64 path: {e}") })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        return Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)));
+    }
+    #[cfg(not(unix))]
+    {
+        let s = String::from_utf8_lossy(&bytes).into_owned();
+        Ok(PathBuf::from(s))
+    }
+}
+
 /// Serve the mount protocol on a stream. Spawned by the acceptor daemon
 /// when a `mount-open` control message arrives. Reads JSON requests from
 /// `rx` (mux inbound pipe) and writes responses via `transport.send_frame`.
@@ -310,9 +345,10 @@ async fn handle_mount_request(
 
 // ---------------------------------------------------------- handler implementations --
 
-fn resolve(root: &PathBuf, path: &str) -> Result<PathBuf, MountError> {
+fn resolve(root: &PathBuf, encoded_path: &str) -> Result<PathBuf, MountError> {
+    let path = path_decode(encoded_path)?;
     let mut resolved = root.clone();
-    for comp in path.split('/').filter(|s| !s.is_empty()) {
+    for comp in path.iter() {
         if comp == ".." {
             resolved.pop();
         } else if comp != "." {
@@ -392,7 +428,8 @@ fn do_readdir(root: &PathBuf, open_files: &HashMap<u64, (std::fs::File, PathBuf)
         Ok(iter) => {
             iter.filter_map(|e| e.ok())
                 .map(|e| {
-                    let name = e.file_name().to_string_lossy().to_string();
+                    let name_os = e.file_name();
+                    let name = path_encode(std::path::Path::new(&name_os));
                     let meta = e.metadata().ok();
                     let stat = match (&e.path(), meta) {
                         (p, Some(m)) => file_stat(p, &m),
@@ -456,7 +493,7 @@ fn do_fsync(open_files: &HashMap<u64, (std::fs::File, PathBuf)>, fh: u64) -> Res
 fn do_readlink(root: &PathBuf, path: &str) -> Result<Value, MountError> {
     let resolved = resolve(root, path)?;
     let target = std::fs::read_link(&resolved).map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
-    Ok(serde_json::Value::String(target.to_string_lossy().to_string()))
+    Ok(serde_json::Value::String(path_encode(&target)))
 }
 
 // ---- helpers ----

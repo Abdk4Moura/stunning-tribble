@@ -1612,8 +1612,9 @@ pub(crate) async fn open_mount_stream(
 ) -> Result<(u32, mpsc::Receiver<PipeItem>)> {
     let sid = mux.alloc_sid();
     let rx = mux.register(sid).await;
+    let encoded = crate::mount_proto::path_encode(std::path::Path::new(root));
     mux.transport
-        .send_control(&json!({ "type": "mount-open", "sid": sid, "root": root }))
+        .send_control(&json!({ "type": "mount-open", "sid": sid, "root": encoded }))
         .await?;
     Ok((sid, rx))
 }
