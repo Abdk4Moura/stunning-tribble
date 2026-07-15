@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-const CODE_WORD: &str = "gigantic-element";
+const CODE_WORD: &str = "gigantic-element-tango";
 
 // ---------------------------------------------------------------- helpers ---
 
