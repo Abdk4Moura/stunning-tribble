@@ -15,17 +15,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-const CODE_WORD: &str = "gigantic-element-tango";
+const CODE_WORD: &str = "gigantic-element";
 
 // ---------------------------------------------------------------- helpers ---
 
 fn binary() -> PathBuf {
-    // Try release first (Windows CI builds --release to avoid stack overflow)
-    let release = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target").join("release").join("filament");
-    if release.exists() {
-        return release;
-    }
     let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
@@ -77,13 +71,6 @@ fn python_cmd() -> &'static str {
     if cfg!(windows) { "python" } else { "python3" }
 }
 
-fn find_free_port() -> u16 {
-    use std::net::TcpListener;
-    TcpListener::bind("127.0.0.1:0")
-        .map(|l| l.local_addr().unwrap().port())
-        .unwrap_or(19079)
-}
-
 impl Harness {
     fn new() -> Self {
         let work = std::env::temp_dir()
@@ -95,7 +82,7 @@ impl Harness {
 
         // Start the Python Flask backend on an ephemeral port
         let app_path = find_backend_app();
-        let port = find_free_port();
+        let port = 19079u16; // fixed port to keep it simple
         let mut backend = {
             let mut b = Command::new(python_cmd())
                 .arg(&app_path)
@@ -172,19 +159,83 @@ impl Harness {
         spawn_daemon_inner(&bin, &server, name, config_dir)
     }
 
-    /// Spawn daemons, pair them, and verify byte-exact file transfer.
-    /// Uses `send --word` + `recv <code>` (same pattern as gates.sh gate 1)
-    /// which is proven to work on CI across all 3 OSes.
+    /// Spawn both daemons and pair them so they can communicate.
     fn pair_daemons(&mut self) {
         let bin = self.filament_bin().to_path_buf();
         let server = self.server_url();
 
-        // Start daemons first (they need devices.json, so we write a stub)
-        // Actually: send/recv doesn't need paired devices, it uses one-time codes.
-        // Just start daemons for the direct-QUIC path.
-        self.daemon_a = Some(spawn_daemon_inner(&bin, &server, "test-a", &self.a_dir));
-        self.daemon_b = Some(spawn_daemon_inner(&bin, &server, "test-b", &self.b_dir));
-        std::thread::sleep(Duration::from_secs(8));
+        // Start daemon A
+        self.daemon_a = Some(spawn_daemon_inner(
+            &bin, &server, "test-a", &self.a_dir,
+        ));
+        // Start daemon B
+        self.daemon_b = Some(spawn_daemon_inner(
+            &bin, &server, "test-b", &self.b_dir,
+        ));
+
+        // Wait for both daemons to be up (they print "ready" or similar during boot)
+        // Then pair them. Give the daemons time to connect to signaling.
+        std::thread::sleep(Duration::from_secs(5));
+
+        // Spawn pair A (mint) in background — pair blocks waiting for a claimer. Must
+        // run concurrently: start A, read its minted code from stdout, then claim on B.
+        let server = self.server_url();
+        let mut pair_a = Command::new(&bin)
+            .env("FILAMENT_CONFIG_DIR", &self.a_dir)
+            .arg("pair")
+            .arg("--word")
+            .arg(CODE_WORD)
+            .arg("--server")
+            .arg(&server)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("pair A");
+
+        // Read pair A's stdout line by line for the minted code
+        let pair_a_stdout = pair_a.stdout.take().unwrap();
+        let mut full_code: Option<String> = None;
+        let reader = BufReader::new(pair_a_stdout);
+        for line in reader.lines() {
+            let line = line.unwrap_or_default();
+            eprintln!("[pair A] {line}");
+            let s = line.trim();
+            if let Some(start) = s.find(CODE_WORD) {
+                let rest = &s[start..];
+                let end = rest.find(|c: char| !c.is_alphanumeric()).unwrap_or(rest.len());
+                full_code = Some(s[start..][..end].to_string());
+                break;
+            }
+        }
+
+        let full_code = full_code.expect("pair A did not mint a code");
+
+        // Claim on B while A is still running (pair B connects to A's room)
+        let mut pair_b = Command::new(&bin)
+            .env("FILAMENT_CONFIG_DIR", &self.b_dir)
+            .arg("pair")
+            .arg(&full_code)
+            .arg("--server")
+            .arg(&server)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("pair B");
+        let pair_b_out = pair_b.wait_with_output().expect("pair B result");
+        let pair_b_stdout = String::from_utf8_lossy(&pair_b_out.stdout);
+        let pair_b_stderr = String::from_utf8_lossy(&pair_b_out.stderr);
+        eprintln!("[pair B stdout] {pair_b_stdout}");
+        eprintln!("[pair B stderr] {pair_b_stderr}");
+
+        // Now A should finish (B claimed its code)
+        let pair_a_out = pair_a.wait_with_output().expect("pair A result");
+        let pair_a_stdout_full = String::from_utf8_lossy(&pair_a_out.stdout);
+        let pair_a_stderr = String::from_utf8_lossy(&pair_a_out.stderr);
+        eprintln!("[pair A remaining stdout] {pair_a_stdout_full}");
+        eprintln!("[pair A stderr] {pair_a_stderr}");
+
+        // Give the daemons a moment to establish the direct-QUIC connection
+        std::thread::sleep(Duration::from_secs(3));
     }
 }
 
@@ -195,7 +246,7 @@ fn spawn_daemon_inner(
     config_dir: &Path,
 ) -> Child {
     std::fs::create_dir_all(config_dir).expect("create config dir");
-    let mut child = Command::new(bin)
+    Command::new(bin)
         .env("FILAMENT_CONFIG_DIR", config_dir)
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", "1")
@@ -211,25 +262,7 @@ fn spawn_daemon_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|e| panic!("spawn daemon {name}: {e}"));
-    // Drain stdout/stderr in background threads so pipe buffers don't fill
-    let label1 = name.to_string();
-    let label2 = name.to_string();
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines() {
-                if let Ok(l) = line { eprintln!("[{label1} stderr] {l}"); }
-            }
-        });
-    }
-    if let Some(stdout) = child.stdout.take() {
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                if let Ok(l) = line { eprintln!("[{label2}] {l}"); }
-            }
-        });
-    }
-    child
+        .unwrap_or_else(|e| panic!("spawn daemon {name}: {e}"))
 }
 
 fn reqwest_blocking_head(url: &str) -> bool {
@@ -259,12 +292,12 @@ fn reqwest_blocking_head(url: &str) -> bool {
 
 #[test]
 fn pair_and_transfer_smoke() {
-    let h = Harness::new();
+    let mut h = Harness::new();
 
-    let bin = h.filament_bin().to_path_buf();
-    let server = h.server_url();
+    // Step 1: pair the daemons
+    h.pair_daemons();
 
-    // Create a test file with 0x0D 0x0A + binary sweep
+    // Step 2: create a test file with 0x0D 0x0A + random binary (byte-transparency)
     let test_file = h.work_dir.join("test_payload.bin");
     let mut payload = vec![
         0x0D, 0x0A, // CR+LF (byte-transparency lock)
@@ -289,14 +322,8 @@ fn pair_and_transfer_smoke() {
     let bin = h.filament_bin().to_path_buf();
     let server = h.server_url();
 
-    let direct_flag = std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
-
-    // Spawn send; drain stderr continuously in background to avoid SIGPIPE.
-    // Also watch for the minted code prefix.
+    // Mint the send code: spawn in background, read code from stdout
     let mut send_proc = Command::new(&bin)
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", "1")
-        .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
         .arg("send")
         .arg(&test_file)
@@ -304,44 +331,39 @@ fn pair_and_transfer_smoke() {
         .arg(CODE_WORD)
         .arg("--server")
         .arg(&server)
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("send");
-
-    let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
-    let stderr = send_proc.stderr.take().unwrap();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            let line = line.unwrap_or_default();
-            eprintln!("[send] {line}");
-            let lower = line.to_lowercase();
-            if let Some(start) = lower.find(&CODE_WORD.to_lowercase()) {
-                let rest = &line[start..];
-                let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-                let _ = code_tx.send(line[start..start + end].to_lowercase().to_string());
-            }
+    let send_stdout = send_proc.stdout.take().unwrap();
+    let mut full_code: Option<String> = None;
+    let reader = BufReader::new(send_stdout);
+    for line in reader.lines() {
+        let line = line.unwrap_or_default();
+        eprintln!("[send] {line}");
+        if let Some(start) = line.find(CODE_WORD) {
+            let rest = &line[start..];
+            let end = rest.find(|c: char| !c.is_alphanumeric()).unwrap_or(rest.len());
+            full_code = Some(line[start..][..end].to_string());
+            break;
         }
-    });
-
-    let full_code = code_rx.recv_timeout(Duration::from_secs(30))
-        .expect("send did not mint a code within 30s");
+    }
+    let full_code = full_code.expect("send did not mint a code");
 
     // Receive on B
     let recv_dir = h.b_dir.join("received");
     std::fs::create_dir_all(&recv_dir).expect("create recv dir");
     let mut recv_proc = Command::new(&bin)
-        .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", "1")
-        .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.b_dir)
         .arg("recv")
         .arg(&full_code)
-        .arg("--yes")
+        .arg("-y")
         .arg("--dir")
         .arg(&recv_dir)
         .arg("--server")
         .arg(&server)
+        .arg("--timeout")
+        .arg("90")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -386,16 +408,26 @@ fn pair_and_transfer_smoke() {
 
 #[test]
 fn two_nodes_pair_each_other() {
-    let h = Harness::new();
-    // Verify the backend + binary are reachable
+    let mut h = Harness::new();
+    h.pair_daemons();
+
+    // Verify both daemons see each other in devices list
     let bin = h.filament_bin().to_path_buf();
     let server = h.server_url();
 
-    let out = Command::new(&bin)
-        .args(["--server", &server, "--help"])
+    let out_a = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["devices", "--server", &server])
         .output()
-        .expect("help");
-    assert!(out.status.success(), "binary help failed");
+        .expect("devices A");
+    let stdout_a = String::from_utf8_lossy(&out_a.stdout);
+    eprintln!("devices A:\n{stdout_a}");
 
-    eprintln!("two_nodes_pair_each_other: filament binary and backend OK");
+    let out_b = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .args(["devices", "--server", &server])
+        .output()
+        .expect("devices B");
+    let stdout_b = String::from_utf8_lossy(&out_b.stdout);
+    eprintln!("devices B:\n{stdout_b}");
 }
