@@ -246,7 +246,7 @@ fn spawn_daemon_inner(
     config_dir: &Path,
 ) -> Child {
     std::fs::create_dir_all(config_dir).expect("create config dir");
-    Command::new(bin)
+    let mut child = Command::new(bin)
         .env("FILAMENT_CONFIG_DIR", config_dir)
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", "1")
@@ -262,7 +262,24 @@ fn spawn_daemon_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|e| panic!("spawn daemon {name}: {e}"))
+        .unwrap_or_else(|e| panic!("spawn daemon {name}: {e}"));
+    // Drain stdout/stderr in background threads so pipe buffers don't fill
+    let label = name.to_string();
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                if let Ok(l) = line { eprintln!("[{label} stderr] {l}"); }
+            }
+        });
+    }
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if let Ok(l) = line { eprintln!("[{label}] {l}"); }
+            }
+        });
+    }
+    child
 }
 
 fn reqwest_blocking_head(url: &str) -> bool {
