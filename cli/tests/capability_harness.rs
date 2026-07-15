@@ -166,27 +166,13 @@ impl Harness {
         spawn_daemon_inner(&bin, &server, name, config_dir)
     }
 
-    /// Spawn both daemons and pair them so they can communicate.
+    /// Pair both nodes first (creates devices.json), THEN start daemons.
+    /// Daemon refuses to start without devices when stdin is not a TTY (line 7799).
     fn pair_daemons(&mut self) {
         let bin = self.filament_bin().to_path_buf();
         let server = self.server_url();
 
-        // Start daemon A
-        self.daemon_a = Some(spawn_daemon_inner(
-            &bin, &server, "test-a", &self.a_dir,
-        ));
-        // Start daemon B
-        self.daemon_b = Some(spawn_daemon_inner(
-            &bin, &server, "test-b", &self.b_dir,
-        ));
-
-        // Wait for both daemons to be up (they print "ready" or similar during boot)
-        // Then pair them. Give the daemons time to connect to signaling.
-        std::thread::sleep(Duration::from_secs(5));
-
-        // Spawn pair A (mint) in background — pair blocks waiting for a claimer. Must
-        // run concurrently: start A, read its minted code from stdout, then claim on B.
-        let server = self.server_url();
+        // Step 1: Pair A mints a code (no daemon needed for pairing)
         let mut pair_a = Command::new(&bin)
             .env("FILAMENT_CONFIG_DIR", &self.a_dir)
             .arg("pair")
@@ -199,25 +185,23 @@ impl Harness {
             .spawn()
             .expect("pair A");
 
-        // Read pair A's stdout line by line for the minted code
+        // Read pair A's stdout for the minted code
         let pair_a_stdout = pair_a.stdout.take().unwrap();
         let mut full_code: Option<String> = None;
         let reader = BufReader::new(pair_a_stdout);
         for line in reader.lines() {
             let line = line.unwrap_or_default();
             eprintln!("[pair A] {line}");
-            let s = line.trim();
-            if let Some(start) = s.find(CODE_WORD) {
-                let rest = &s[start..];
-                let end = rest.find(|c: char| !c.is_alphanumeric()).unwrap_or(rest.len());
-                full_code = Some(s[start..][..end].to_string());
+            let lower = line.to_lowercase();
+            if let Some(start) = lower.find(&CODE_WORD.to_lowercase()) {
+                let end = line[start..].find(|c: char| !c.is_alphanumeric()).unwrap_or(line.len() - start);
+                full_code = Some(line[start..start + end].to_lowercase().to_string());
                 break;
             }
         }
-
         let full_code = full_code.expect("pair A did not mint a code");
 
-        // Claim on B while A is still running (pair B connects to A's room)
+        // Step 2: Pair B claims the code (no daemon needed)
         let mut pair_b = Command::new(&bin)
             .env("FILAMENT_CONFIG_DIR", &self.b_dir)
             .arg("pair")
@@ -229,20 +213,20 @@ impl Harness {
             .spawn()
             .expect("pair B");
         let pair_b_out = pair_b.wait_with_output().expect("pair B result");
-        let pair_b_stdout = String::from_utf8_lossy(&pair_b_out.stdout);
-        let pair_b_stderr = String::from_utf8_lossy(&pair_b_out.stderr);
-        eprintln!("[pair B stdout] {pair_b_stdout}");
-        eprintln!("[pair B stderr] {pair_b_stderr}");
+        eprintln!("[pair B stdout] {}", String::from_utf8_lossy(&pair_b_out.stdout));
+        eprintln!("[pair B stderr] {}", String::from_utf8_lossy(&pair_b_out.stderr));
 
-        // Now A should finish (B claimed its code)
+        // Pair A should finish now
         let pair_a_out = pair_a.wait_with_output().expect("pair A result");
-        let pair_a_stdout_full = String::from_utf8_lossy(&pair_a_out.stdout);
-        let pair_a_stderr = String::from_utf8_lossy(&pair_a_out.stderr);
-        eprintln!("[pair A remaining stdout] {pair_a_stdout_full}");
-        eprintln!("[pair A stderr] {pair_a_stderr}");
+        eprintln!("[pair A remaining] {}", String::from_utf8_lossy(&pair_a_out.stdout));
+        eprintln!("[pair A stderr] {}", String::from_utf8_lossy(&pair_a_out.stderr));
 
-        // Give the daemons a moment to establish the direct-QUIC connection
-        std::thread::sleep(Duration::from_secs(3));
+        // Step 3: Now start daemons (they have devices.json from pairing)
+        self.daemon_a = Some(spawn_daemon_inner(&bin, &server, "test-a", &self.a_dir));
+        self.daemon_b = Some(spawn_daemon_inner(&bin, &server, "test-b", &self.b_dir));
+
+        // Give daemons time to boot and establish direct-QUIC connection
+        std::thread::sleep(Duration::from_secs(8));
     }
 }
 
