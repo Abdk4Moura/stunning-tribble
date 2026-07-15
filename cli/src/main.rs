@@ -27,7 +27,6 @@ mod holepunch;
 mod interact;
 mod l2;
 mod mount;
-mod mount_proto;
 mod backup;
 mod net;
 mod overlay;
@@ -587,9 +586,6 @@ enum Cmd {
         /// (often root). Requires `up` to run as root (runuser is setuid).
         #[arg(long, value_name = "USER")]
         shell_user: Option<String>,
-        /// Internal: re-invoked after elevation to do the system-level install.
-        #[arg(long, hide = true)]
-        install_system: bool,
     },
     /// Show whether the daemon runs and what it received recently
     Status {
@@ -1973,26 +1969,7 @@ async fn up_cmd(
     shell_only: Option<String>,
     shell_program: Option<String>,
     shell_user: Option<String>,
-    install_system_flag: bool,
 ) -> Result<()> {
-    // Internal: re-invoked after elevation. Do the system-level install directly
-    // and return. The privileged backend registers the service/daemon/task and exits.
-    if install_system_flag {
-        let host = platform::ServiceHost::detect();
-        let exe = std::env::current_exe()?;
-        // Build shell args from the current flag carried by the elevated process.
-        let mut up_args = String::new();
-        if let Some(csv) = &shell_only {
-            up_args.push_str(&format!(" --shell-only {csv}"));
-        } else if shell {
-            up_args.push_str(" --shell");
-        }
-        if let Some(u) = &shell_user {
-            up_args.push_str(&format!(" --shell-user {u}"));
-        }
-        host.install_system(&exe, &up_args)?;
-        return Ok(());
-    }
     // --shell-program -- persist it so the daemon picks it up (shell_argv reads
     // this from config). The env var FILAMENT_SHELL is also checked independently.
     if let Some(ref prog) = shell_program {
@@ -2013,15 +1990,29 @@ async fn up_cmd(
         return install_system_service(shell, &shell_only, &shell_user);
     }
     if install {
-        // Gate --install on a detected service manager.
+        // Gate --install on a detected, supported service manager.
+        // Only systemd has a native backend today; other platforms get
+        // correct manual instructions instead of a dead unit.
         let host = platform::ServiceHost::detect();
         if !host.supports_install() {
             let hint = host.install_instructions();
-            eprintln!("filament: --install is not supported on this platform. {hint}");
+            if cfg!(target_os = "macos") {
+                eprintln!("filament: --install is not yet supported on macOS ({hint})");
+            } else if cfg!(target_os = "windows") {
+                eprintln!("filament: --install is not yet supported on Windows ({hint})");
+            } else {
+                eprintln!("filament: --install requires systemd ({hint})");
+            }
             return Ok(());
         }
         let exe = std::env::current_exe()?;
-        let mut up_args = String::new();
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
+        std::fs::create_dir_all(&unit_dir)?;
+        let unit = unit_dir.join("filament.service");
+        // Carry the shell policy into the unit so a service install keeps the
+        // same seamless-ssh posture the user asked for on the command line.
+        let mut up_args = String::from(" up");
         if let Some(csv) = &shell_only {
             up_args.push_str(&format!(" --shell-only {csv}"));
         } else if shell {
@@ -2030,22 +2021,29 @@ async fn up_cmd(
         if let Some(u) = &shell_user {
             up_args.push_str(&format!(" --shell-user {u}"));
         }
-        // Try privileged system install (elevation popup). On decline, fall
-        // back to user-level autostart. Never fail hard.
-        match host.install_system(&exe, &up_args) {
-            Ok(platform::InstallResult::System) => {
-                ui::say(&format!("  {} installed as a system service (autostart at boot)", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-            }
-            Ok(platform::InstallResult::User) | Err(_) => {
-                // Elevation declined: user-level autostart
-                host.install_user(&exe, &up_args)?;
-                ui::say(&format!("  {} installed as a user-level autostart", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-                ui::say(&format!("  {} run `filament up --install` again to grant admin for kernel overlay",
-                    ui::paint(ui::Tone::Dim, "note:")));
-            }
+        // Type=notify + WatchdogSec: the daemon sends READY=1 once its event loop
+        // is serving and WATCHDOG=1 each tick. If the loop WEDGES (the failure
+        // that also defeats the in-core signaling reconnect, so the node silently
+        // drops off presence) the pings stop and systemd restarts us within
+        // WatchdogSec instead of needing a manual `down`/`up`. Restart=always so
+        // any exit recovers too. (Requires a binary new enough to emit sd_notify,
+        // which is exactly the one writing this unit, so they ship together.)
+        std::fs::write(&unit, format!(
+            "[Unit]\nDescription=Filament drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={}{}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=default.target\n",
+            exe.display(), up_args
+        ))?;
+        ui::say(&format!("  {} wrote {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), unit.display()));
+        let enabled = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status()
+            .and_then(|_| std::process::Command::new("systemctl").args(["--user", "enable", "--now", "filament"]).status())
+            .map(|st| st.success())
+            .unwrap_or(false);
+        if enabled {
+            ui::say(&format!("  {} service enabled and started, logs: journalctl --user -u filament", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+        } else {
+            ui::say(&format!("  start it with: {}", ui::paint(ui::Tone::Bold, "systemctl --user enable --now filament")));
         }
-        #[cfg(target_os = "windows")]
-        platform::add_firewall_rule(&exe);
         return Ok(());
     }
     if let Some(pid) = daemon_alive() {
@@ -5876,7 +5874,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Up { install, system, userspace, dir, shell, shell_only, shell_program, shell_user, install_system } => {
+        Cmd::Up { install, system, userspace, dir, shell, shell_only, shell_program, shell_user } => {
             // `--userspace` forces the netstack backend; L3::start reads this env, so
             // set it before the daemon brings L3 up (same process). Safe: single
             // threaded at this point (the daemon's tasks are not spawned yet).
@@ -5894,7 +5892,7 @@ async fn main() -> Result<()> {
                 (Some(list), false) => Some(format!("{list},{}", peer_shell.join(","))),
                 (None, false) => Some(peer_shell.join(",")),
             };
-            up_cmd(&server, install, system, dir, relay, shell, shell_only, shell_program, shell_user, install_system).await
+            up_cmd(&server, install, system, dir, relay, shell, shell_only, shell_program, shell_user).await
         }
         Cmd::Status { json } => status_cmd(json),
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
@@ -6040,50 +6038,7 @@ async fn main() -> Result<()> {
                 let peer = peer.ok_or_else(|| anyhow::anyhow!("peer is required"))?;
                 let remote = remote.ok_or_else(|| anyhow::anyhow!("remote path is required"))?;
                 let auto_restore = save_auto;
-                let mut client = l2::mount_cmd(&server, &peer, relay, &remote).await?;
-                if let Some(_local) = local {
-                    // FUSE adapter coming next. For now, tell the user the path exists
-                    // and the protocol is wired; the actual mount host is TODO.
-                    ui::say(&format!(
-                        "  {} mesh-native mount protocol connected to {peer}:{remote}",
-                        ui::paint(ui::Tone::Ok, ui::glyph_ok())
-                    ));
-                    ui::say(&format!(
-                        "  {} FUSE adapter not yet available; listing directory instead",
-                        ui::paint(ui::Tone::Warn, "!")
-                    ));
-                }
-                // List the root directory
-                use crate::mount_proto::MountOp;
-                let root_enc = mount_proto::path_encode(std::path::Path::new("."));
-                let resp = client.call(MountOp::Open { path: root_enc, flags: 0 }).await?;
-                match resp.result {
-                    crate::mount_proto::MountResult::Ok(v) => {
-                        let fh = v["fh"].as_u64().unwrap_or(0);
-                        ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), remote));
-                        let entries = client.call(MountOp::ReadDir { fh, offset: 0 }).await?;
-                        match entries.result {
-                            crate::mount_proto::MountResult::Ok(v) => {
-                                if let Some(arr) = v.as_array() {
-                                    for entry in arr {
-                                        let name_enc = entry["name"].as_str().unwrap_or("?");
-                                        let name = mount_proto::path_decode(name_enc)
-                                            .map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "?".into()))
-                                            .unwrap_or_else(|_| "?".into());
-                                        let kind = entry["stat"]["kind"].as_str().unwrap_or("file");
-                                        let size = entry["stat"]["size"].as_u64().unwrap_or(0);
-                                        ui::say(&format!("    {name}  ({kind}, {size}B)"));
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    crate::mount_proto::MountResult::Err(e) => {
-                        ui::say(&format!("  {} {}: {}", ui::paint(ui::Tone::Err, ui::glyph_err()), remote, e.msg));
-                    }
-                }
-                Ok(())
+                mount::mount_cmd(&server, &peer, &remote, local, read_only, options, relay, foreground, auto_restore).await
             }
         }
         Cmd::Unmount { path } => { ui_caps.confirm(&format!("unmount {path}"))?; mount::unmount_cmd(&path) },
@@ -9676,33 +9631,6 @@ async fn recv_cmd(
                             mux.drop_pty(sid).await;
                         }
                     }
-                }
-                // Mount-native: serve a filesystem subtree over a mesh stream.
-                // Same L2 stream pattern as pty: the peer sends mount protocol
-                // requests as data frames, the server replies on the same sid.
-                Some("mount-open") if l2_enabled => {
-                    let Some(t) = conn.transport_of(&pid) else { continue };
-                    let sid = v["sid"].as_u64().unwrap_or(0) as u32;
-                    if !l2::is_l2_sid(sid) { continue; }
-                    let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
-                    if !trusted {
-                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "mount: untrusted peer" })).await;
-                        continue;
-                    }
-                    let root_encoded = v["root"].as_str().unwrap_or(".");
-                    let root_path = mount_proto::path_decode(root_encoded).unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let mux = l2_muxes.entry(pid.clone())
-                        .or_insert_with(|| l2::Mux::new(t.clone()))
-                        .clone();
-                    if mux.at_stream_cap().await {
-                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
-                        continue;
-                    }
-                    let rx = mux.register_stream(sid).await; // inbound pipe from peer
-                    let _ = t.send_control(&json!({ "type": "mount-open-ack", "sid": sid })).await;
-                    let transport = t.clone();
-                    let spawn_sid = sid;
-                    mount_proto::spawn_mount_server(root_path, transport, spawn_sid, rx);
                 }
                 Some("pty-resize") if l2_enabled => {
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;

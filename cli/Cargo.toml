@@ -1,6 +1,6 @@
 [package]
 name = "filament-cli"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 description = "P2P file transfer between terminals and browsers, no upload, no account. The terminal end of filament.autumated.com."
 license = "MIT"
@@ -54,7 +54,6 @@ tar = "0.4.46"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tokio = { version = "1.52.3", features = ["full"] }
 webrtc = "0.17.1"
-base64 = "0.22"
 clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
 flate2 = "1.1.9"
