@@ -194,14 +194,15 @@ impl Harness {
             eprintln!("[pair A] {line}");
             let lower = line.to_lowercase();
             if let Some(start) = lower.find(&CODE_WORD.to_lowercase()) {
-                let end = line[start..].find(|c: char| !c.is_alphanumeric()).unwrap_or(line.len() - start);
+                let rest = &line[start..];
+                let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
                 full_code = Some(line[start..start + end].to_lowercase().to_string());
                 break;
             }
         }
         let full_code = full_code.expect("pair A did not mint a code");
 
-        // Step 2: Pair B claims the code (no daemon needed)
+        // Pair B claims the code
         let mut pair_b = Command::new(&bin)
             .env("FILAMENT_CONFIG_DIR", &self.b_dir)
             .arg("pair")
@@ -352,9 +353,9 @@ fn pair_and_transfer_smoke() {
         let line = line.unwrap_or_default();
         eprintln!("[send] {line}");
         let lower = line.to_lowercase();
-        let word_lower = CODE_WORD.to_lowercase();
-        if let Some(start) = lower.find(&word_lower) {
-            let end = line[start..].find(|c: char| !c.is_alphanumeric()).unwrap_or(line.len() - start);
+        if let Some(start) = lower.find(&CODE_WORD.to_lowercase()) {
+            let rest = &line[start..];
+            let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
             full_code = Some(line[start..start + end].to_lowercase().to_string());
             break;
         }
