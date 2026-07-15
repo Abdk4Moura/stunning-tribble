@@ -100,7 +100,7 @@ impl Harness {
             let mut b = Command::new(python_cmd())
                 .arg(&app_path)
                 .env("PORT", port.to_string())
-                .env("FIL_ASYNC_MODE", "eventlet")
+                .env("FIL_ASYNC_MODE", std::env::var("FILAMENT_HARNESS_ASYNC_MODE").unwrap_or_else(|_| "eventlet".into()))
                 .env("FIL_SELF_MONKEYPATCH", "1")
                 .env("FIL_CLAIM_LIMIT", "1000000")
                 .stdout(Stdio::piped())
