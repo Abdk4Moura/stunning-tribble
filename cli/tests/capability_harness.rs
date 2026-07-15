@@ -71,6 +71,13 @@ fn python_cmd() -> &'static str {
     if cfg!(windows) { "python" } else { "python3" }
 }
 
+fn find_free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind("127.0.0.1:0")
+        .map(|l| l.local_addr().unwrap().port())
+        .unwrap_or(19079)
+}
+
 impl Harness {
     fn new() -> Self {
         let work = std::env::temp_dir()
@@ -82,7 +89,7 @@ impl Harness {
 
         // Start the Python Flask backend on an ephemeral port
         let app_path = find_backend_app();
-        let port = 19079u16; // fixed port to keep it simple
+        let port = find_free_port();
         let mut backend = {
             let mut b = Command::new(python_cmd())
                 .arg(&app_path)
