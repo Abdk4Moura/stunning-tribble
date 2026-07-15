@@ -434,29 +434,61 @@ impl ServiceHost {
         }
         #[cfg(target_os = "windows")]
         {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            let status = std::process::Command::new(exe)
-                .args(["--install-system", shell_args])
-                .creation_flags(CREATE_NO_WINDOW)
-                .status();
-            match status {
-                Ok(s) if s.success() => return Ok(true),
-                Ok(_) => return Ok(false),
-                Err(e) => {
-                    // ERROR_CANCELLED (1223) = user declined UAC
-                    if e.raw_os_error() == Some(1223) {
-                        return Ok(false);
-                    }
-                    return Err(e.into());
-                }
+            use std::os::windows::ffi::OsStrExt;
+
+            extern "system" {
+                fn ShellExecuteW(
+                    hwnd: isize,
+                    lpOperation: *const u16,
+                    lpFile: *const u16,
+                    lpParameters: *const u16,
+                    lpDirectory: *const u16,
+                    nShowCmd: i32,
+                ) -> isize;
+                fn GetLastError() -> u32;
             }
+
+            const SW_HIDE: i32 = 0;
+
+            let exe_win: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+            let args = format!("--install-system {shell_args}");
+            let args_win: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
+
+            let verb: Vec<u16> = "runas\0".encode_utf16().collect();
+
+            let ret = unsafe {
+                ShellExecuteW(
+                    0, // hwnd
+                    verb.as_ptr(),
+                    exe_win.as_ptr(),
+                    args_win.as_ptr(),
+                    std::ptr::null(),
+                    SW_HIDE,
+                )
+            };
+
+            // ShellExecuteW returns HINSTANCE > 32 on success.
+            if ret as usize > 32 {
+                return Ok(true);
+            }
+            let code = unsafe { GetLastError() };
+            if code == 1223 {
+                // ERROR_CANCELLED — user declined UAC
+                return Ok(false);
+            }
+            anyhow::bail!("ShellExecuteW failed: {}", code);
         }
         #[cfg(target_os = "macos")]
         {
+            // Escape the exe path and shell_args for the AppleScript do-shell-script
+            // double-quote context. The shell_args are our own --shell / --shell-only
+            // flags so they are constrained, but we escape defensively anyway.
+            let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
             let script = format!(
                 "do shell script \"'{}' --install-system {}\" with administrator privileges",
-                exe.display(), shell_args
+                esc(&exe.display().to_string()),
+                esc(shell_args)
             );
             let ok = std::process::Command::new("osascript")
                 .args(["-e", &script])
@@ -549,6 +581,7 @@ pub fn add_firewall_rule(exe: &Path) {
     let _ = std::process::Command::new("netsh")
         .args(["advfirewall", "firewall", "add", "rule",
             "name=Filament QUIC", "dir=in", "action=allow",
+            "protocol=udp",
             "program=", &exe.display().to_string(),
             "enable=yes"])
         .output();
