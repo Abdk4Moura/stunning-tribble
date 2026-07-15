@@ -43,9 +43,9 @@ jobs:
 
       - name: Build filament (test-hooks)
         working-directory: cli
-        run: cargo build --features test-hooks
+        run: cargo build --features test-hooks ${{ runner.os == 'Windows' && '--release' || '' }}
         env:
-          RUST_BACKTRACE: 1
+          RUST_MIN_STACK: 8388608
 
       - name: Run capability harness
         working-directory: cli
