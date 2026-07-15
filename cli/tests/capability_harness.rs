@@ -185,10 +185,10 @@ impl Harness {
             .spawn()
             .expect("pair A");
 
-        // Read pair A's stdout for the minted code
-        let pair_a_stdout = pair_a.stdout.take().unwrap();
+        // Read pair A's STDERR for the minted code (ui::emit uses eprintln!)
+        let pair_a_stderr = pair_a.stderr.take().unwrap();
         let mut full_code: Option<String> = None;
-        let reader = BufReader::new(pair_a_stdout);
+        let reader = BufReader::new(pair_a_stderr);
         for line in reader.lines() {
             let line = line.unwrap_or_default();
             eprintln!("[pair A] {line}");
@@ -344,9 +344,10 @@ fn pair_and_transfer_smoke() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("send");
-    let send_stdout = send_proc.stdout.take().unwrap();
+    // Read send's STDERR for the minted code (ui::emit uses eprintln!)
+    let send_stderr = send_proc.stderr.take().unwrap();
     let mut full_code: Option<String> = None;
-    let reader = BufReader::new(send_stdout);
+    let reader = BufReader::new(send_stderr);
     for line in reader.lines() {
         let line = line.unwrap_or_default();
         eprintln!("[send] {line}");
