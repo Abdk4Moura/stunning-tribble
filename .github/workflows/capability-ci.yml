@@ -53,6 +53,7 @@ jobs:
         env:
           RUST_BACKTRACE: 1
           FILAMENT_WORKTREE: ${{ github.workspace }}
+          RUST_MIN_STACK: 8388608
         timeout-minutes: 15
 
   # Security gate: confirm capability_harness is ABSENT in release builds.
