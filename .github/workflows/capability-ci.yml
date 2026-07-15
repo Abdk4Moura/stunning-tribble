@@ -99,6 +99,10 @@ jobs:
       - name: Install Python deps
         run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
 
+      - name: Disable macOS firewall (blocks localhost)
+        if: runner.os == 'macOS'
+        run: sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off || true
+
       - name: Restore cargo registry cache
         uses: actions/cache@v4
         with:
