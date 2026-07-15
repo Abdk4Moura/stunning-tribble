@@ -177,7 +177,8 @@ impl Harness {
         // Then pair them. Give the daemons time to connect to signaling.
         std::thread::sleep(Duration::from_secs(5));
 
-        // Pair A: mint a code
+        // Spawn pair A (mint) in background — pair blocks waiting for a claimer. Must
+        // run concurrently: start A, read its minted code from stdout, then claim on B.
         let server = self.server_url();
         let mut pair_a = Command::new(&bin)
             .env("FILAMENT_CONFIG_DIR", &self.a_dir)
@@ -190,26 +191,26 @@ impl Harness {
             .stderr(Stdio::piped())
             .spawn()
             .expect("pair A");
-        let pair_a_out = pair_a.wait_with_output().expect("pair A result");
-        let pair_a_stdout = String::from_utf8_lossy(&pair_a_out.stdout);
-        let pair_a_stderr = String::from_utf8_lossy(&pair_a_out.stderr);
 
-        // Extract the minted code from the output
-        let full_code: String = pair_a_stdout
-            .lines()
-            .find_map(|line| {
-                let s = line.trim();
-                s.strip_prefix("  ")
-                    .filter(|c| c.starts_with(CODE_WORD) && c.contains('-'))
-                    .map(|c| c.to_string())
-            })
-            .unwrap_or_else(|| {
-                eprintln!("pair A stdout:\n{pair_a_stdout}");
-                eprintln!("pair A stderr:\n{pair_a_stderr}");
-                "gigantic-element-9999".to_string() // fallback
-            });
+        // Read pair A's stdout line by line for the minted code
+        let pair_a_stdout = pair_a.stdout.take().unwrap();
+        let mut full_code: Option<String> = None;
+        let reader = BufReader::new(pair_a_stdout);
+        for line in reader.lines() {
+            let line = line.unwrap_or_default();
+            eprintln!("[pair A] {line}");
+            let s = line.trim();
+            if let Some(start) = s.find(CODE_WORD) {
+                let rest = &s[start..];
+                let end = rest.find(|c: char| !c.is_alphanumeric()).unwrap_or(rest.len());
+                full_code = Some(s[start..][..end].to_string());
+                break;
+            }
+        }
 
-        // Pair B: claim the code
+        let full_code = full_code.expect("pair A did not mint a code");
+
+        // Claim on B while A is still running (pair B connects to A's room)
         let mut pair_b = Command::new(&bin)
             .env("FILAMENT_CONFIG_DIR", &self.b_dir)
             .arg("pair")
@@ -223,11 +224,15 @@ impl Harness {
         let pair_b_out = pair_b.wait_with_output().expect("pair B result");
         let pair_b_stdout = String::from_utf8_lossy(&pair_b_out.stdout);
         let pair_b_stderr = String::from_utf8_lossy(&pair_b_out.stderr);
+        eprintln!("[pair B stdout] {pair_b_stdout}");
+        eprintln!("[pair B stderr] {pair_b_stderr}");
 
-        eprintln!("pair A stdout:\n{pair_a_stdout}");
-        eprintln!("pair A stderr:\n{pair_a_stderr}");
-        eprintln!("pair B stdout:\n{pair_b_stdout}");
-        eprintln!("pair B stderr:\n{pair_b_stderr}");
+        // Now A should finish (B claimed its code)
+        let pair_a_out = pair_a.wait_with_output().expect("pair A result");
+        let pair_a_stdout_full = String::from_utf8_lossy(&pair_a_out.stdout);
+        let pair_a_stderr = String::from_utf8_lossy(&pair_a_out.stderr);
+        eprintln!("[pair A remaining stdout] {pair_a_stdout_full}");
+        eprintln!("[pair A stderr] {pair_a_stderr}");
 
         // Give the daemons a moment to establish the direct-QUIC connection
         std::thread::sleep(Duration::from_secs(3));
@@ -317,7 +322,7 @@ fn pair_and_transfer_smoke() {
     let bin = h.filament_bin().to_path_buf();
     let server = h.server_url();
 
-    // Mint the send code first
+    // Mint the send code: spawn in background, read code from stdout
     let mut send_proc = Command::new(&bin)
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
         .arg("send")
@@ -330,27 +335,20 @@ fn pair_and_transfer_smoke() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("send");
-    let send_out = send_proc.wait_with_output().expect("send result");
-    let send_stdout = String::from_utf8_lossy(&send_out.stdout);
-    let send_stderr = String::from_utf8_lossy(&send_out.stderr);
-    eprintln!("send stdout:\n{send_stdout}");
-    eprintln!("send stderr:\n{send_stderr}");
-
-    // Extract the minted code
-    let full_code: String = send_stdout
-        .lines()
-        .find_map(|line| {
-            let s = line.trim();
-            if s.starts_with(CODE_WORD) && s.contains('-') {
-                Some(s.to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| {
-            eprintln!("failed to extract code from send output");
-            "gigantic-element-9999".to_string()
-        });
+    let send_stdout = send_proc.stdout.take().unwrap();
+    let mut full_code: Option<String> = None;
+    let reader = BufReader::new(send_stdout);
+    for line in reader.lines() {
+        let line = line.unwrap_or_default();
+        eprintln!("[send] {line}");
+        if let Some(start) = line.find(CODE_WORD) {
+            let rest = &line[start..];
+            let end = rest.find(|c: char| !c.is_alphanumeric()).unwrap_or(rest.len());
+            full_code = Some(line[start..][..end].to_string());
+            break;
+        }
+    }
+    let full_code = full_code.expect("send did not mint a code");
 
     // Receive on B
     let recv_dir = h.b_dir.join("received");
