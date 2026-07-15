@@ -574,6 +574,12 @@ enum Cmd {
         /// every other device still needs an explicit `grant <dev> shell`.
         #[arg(long, value_name = "DEVICES")]
         shell_only: Option<String>,
+        /// The shell program to spawn for PTY sessions (overrides platform default).
+        /// Can carry args: `--shell-program "bash -l"`, `"pwsh -NoLogo"`.
+        /// Persistent: use `filament set shell-program "<program>"` for the daemon.
+        /// Env: `FILAMENT_SHELL`.
+        #[arg(long, value_name = "PROGRAM")]
+        shell_program: Option<String>,
         /// Drop the web-shell / ssh PTY to this non-root account (via
         /// `runuser -l <user>`). STRONGLY recommended when `up` runs as root:
         /// without it, a granted device gets a shell as the up-process user
@@ -755,6 +761,9 @@ enum Cmd {
     Pty {
         /// Known device (petname) to open a shell on
         peer: String,
+        /// Optional one-shot command to run and return (no interactive shell)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
     },
     /// Forward a local port to a known peer's port.
     ///
@@ -1710,16 +1719,10 @@ fn daemon_alive() -> Option<u32> {
 /// flag the PTY runs as the up-process user (often root on a server); this is an
 /// ACCEPTED RISK documented in docs/security/web-shell-review.md (M-1) and in the
 /// `up --shell` help. Operators are urged to pass `--shell-user`.
-fn shell_argv(shell_user: Option<&str>) -> Vec<String> {
-    let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
-        if std::path::Path::new("/bin/bash").exists() { "/bin/bash".into() } else { "/bin/sh".into() }
-    });
-    match shell_user {
-        // `runuser -l <user>` opens a fresh login shell as <user>; we don't force
-        // a specific shell so the target account's own login shell is honored.
-        Some(user) => vec!["runuser".into(), "-l".into(), user.into()],
-        None => vec![shell, "-l".into()],
-    }
+fn shell_argv(shell_program: Option<&str>, shell_user: Option<&str>) -> Vec<String> {
+    let shell_config = settings::get_str("shell-program", None);
+    let (argv, _can_user) = platform::Paths::shell_argv(shell_program, shell_config.as_deref(), shell_user);
+    argv
 }
 
 /// #4: bridge ONE link's PTY stream to a persistent session. Inbound data frames
@@ -1964,8 +1967,14 @@ async fn up_cmd(
     relay: bool,
     shell: bool,
     shell_only: Option<String>,
+    shell_program: Option<String>,
     shell_user: Option<String>,
 ) -> Result<()> {
+    // --shell-program -- persist it so the daemon picks it up (shell_argv reads
+    // this from config). The env var FILAMENT_SHELL is also checked independently.
+    if let Some(ref prog) = shell_program {
+        settings::set("shell-program", prog, None).ok();
+    }
     let shell_policy = match &shell_only {
         Some(csv) => ShellPolicy::Only(
             csv.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
@@ -1973,6 +1982,10 @@ async fn up_cmd(
         None if shell => ShellPolicy::All,
         None => ShellPolicy::Granted,
     };
+    // --shell-user is Unix-only (uses runuser). Warn early on Windows.
+    if shell_user.is_some() && cfg!(windows) {
+        ui::say(&format!("  {} --shell-user is not supported on Windows (PTY runs as current user)", ui::paint(ui::Tone::Warn, "WARNING:")));
+    }
     if install && system {
         return install_system_service(shell, &shell_only, &shell_user);
     }
@@ -5518,7 +5531,7 @@ async fn handle_warm_pty(
     // pty rather than getting a dead terminal. Spawned so the verify wait never
     // blocks the event loop (F8).
     tokio::spawn(async move {
-        match l2::open_pty_stream_verified(&mux, &session, cols, rows, &term, verify).await {
+        match l2::open_pty_stream_verified(&mux, &session, cols, rows, &term, "", verify).await {
             Ok((sid, first, rx_pipe)) => {
                 if let Ok(mut m) = warm_ptys.lock() {
                     m.insert(session.clone(), (pid, sid));
@@ -5678,14 +5691,10 @@ async fn main() -> Result<()> {
                 // if the peer can't run the handshake).
                 argv.insert(1, "recv".into());
             } else if devices_load().iter().any(|(n, _)| n == first) {
-                // Bare device name = shell in. `filament dovm` opens filament's OWN
-                // pty (universal: no sshd needed, resumable, survives link repairs) -
-                // the "just works" default. `filament dovm <cmd>` runs a one-off
-                // command, which needs a real command runner, so that routes to ssh.
-                // Deterministic on what you typed (no runtime fallback magic); a real
-                // subcommand still wins (cmd_names above); only fires for a paired name.
-                let verb = if argv.len() > 2 { "ssh" } else { "pty" };
-                argv.insert(1, verb.into());
+                // Bare device name = shell in. `filament dovm` opens an interactive
+                // PTY. `filament dovm <cmd...>` runs a one-shot command over PTY
+                // (no sshd needed; the PTY protocol handles it).
+                argv.insert(1, "pty".into());
             } else {
                 // Not a command, path, code, or paired device. Give a filament-native
                 // error with a did-you-mean over BOTH commands and device names,
@@ -5865,7 +5874,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Up { install, system, userspace, dir, shell, shell_only, shell_user } => {
+        Cmd::Up { install, system, userspace, dir, shell, shell_only, shell_program, shell_user } => {
             // `--userspace` forces the netstack backend; L3::start reads this env, so
             // set it before the daemon brings L3 up (same process). Safe: single
             // threaded at this point (the daemon's tasks are not spawned yet).
@@ -5883,7 +5892,7 @@ async fn main() -> Result<()> {
                 (Some(list), false) => Some(format!("{list},{}", peer_shell.join(","))),
                 (None, false) => Some(peer_shell.join(",")),
             };
-            up_cmd(&server, install, system, dir, relay, shell, shell_only, shell_user).await
+            up_cmd(&server, install, system, dir, relay, shell, shell_only, shell_program, shell_user).await
         }
         Cmd::Status { json } => status_cmd(json),
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
@@ -5971,7 +5980,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Netcat { peer, rport } => l2::netcat_cmd(&server, &peer, rport, relay).await,
         Cmd::Dial { peer, port } => l2::dial_cmd(&peer, port).await,
-        Cmd::Pty { peer } => l2::pty_cmd(&server, &peer, relay).await,
+        Cmd::Pty { peer, cmd } => l2::pty_cmd(&server, &peer, relay, cmd).await,
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
         Cmd::Expose { port, to, peer, list } => expose::expose_cmd(port, to, peer, list).await,
         Cmd::Unexpose { port } => { ui_caps.confirm("unexpose a port")?; expose::unexpose_cmd(port).await },
@@ -9527,6 +9536,11 @@ async fn recv_cmd(
                         .filter(|s| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_graphic()))
                         .unwrap_or("xterm-256color")
                         .to_string();
+                    // One-shot command (non-empty when pty one-shot was requested).
+                    let pty_cmd = v["cmd"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
                     // RESUME-ONLY (warm-drop fall-through): the client wants to
                     // REATTACH an existing session and never start a fresh shell, so a
                     // clean warm exit can't turn into a surprise re-login.
@@ -9586,6 +9600,14 @@ async fn recv_cmd(
                     // #4: spawn the PTY as a PERSISTENT session keyed by session_id,
                     // not a link-bound serve_pty. It outlives this link; a drop
                     // detaches it, a reconnect reattaches above.
+                    // Resolve the shell and build interactive or one-shot argv.
+                    let shell_argv = shell_argv(None, shell_user.as_deref());
+                    let host = platform::ShellHost::new(&shell_argv);
+                    let argv = if pty_cmd.is_empty() {
+                        host.interactive_args()
+                    } else {
+                        host.exec_cmd_args(&pty_cmd)
+                    };
                     match l2::spawn_pty_session(
                         pty_sessions.clone(),
                         session_id.clone(),
@@ -9594,7 +9616,7 @@ async fn recv_cmd(
                         cols,
                         rows,
                         &term,
-                        shell_argv(shell_user.as_deref()),
+                        argv,
                         pty_guard,
                     )
                     .await

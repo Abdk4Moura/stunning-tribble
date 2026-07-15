@@ -58,6 +58,88 @@ impl Paths {
             }
         }
     }
+
+    /// Platform-aware home directory for the current user.
+    /// Unix: `$HOME`. Windows: `%USERPROFILE%`. Falls back to `"."` when unset.
+    pub fn home_dir() -> PathBuf {
+        #[cfg(unix)]
+        {
+            if let Ok(h) = std::env::var("HOME") {
+                if !h.is_empty() {
+                    return PathBuf::from(h);
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Ok(h) = std::env::var("USERPROFILE") {
+                if !h.is_empty() {
+                    return PathBuf::from(h);
+                }
+            }
+        }
+        PathBuf::from(".")
+    }
+
+    /// Platform-aware shell for PTY sessions. Returns `(argv, can_use_user)`.
+    ///
+    /// Resolution order (first match wins):
+    /// 1. `shell_program` (from `--shell-program` flag)
+    /// 2. `FILAMENT_SHELL` env var
+    /// 3. `filament set shell` config (passed via `shell_config`)
+    /// 4. `$SHELL` on Unix / powershell→cmd on Windows
+    /// 5. Hardcoded fallback (`/bin/bash` → `/bin/sh` / `cmd.exe`)
+    ///
+    /// The value is argv-split so it can carry args: `bash -l`, `pwsh -NoLogo`.
+    /// On Unix, `shell_user` uses `runuser -l`; on Windows it's unsupported.
+    pub fn shell_argv(shell_program: Option<&str>, shell_config: Option<&str>, shell_user: Option<&str>) -> (Vec<String>, bool) {
+        let shell = shell_program
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("FILAMENT_SHELL").ok().filter(|s| !s.is_empty()))
+            .or_else(|| shell_config.map(|s| s.to_string()))
+            .unwrap_or_else(|| Self::default_shell());
+
+        let parts: Vec<String> = shell.split_whitespace().map(|s| s.to_string()).collect();
+        #[cfg(unix)]
+        {
+            let argv = match shell_user {
+                Some(user) => vec!["runuser".into(), "-l".into(), user.into()],
+                None => parts,
+            };
+            (argv, true)
+        }
+        #[cfg(windows)]
+        {
+            (parts, false)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            (parts, true)
+        }
+    }
+
+    fn default_shell() -> String {
+        #[cfg(unix)]
+        {
+            std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
+                if Path::new("/bin/bash").exists() { "/bin/bash".into() } else { "/bin/sh".into() }
+            })
+        }
+        #[cfg(windows)]
+        {
+            if Path::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe").exists() {
+                "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".into()
+            } else if Path::new("C:\\Windows\\System32\\cmd.exe").exists() {
+                "C:\\Windows\\System32\\cmd.exe".into()
+            } else {
+                "cmd.exe".into()
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            "/bin/sh".into()
+        }
+    }
 }
 
 // ------------------------------------------------------------ SecretFile --
@@ -263,6 +345,86 @@ impl InstallSource {
     }
 }
 
+// ----------------------------------------------------------- ShellHost --
+
+/// Shell invocation strategy — the correct flag for running a command
+/// depends on the shell family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellKind {
+    /// sh / bash / zsh / fish / dash: `-c 'cmd'`
+    Posix,
+    /// powershell.exe / pwsh.exe / pwsh: `-Command 'cmd'`
+    PowerShell,
+    /// cmd.exe: `/c cmd`
+    Cmd,
+}
+
+/// Resolves the shell program and provides the correct invocation for
+/// interactive (login PTY) and one-shot (`exec cmd`) modes.
+pub struct ShellHost {
+    argv: Vec<String>,
+    kind: ShellKind,
+}
+
+impl ShellHost {
+    /// Resolve the shell from the precedence chain. No external resolution
+    /// is done here — callers pass the already-resolved argv (from
+    /// --shell-program / FILAMENT_SHELL / config / $SHELL / platform default).
+    pub fn new(shell_argv: &[String]) -> Self {
+        let binary = shell_argv.first().map(|s| s.as_str()).unwrap_or("");
+        let name = Path::new(binary)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let kind = if name.contains("pwsh") || name.contains("powershell") {
+            ShellKind::PowerShell
+        } else if name == "cmd.exe" || name == "cmd" {
+            ShellKind::Cmd
+        } else {
+            ShellKind::Posix
+        };
+        ShellHost {
+            argv: shell_argv.to_vec(),
+            kind,
+        }
+    }
+
+    /// Args for spawning an INTERACTIVE login shell (PTY session).
+    pub fn interactive_args(&self) -> Vec<String> {
+        let mut args = self.argv.clone();
+        match self.kind {
+            ShellKind::Posix => {
+                if !args.iter().any(|a| a == "-l" || a == "--login") {
+                    args.push("-l".into());
+                }
+                args
+            }
+            _ => args,
+        }
+    }
+
+    /// Args for running a one-shot COMMAND (returns, no interactive shell).
+    pub fn exec_cmd_args(&self, cmd: &str) -> Vec<String> {
+        let mut args = vec![self.argv[0].clone()];
+        match self.kind {
+            ShellKind::Posix => {
+                args.push("-c".into());
+                args.push(cmd.to_string());
+            }
+            ShellKind::PowerShell => {
+                args.push("-Command".into());
+                args.push(cmd.to_string());
+            }
+            ShellKind::Cmd => {
+                args.push("/c".into());
+                args.push(cmd.to_string());
+            }
+        }
+        args
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +504,45 @@ mod tests {
         assert_eq!(InstallSource::Winget.upgrade_hint(), "winget upgrade Abdk4Moura.Filament");
         assert_eq!(InstallSource::Cargo.upgrade_hint(), "cargo install filament-cli");
         assert_eq!(InstallSource::SelfInstalled.upgrade_hint(), "");
+    }
+
+    #[test]
+    fn shell_host_interactive_posix_adds_login() {
+        let sh = ShellHost::new(&["/bin/bash".into()]);
+        assert!(sh.interactive_args().contains(&"-l".into()));
+    }
+
+    #[test]
+    fn shell_host_exec_posix_uses_minus_c() {
+        let sh = ShellHost::new(&["bash".into()]);
+        let args = sh.exec_cmd_args("echo hi");
+        assert_eq!(args[0], "bash");
+        assert_eq!(args[1], "-c");
+        assert_eq!(args[2], "echo hi");
+    }
+
+    #[test]
+    fn shell_host_exec_powershell_uses_command_flag() {
+        let sh = ShellHost::new(&["pwsh.exe".into()]);
+        let args = sh.exec_cmd_args("Get-Date");
+        assert_eq!(args[1], "-Command");
+        assert_eq!(args[2], "Get-Date");
+    }
+
+    #[test]
+    fn shell_host_exec_cmd_uses_slash_c() {
+        let sh = ShellHost::new(&["cmd.exe".into()]);
+        let args = sh.exec_cmd_args("dir");
+        assert_eq!(args[1], "/c");
+        assert_eq!(args[2], "dir");
+    }
+
+    #[test]
+    fn shell_host_preserves_shell_argv_prefix() {
+        let sh = ShellHost::new(&["bash".into(), "-l".into(), "-i".into()]);
+        let args = sh.exec_cmd_args("echo x");
+        assert_eq!(args[0], "bash");
+        assert_eq!(args[1], "-c");
+        assert_eq!(args[2], "echo x");
     }
 }
