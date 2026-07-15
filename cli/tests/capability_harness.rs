@@ -174,6 +174,8 @@ impl Harness {
 
         // Step 1: Pair A mints a code (no daemon needed for pairing)
         let mut pair_a = Command::new(&bin)
+            .env("FILAMENT_DIRECT_LOOPBACK_ONLY", "1")
+            .env("FILAMENT_NAME", "test-a")
             .env("FILAMENT_CONFIG_DIR", &self.a_dir)
             .arg("pair")
             .arg("--word")
@@ -204,6 +206,8 @@ impl Harness {
 
         // Pair B claims the code
         let mut pair_b = Command::new(&bin)
+            .env("FILAMENT_DIRECT_LOOPBACK_ONLY", "1")
+            .env("FILAMENT_NAME", "test-b")
             .env("FILAMENT_CONFIG_DIR", &self.b_dir)
             .arg("pair")
             .arg(&full_code)
@@ -334,6 +338,7 @@ fn pair_and_transfer_smoke() {
 
     // Mint the send code: spawn in background, read code from stdout
     let mut send_proc = Command::new(&bin)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", "1")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
         .arg("send")
         .arg(&test_file)
