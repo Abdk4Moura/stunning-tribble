@@ -1173,7 +1173,7 @@ impl Peer {
         // routable interfaces on CI). Mirrors direct.rs's loopback_only().
         #[cfg(feature = "test-hooks")]
         if std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").map(|v| v == "1").unwrap_or(false) {
-            se.set_ip_filter(Box::new(|ip: &std::net::IpAddr| ip.is_loopback()));
+            se.set_ip_filter(Box::new(|ip: std::net::IpAddr| ip.is_loopback()));
         }
         se.detach_data_channels(); // C1: we run our own read loop (see READ_BUF)
         let api = APIBuilder::new()
