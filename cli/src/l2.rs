@@ -3419,10 +3419,14 @@ async fn ensure_sshd(peer: &str, rport: u16, reported: Option<bool>) {
     }
     crate::ui::problem(
         &format!("filament ssh: no sshd on '{peer}'"),
-        &format!("'{peer}' is reachable, but nothing is listening on port {rport} for ssh."),
+        &format!(
+            "'{peer}' is reachable, but nothing is listening on localhost:{rport} for ssh. \
+             (sshd may be bound to a non-localhost address like the mesh ULA — \
+             `filament ssh` connects to localhost:{rport} on the peer.)",
+        ),
         &[
-            format!("start an sshd on '{peer}'"),
-            format!("set {} to its port", crate::ui::paint(crate::ui::Tone::Brand, "FILAMENT_SSH_PORT")),
+            format!("start an sshd on '{peer}' listening on localhost (or all interfaces)"),
+            format!("set {} to a different port", crate::ui::paint(crate::ui::Tone::Brand, "FILAMENT_SSH_PORT")),
             format!(
                 "use {} for a shell that needs no sshd",
                 crate::ui::paint(crate::ui::Tone::Brand, &format!("filament pty {peer}"))
