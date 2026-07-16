@@ -2987,9 +2987,13 @@ struct WarmHold {
     /// Explicitly configured peers (from `warm-peers` setting)
     configured: std::collections::HashSet<String>,
     /// Peers with active relationships (forward/expose/proxy/pty/bridge)
-    /// that should be auto-warmed while the relationship is active
+    /// that should be auto-warmed while the relationship is active.
+    /// UNBOUNDED - not capped like recent LRU.
     active: std::collections::HashSet<String>,
-    /// Recently-used peers in LRU order (most recent at back)
+    /// Peers warmed by L3 overlay being up (all paired peers when L3 enabled).
+    /// UNBOUNDED - not capped like recent LRU.
+    l3: std::collections::HashSet<String>,
+    /// Recently-used peers in LRU order (most recent at back, capped at 5)
     recent: std::collections::VecDeque<String>,
     /// Per-peer last-use timestamp
     last_use: HashMap<String, Instant>,
@@ -3062,12 +3066,15 @@ impl WarmHold {
         }
     }
 
-    /// Check if a peer should be connected (configured OR active OR recently used, not dormant)
+    /// Check if a peer should be connected (configured OR active OR l3 OR recently used, not dormant)
     fn should_connect(&self, peer: &str) -> bool {
         if self.configured.contains(peer) {
             return true;
         }
         if self.active.contains(peer) {
+            return true;
+        }
+        if self.l3.contains(peer) {
             return true;
         }
         if self.recent.contains(&peer.to_string()) {
@@ -3083,13 +3090,19 @@ impl WarmHold {
     /// Get all peers that should be connected
     fn peers_to_connect(&self) -> Vec<String> {
         let mut peers: Vec<String> = self.configured.iter().cloned().collect();
-        // Add active peers
+        // Add active peers (unbounded)
         for p in &self.active {
             if !peers.contains(p) {
                 peers.push(p.clone());
             }
         }
-        // Add recent peers (not dormant)
+        // Add L3 peers (unbounded)
+        for p in &self.l3 {
+            if !peers.contains(p) {
+                peers.push(p.clone());
+            }
+        }
+        // Add recent peers (capped at 5, not dormant)
         for p in &self.recent {
             if !peers.contains(p) {
                 if let Some(b) = self.backoff.get(p) {
@@ -3579,13 +3592,26 @@ impl Conn {
         // Reload configured peers from settings to stay in sync
         self.load_warm_peers_config();
         // L3 auto-warm: when L3 is enabled, auto-warm ALL online paired peers
-        // (the overlay is always-on, so every connection should be instant)
+        // via the unbounded l3 set (NOT recent LRU which is capped at 5)
         if l3_enabled {
-            for name in self.roster.values().filter_map(|v| v["name"].as_str()) {
-                if !self.warm_hold.should_connect(name) {
-                    self.warm_hold.note_use(name);
+            let current_l3: std::collections::HashSet<String> = self.roster.values()
+                .filter_map(|v| v["name"].as_str())
+                .map(|s| s.to_string())
+                .collect();
+            // Add new peers to L3 set
+            for name in &current_l3 {
+                if !self.warm_hold.l3.contains(name) {
+                    self.warm_hold.l3.insert(name.clone());
                     ui::debug(&format!("warm-hold: L3 auto-warming peer '{name}'"));
                 }
+            }
+            // Remove peers no longer in roster
+            self.warm_hold.l3.retain(|name| current_l3.contains(name));
+        } else {
+            // L3 disabled: clear all L3-warmed peers
+            if !self.warm_hold.l3.is_empty() {
+                ui::debug("warm-hold: L3 disabled, clearing L3 warm set");
+                self.warm_hold.l3.clear();
             }
         }
         let mut connected = Vec::new();

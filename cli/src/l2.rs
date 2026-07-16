@@ -2176,24 +2176,6 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
         }
     }
 
-    // PRE-FLIGHT: check if peer is reachable before starting session
-    if !ever_connected && !warm_ended {
-        match preflight_health_check(peer, relay).await {
-            Ok(true) => {} // healthy, proceed
-            Ok(false) => {
-                return Err(anyhow::anyhow!(
-                    "peer '{peer}' is unreachable (not responding to health check)"
-                ));
-            }
-            Err(e) => {
-                eprintln!("filament: pre-flight check inconclusive: {e}, proceeding anyway");
-            }
-        }
-    }
-
-    // RETRY LOOP: first cold connect gets retries with backoff (1s, 2s, 4s)
-    let mut cold_retries: u32 = 0;
-    let cold_max_retries = 3;
     loop {
         // Resume-only after any prior connection (warm or cold). If the session
         // is gone (shell exited cleanly on a prior drop), the acceptor returns
@@ -2209,20 +2191,16 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                 ever_connected = true;
                 last_up = std::time::Instant::now();
                 backoff = Duration::from_millis(300);
-                cold_retries = 0; // reset cold retries after successful connect
                 role = "reconnect";
                 eprint!("\r\n\x1b[2m[filament: link dropped, reconnecting...]\x1b[0m\r\n");
                 continue;
             }
             Err(e) => {
-                // First COLD connect: retry with backoff before giving up
-                if !ever_connected && !warm_ended && cold_retries < cold_max_retries {
-                    cold_retries += 1;
-                    let wait = Duration::from_secs(1u64 << (cold_retries - 1)); // 1s, 2s, 4s
-                    eprint!("\r\n\x1b[2m[filament: connection attempt {} failed, retrying in {}s...]\x1b[0m\r\n",
-                        cold_retries, wait.as_secs());
-                    tokio::time::sleep(wait).await;
-                    continue;
+                // A first COLD connect (no warm session) failing is fatal. But if a
+                // warm session just ended, a failed reattach should RETRY (the mesh
+                // may be mid-repair) until the reaper window, not bail.
+                if !ever_connected && !warm_ended {
+                    return Err(e);
                 }
                 // A reconnect attempt failed. Keep trying until the acceptor would
                 // have reaped the detached session (SESSION_DETACHED_IDLE = 180s);
@@ -3319,28 +3297,8 @@ pub(crate) fn l3_dest(info: &PeerSshInfo) -> Option<String> {
 pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) -> Result<()> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
 
-    // PRE-FLIGHT: check if peer is reachable before bootstrap
-    match preflight_health_check(peer, relay).await {
-        Ok(true) => {} // healthy, proceed
-        Ok(false) => {
-            crate::ui::problem(
-                &format!("filament ssh: peer '{peer}' unreachable"),
-                "The peer is not responding to health checks.",
-                &[
-                    format!("check if '{peer}' is online"),
-                    format!("try `filament {peer}` for a shell (no sshd needed)"),
-                ],
-            );
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("filament: pre-flight check inconclusive: {e}, proceeding anyway");
-        }
-    }
-
     let info = ensure_peer_bootstrap(server, peer, relay).await?;
 
-    // RETRY: if initial ssh fails with connection error, retry once
     let code = run_ssh(server, peer, relay, &info.host, &info.login, info.rport, extra, true).await?;
 
     // A cached skip that failed at the ssh layer (connect/auth, exit 255) may mean
@@ -3419,60 +3377,6 @@ async fn probe_sshd_warm(peer: &str, rport: u16) -> Option<bool> {
         Ok(Err(_)) => Some(false), // stream error: treat as unreachable
         Err(_) => None,            // no banner in time: inconclusive, don't block
     }
-}
-
-// --- PRE-FLIGHT HEALTH CHECK + RETRY ---
-
-/// Pre-flight health check: verify the peer is reachable before starting a
-/// pty/ssh session. Uses the warm-link probe if available, otherwise does a
-/// cold establish probe. Returns Ok(true) if healthy, Ok(false) if unreachable,
-/// or Err with a clear message.
-///
-/// This is belt-and-suspenders for un-warmed / first-connect cases. Warm peers
-/// should sail through instantly (that's the point of warm-hold).
-async fn preflight_health_check(peer: &str, relay: bool) -> Result<bool> {
-    // Try warm probe first (instant, no cold establish)
-    #[cfg(unix)]
-    {
-        if let Some(healthy) = probe_sshd_warm(peer, 22).await {
-            return Ok(healthy);
-        }
-    }
-    // Warm probe inconclusive - try cold establish probe
-    match crate::l2::establish_probe("", peer, relay).await {
-        Ok(o) if o.established => Ok(true),
-        Ok(o) => {
-            let phase = o.failed_phase.map(|p| p.label()).unwrap_or("establishing");
-            Ok(false)
-        }
-        Err(e) => Ok(false),
-    }
-}
-
-/// Retry-with-backoff for initial connection. Tries up to `max_retries` times
-/// with exponential backoff (1s, 2s, 4s). Returns Ok on first success, or
-/// the last error after all retries exhausted.
-async fn retry_connect<F, Fut, T>(max_retries: u32, mut f: F) -> Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
-{
-    let mut last_err = None;
-    for attempt in 0..=max_retries {
-        match f().await {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                if attempt < max_retries {
-                    let backoff = Duration::from_secs(1u64 << attempt); // 1s, 2s, 4s
-                    eprint!("\r\n\x1b[2m[filament: connection attempt {} failed, retrying in {}s...]\x1b[0m\r\n",
-                        attempt + 1, backoff.as_secs());
-                    tokio::time::sleep(backoff).await;
-                }
-                last_err = Some(e);
-            }
-        }
-    }
-    Err(last_err.unwrap())
 }
 
 #[cfg(test)]
