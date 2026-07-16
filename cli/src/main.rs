@@ -2248,6 +2248,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
     local_listener: None,
     direct_endpoint: None,
     warm_hold: WarmHold::default(),
+    cold_establishes: std::sync::atomic::AtomicU64::new(0),
     worker_port_tx: HashMap::new(),
     };
     // sid -> which device (false = a, true = b)
@@ -3132,6 +3133,177 @@ impl WarmHold {
     }
 }
 
+#[cfg(test)]
+mod warm_hold_tests {
+    use super::*;
+
+    #[test]
+    fn should_connect_configured() {
+        let mut wh = WarmHold::default();
+        wh.configured.insert("dovm".into());
+        assert!(wh.should_connect("dovm"));
+        assert!(!wh.should_connect("popos"));
+    }
+
+    #[test]
+    fn should_connect_active() {
+        let mut wh = WarmHold::default();
+        wh.active.insert("dovm".into());
+        assert!(wh.should_connect("dovm"));
+        assert!(!wh.should_connect("popos"));
+    }
+
+    #[test]
+    fn should_connect_l3() {
+        let mut wh = WarmHold::default();
+        wh.l3.insert("dovm".into());
+        assert!(wh.should_connect("dovm"));
+        assert!(!wh.should_connect("popos"));
+    }
+
+    #[test]
+    fn should_connect_recent_not_dormant() {
+        let mut wh = WarmHold::default();
+        wh.note_use("dovm");
+        assert!(wh.should_connect("dovm"));
+    }
+
+    #[test]
+    fn should_connect_false_for_dormant() {
+        let mut wh = WarmHold::default();
+        for _ in 0..WARM_DORMANT_THRESHOLD {
+            wh.note_failure("dovm");
+        }
+        assert!(!wh.should_connect("dovm"));
+    }
+
+    #[test]
+    fn should_connect_false_for_unknown() {
+        let wh = WarmHold::default();
+        assert!(!wh.should_connect("unknown"));
+    }
+
+    #[test]
+    fn recent_lru_caps_at_5() {
+        let mut wh = WarmHold::default();
+        for i in 0..7 {
+            wh.note_use(&format!("peer{i}"));
+        }
+        // Should only have last 5: peer2, peer3, peer4, peer5, peer6
+        assert_eq!(wh.recent.len(), WARM_RECENT_CAP);
+        assert!(!wh.recent.contains(&"peer0".to_string()));
+        assert!(!wh.recent.contains(&"peer1".to_string()));
+        assert!(wh.recent.contains(&"peer2".to_string()));
+        assert!(wh.recent.contains(&"peer6".to_string()));
+    }
+
+    #[test]
+    fn recent_evicts_oldest() {
+        let mut wh = WarmHold::default();
+        wh.note_use("a");
+        wh.note_use("b");
+        wh.note_use("c");
+        wh.note_use("d");
+        wh.note_use("e");
+        // All 5 present
+        assert_eq!(wh.recent.len(), 5);
+        // Add 6th - "a" should be evicted
+        wh.note_use("f");
+        assert_eq!(wh.recent.len(), 5);
+        assert!(!wh.recent.contains(&"a".to_string()));
+        assert!(wh.recent.contains(&"f".to_string()));
+    }
+
+    #[test]
+    fn l3_set_is_unbounded() {
+        let mut wh = WarmHold::default();
+        // Add 10 peers to L3 set
+        for i in 0..10 {
+            wh.l3.insert(format!("peer{i}"));
+        }
+        // All 10 should be in peers_to_connect
+        let peers = wh.peers_to_connect();
+        for i in 0..10 {
+            assert!(peers.contains(&format!("peer{i}")), "peer{i} missing");
+        }
+    }
+
+    #[test]
+    fn active_add_remove() {
+        let mut wh = WarmHold::default();
+        wh.active.insert("dovm".into());
+        assert!(wh.should_connect("dovm"));
+        wh.active.remove("dovm");
+        assert!(!wh.should_connect("dovm"));
+    }
+
+    #[test]
+    fn l3_disabled_clears_set() {
+        let mut wh = WarmHold::default();
+        wh.l3.insert("dovm".into());
+        wh.l3.insert("popos".into());
+        assert!(wh.should_connect("dovm"));
+        // Simulate L3 disabled
+        wh.l3.clear();
+        assert!(!wh.should_connect("dovm"));
+        assert!(!wh.should_connect("popos"));
+    }
+
+    #[test]
+    fn note_failure_backoff_doubling() {
+        let mut wh = WarmHold::default();
+        wh.note_failure("dovm");
+        assert_eq!(wh.backoff["dovm"].duration, Duration::from_secs(2));
+        wh.note_failure("dovm");
+        assert_eq!(wh.backoff["dovm"].duration, Duration::from_secs(4));
+        wh.note_failure("dovm");
+        assert_eq!(wh.backoff["dovm"].duration, Duration::from_secs(8));
+    }
+
+    #[test]
+    fn note_failure_caps_at_30s() {
+        let mut wh = WarmHold::default();
+        for _ in 0..10 {
+            wh.note_failure("dovm");
+        }
+        assert_eq!(wh.backoff["dovm"].duration, WARM_MAX_BACKOFF);
+    }
+
+    #[test]
+    fn note_failure_dormant_after_threshold() {
+        let mut wh = WarmHold::default();
+        for _ in 0..WARM_DORMANT_THRESHOLD {
+            wh.note_failure("dovm");
+        }
+        assert!(wh.backoff["dovm"].dormant);
+        assert!(wh.is_dormant("dovm"));
+    }
+
+    #[test]
+    fn note_use_clears_backoff() {
+        let mut wh = WarmHold::default();
+        for _ in 0..WARM_DORMANT_THRESHOLD {
+            wh.note_failure("dovm");
+        }
+        assert!(wh.is_dormant("dovm"));
+        wh.note_use("dovm");
+        assert!(!wh.is_dormant("dovm"));
+        assert_eq!(wh.backoff["dovm"].duration, Duration::from_secs(1));
+        assert_eq!(wh.backoff["dovm"].failures, 0);
+    }
+
+    #[test]
+    fn resume_clears_dormant() {
+        let mut wh = WarmHold::default();
+        for _ in 0..WARM_DORMANT_THRESHOLD {
+            wh.note_failure("dovm");
+        }
+        assert!(wh.is_dormant("dovm"));
+        wh.resume("dovm");
+        assert!(!wh.is_dormant("dovm"));
+    }
+}
+
 struct Conn {
     server: String,
     sio: rust_socketio::asynchronous::Client,
@@ -3211,6 +3383,9 @@ struct Conn {
     /// configured peers so `filament ping`/`ssh` is instant. Tracked per-peer
     /// with LRU eviction and exponential backoff on failures.
     warm_hold: WarmHold,
+    /// Cold-establish counter: increments every time a connection is cold-established
+    /// (via establish()). Exposed for CI guardrail to verify warm path reuses held links.
+    cold_establishes: std::sync::atomic::AtomicU64,
     /// Oneshot senders for per-endpoint worker port negotiation, keyed by pid.
     /// The dialer-side `spawn_direct_workers` stores a sender here; the
     /// `worker-ports` control message handler delivers the acceptor's port list
@@ -3372,6 +3547,7 @@ impl Conn {
             local_listener: None,
             direct_endpoint: None,
             warm_hold: WarmHold::default(),
+            cold_establishes: std::sync::atomic::AtomicU64::new(0),
             worker_port_tx: HashMap::new(),
         }
     }
@@ -3658,6 +3834,8 @@ impl Conn {
     }
 
     async fn establish(&mut self, info: Value) -> Result<()> {
+        // Track cold-establishes for CI guardrail (warm path should bypass this)
+        self.cold_establishes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.establish_as(info, None).await
     }
 
