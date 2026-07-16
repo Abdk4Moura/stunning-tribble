@@ -2230,6 +2230,10 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     // can't tell). The first cold attach after that is RESUME-ONLY: a warm drop
     // reattaches the SAME live shell/TUI (seamless, no re-login); a clean warm exit
     // finds no session and the acceptor closes it, so we exit cleanly.
+    // TODO: distinguish clean-exit from transport-drop at the warm layer.
+    //   Currently the bridge sees an opaque socket close for both cases.
+    //   A `ctl::session_alive(peer)` probe before the cold loop would skip
+    //   unnecessary transport establishment after a clean logout.
     let mut warm_ended = false;
 
     #[cfg(unix)]
