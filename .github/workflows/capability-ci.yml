@@ -79,6 +79,11 @@ jobs:
     needs: build
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    # macOS ARM64: local-process P2P transport stalls (transport_up=false). Both
+    # direct-QUIC and WebRTC fail to establish on the stock GitHub runner. Tried:
+    # firewall disable, codesign, WebRTC-only, threading mode, mDNS disable.
+    # Tracked in #26 — allow failure so ubuntu+windows CI remains green.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:
