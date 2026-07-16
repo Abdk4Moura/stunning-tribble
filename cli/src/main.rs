@@ -8636,8 +8636,10 @@ async fn recv_cmd(
                         } else if matches!(&req.kind, ctl::ReqKind::MountHealth { .. }) {
                             handle_mount_health(req, &daemon_mounts).await;
                         } else {
-                            // Auto-warm: track peer for active relationships (forward/expose/pty)
-                            if let ctl::ReqKind::Open { peer, .. } | ctl::ReqKind::Pty { peer, .. } = &req.kind {
+                            // Auto-warm: track peer for active PTY relationships only.
+                            // Open (forward/netcat) is short-lived, not worth warming permanently.
+                            // Pty sessions are long-lived interactive shells worth keeping warm.
+                            if let ctl::ReqKind::Pty { peer, .. } = &req.kind {
                                 conn.note_active_relationship(peer);
                             }
                             handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
