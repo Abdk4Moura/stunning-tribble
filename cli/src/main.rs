@@ -2247,6 +2247,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
     local_port: None,
     local_listener: None,
     direct_endpoint: None,
+    warm_hold: WarmHold::default(),
     worker_port_tx: HashMap::new(),
     };
     // sid -> which device (false = a, true = b)
@@ -2969,6 +2970,142 @@ struct RejoinState {
     away: Option<(String, Instant)>,
 }
 
+/// WARM-HOLD state: keeps connections alive to recently-used and explicitly
+/// configured peers so `filament ping`/`ssh` is instant.
+///
+/// Design:
+/// - EXPLICIT peers: from `filament set warm-peers dovm,popos` (always connected)
+/// - RECENT peers: LRU of last 5 peers used for send/ssh/ping (auto-connected)
+/// - RECONNECT: exponential backoff (1s, 2s, 4s, 8s, 16s, 30s cap) on drop
+/// - DORMANT: go dormant after 5 failed attempts; resume on peer presence
+const WARM_RECENT_CAP: usize = 5;
+const WARM_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const WARM_DORMANT_THRESHOLD: u32 = 5;
+
+#[derive(Default)]
+struct WarmHold {
+    /// Explicitly configured peers (from `warm-peers` setting)
+    configured: std::collections::HashSet<String>,
+    /// Recently-used peers in LRU order (most recent at back)
+    recent: std::collections::VecDeque<String>,
+    /// Per-peer last-use timestamp
+    last_use: HashMap<String, Instant>,
+    /// Per-peer reconnect backoff state
+    backoff: HashMap<String, WarmBackoff>,
+}
+
+#[derive(Clone)]
+struct WarmBackoff {
+    /// Current backoff duration
+    duration: Duration,
+    /// Number of consecutive failures
+    failures: u32,
+    /// When we last tried to connect
+    last_attempt: Option<Instant>,
+    /// True if we've given up (dormant) after too many failures
+    dormant: bool,
+}
+
+impl Default for WarmBackoff {
+    fn default() -> Self {
+        Self {
+            duration: Duration::from_secs(1),
+            failures: 0,
+            last_attempt: None,
+            dormant: false,
+        }
+    }
+}
+
+impl WarmHold {
+    /// Record that a peer was just used (transfer, ssh, ping)
+    fn note_use(&mut self, peer: &str) {
+        let peer = peer.to_string();
+        self.last_use.insert(peer.clone(), Instant::now());
+        // Move to back of LRU (most recent)
+        self.recent.retain(|p| p != &peer);
+        self.recent.push_back(peer.clone());
+        // Trim to cap
+        while self.recent.len() > WARM_RECENT_CAP {
+            self.recent.pop_front();
+        }
+        // Clear dormant flag and reset backoff on use
+        if let Some(b) = self.backoff.get_mut(&peer) {
+            b.dormant = false;
+            b.failures = 0;
+            b.duration = Duration::from_secs(1);
+        }
+    }
+
+    /// Mark a connection attempt failed (exponential backoff)
+    fn note_failure(&mut self, peer: &str) {
+        let b = self.backoff.entry(peer.to_string()).or_default();
+        b.failures += 1;
+        b.last_attempt = Some(Instant::now());
+        // Exponential backoff with cap
+        b.duration = (b.duration * 2).min(WARM_MAX_BACKOFF);
+        // Go dormant after too many failures
+        if b.failures >= WARM_DORMANT_THRESHOLD {
+            b.dormant = true;
+        }
+    }
+
+    /// Mark a connection succeeded (reset backoff)
+    fn note_success(&mut self, peer: &str) {
+        if let Some(b) = self.backoff.get_mut(peer) {
+            b.failures = 0;
+            b.duration = Duration::from_secs(1);
+            b.dormant = false;
+        }
+    }
+
+    /// Check if a peer should be connected (configured OR recently used, not dormant)
+    fn should_connect(&self, peer: &str) -> bool {
+        if self.configured.contains(peer) {
+            return true;
+        }
+        if self.recent.contains(&peer.to_string()) {
+            // Check if dormant
+            if let Some(b) = self.backoff.get(peer) {
+                return !b.dormant;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Get all peers that should be connected
+    fn peers_to_connect(&self) -> Vec<String> {
+        let mut peers: Vec<String> = self.configured.iter().cloned().collect();
+        for p in &self.recent {
+            if !peers.contains(p) {
+                if let Some(b) = self.backoff.get(p) {
+                    if !b.dormant {
+                        peers.push(p.clone());
+                    }
+                } else {
+                    peers.push(p.clone());
+                }
+            }
+        }
+        peers
+    }
+
+    /// Check if a peer is dormant (too many failures)
+    fn is_dormant(&self, peer: &str) -> bool {
+        self.backoff.get(peer).map(|b| b.dormant).unwrap_or(false)
+    }
+
+    /// Resume a dormant peer (e.g., when it reappears in signaling presence)
+    fn resume(&mut self, peer: &str) {
+        if let Some(b) = self.backoff.get_mut(peer) {
+            b.dormant = false;
+            b.failures = 0;
+            b.duration = Duration::from_secs(1);
+        }
+    }
+}
+
 struct Conn {
     server: String,
     sio: rust_socketio::asynchronous::Client,
@@ -3044,6 +3181,10 @@ struct Conn {
     /// Set once in `start_direct_inner`; `None` when direct is not in use, or
     /// when multi-streaming is disabled (`direct_streams() == 1`).
     direct_endpoint: Option<quinn::Endpoint>,
+    /// WARM-HOLD: keeps connections alive to recently-used and explicitly
+    /// configured peers so `filament ping`/`ssh` is instant. Tracked per-peer
+    /// with LRU eviction and exponential backoff on failures.
+    warm_hold: WarmHold,
     /// Oneshot senders for per-endpoint worker port negotiation, keyed by pid.
     /// The dialer-side `spawn_direct_workers` stores a sender here; the
     /// `worker-ports` control message handler delivers the acceptor's port list
@@ -3204,6 +3345,7 @@ impl Conn {
             local_port: None,
             local_listener: None,
             direct_endpoint: None,
+            warm_hold: WarmHold::default(),
             worker_port_tx: HashMap::new(),
         }
     }
@@ -3378,6 +3520,77 @@ impl Conn {
         if self.is_active(pid) {
             self.active = None;
         }
+    }
+
+    // --- WARM-HOLD: proactive connection management ---
+
+    /// Record that a peer was just used (transfer, ssh, ping). This updates the
+    /// LRU and marks the peer as warm so the daemon proactively connects/reconnects.
+    fn note_warm_use(&mut self, peer: &str) {
+        self.warm_hold.note_use(peer);
+    }
+
+    /// Load configured warm-peers from settings. Called at daemon startup and
+    /// at the top of each warm_hold_tick to stay in sync with runtime changes.
+    fn load_warm_peers_config(&mut self) {
+        if let Some(setting) = settings::get_str("warm-peers", None) {
+            self.warm_hold.configured.clear();
+            for p in setting.split(',') {
+                let p = p.trim().to_string();
+                if !p.is_empty() {
+                    self.warm_hold.configured.insert(p);
+                }
+            }
+        }
+    }
+
+    /// Check for warm peers that need connections and establish them.
+    /// Called periodically from the daemon event loop. Returns the list of
+    /// peers we attempted to connect to.
+    async fn warm_hold_tick(&mut self) -> Vec<String> {
+        // Reload configured peers from settings to stay in sync
+        self.load_warm_peers_config();
+        let mut connected = Vec::new();
+        let peers = self.warm_hold.peers_to_connect();
+        for peer in peers {
+            // Skip if already connected
+            if self.links.iter().any(|(_, l)| {
+                l.verified_name.as_deref().map(|n| n.eq_ignore_ascii_case(&peer)).unwrap_or(false)
+                    && l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false)
+            }) {
+                continue;
+            }
+            // Skip if dormant (too many failures)
+            if self.warm_hold.is_dormant(&peer) {
+                continue;
+            }
+            // Find peer info from roster
+            if let Some(info) = self.roster.values().find(|v| {
+                v["name"].as_str().map(|n| n.eq_ignore_ascii_case(&peer)).unwrap_or(false)
+                    || v["id"].as_str().map(|id| id.eq_ignore_ascii_case(&peer)).unwrap_or(false)
+            }) {
+                let info = info.clone();
+                let peer_id = info["id"].as_str().unwrap_or_default().to_string();
+                // Try to establish connection
+                match self.establish(info).await {
+                    Ok(()) => {
+                        self.warm_hold.note_success(&peer);
+                        ui::debug(&format!("warm-hold: established connection to '{peer}'"));
+                        connected.push(peer);
+                    }
+                    Err(e) => {
+                        self.warm_hold.note_failure(&peer);
+                        ui::debug(&format!("warm-hold: failed to connect to '{peer}': {e}"));
+                    }
+                }
+            }
+        }
+        connected
+    }
+
+    /// Resume a dormant warm peer (e.g., when it reappears in signaling presence)
+    fn resume_warm_peer(&mut self, peer: &str) {
+        self.warm_hold.resume(peer);
     }
 
     async fn establish(&mut self, info: Value) -> Result<()> {
@@ -5378,6 +5591,9 @@ async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
         req.reject("no warm link").await;
         return;
     };
+    // WARM-HOLD: ping succeeded, mark peer as warm (note: we can't call
+    // note_warm_use here because conn is &Conn; the warm-hold tick will
+    // connect to this peer on the next cycle if it drops)
     let link = conn.link(&pid);
     let direct = link.map(|l| l.direct).unwrap_or(false);
     let route = if direct {
@@ -7880,6 +8096,10 @@ async fn recv_cmd(
         // are unaffected and keep their WebRTC default.
         direct_ok_for(daemon, l2_enabled),
     );
+    // WARM-HOLD: load configured warm-peers at daemon startup
+    if daemon {
+        conn.load_warm_peers_config();
+    }
     // SIGINT/SIGTERM: route a graceful Ev::Interrupted through the loop AND arm a
     // signal-owned force-exit watchdog. The watchdog is the guarantee: if the
     // event loop is wedged on a stuck peer transport (a WebRTC data-channel write
@@ -8187,6 +8407,9 @@ async fn recv_cmd(
         children: HashMap::new(),
     };
     let mut last_mount_check = Instant::now();
+
+    // WARM-HOLD: periodic check for warm peers that need connections
+    let mut last_warm_hold_tick = Instant::now();
 
     // P2 (GAP-2): outer reconnect / re-announce loop state for the long-lived
     // acceptor. `reconnect(false)` means a severed signaling TCP leaves the
@@ -8598,6 +8821,14 @@ async fn recv_cmd(
             }
         }
 
+        // WARM-HOLD: periodically check for warm peers that need connections.
+        // This keeps recently-used and explicitly configured peers connected
+        // so `filament ping`/`ssh` is instant. Runs every 10s, daemon-only.
+        if daemon && last_warm_hold_tick.elapsed() >= Duration::from_secs(10) {
+            last_warm_hold_tick = Instant::now();
+            let _ = conn.warm_hold_tick().await;
+        }
+
         // C12 live-pairing: pick up devices paired AFTER we started (a separate
         // `filament pair` writes them into the shared store atomically). Re-read
         // every ~2s, subscribe to any channel we don't already watch, and feed
@@ -8682,6 +8913,16 @@ async fn recv_cmd(
         // gate-11c fence exact: a mid-transfer link (by_sid non-empty) sees
         // recv_done=false and reconnects unchanged.
         conn.recv_done = protocol::recv_transfer_done(completed, keep_open, by_sid.is_empty());
+        // WARM-HOLD: when a transfer completes, mark the peer as warm so we
+        // proactively reconnect if the link drops.
+        if completed > 0 {
+            let warm_peers: Vec<String> = by_sid.keys()
+                .filter_map(|(pid, _)| conn.links.get(pid)?.verified_name.clone())
+                .collect();
+            for name in &warm_peers {
+                conn.note_warm_use(name);
+            }
+        }
         if completed > 0 || !by_sid.is_empty() {
             ever_received = true; // a channel was up; Bug-5 wedge hint no longer applies
         }
@@ -8971,6 +9212,12 @@ async fn recv_cmd(
                 }
                 if let Some((n, sec)) = devices.iter().find(|(_, s)| channel_of(s) == v["channel"].as_str().unwrap_or("")) {
                     let pid = v["id"].as_str().unwrap_or_default().to_string();
+                    // WARM-HOLD: when a known peer appears, RESUME it if
+                    // dormant/configured (clear backoff so tick reconnects).
+                    // Do NOT add to recent-LRU (that's for ACTUAL use only).
+                    if conn.warm_hold.should_connect(n) {
+                        conn.warm_hold.resume(n);
+                    }
                     // Only announce a FRESH connect. The server re-pushes the
                     // known-peer roster on every (re)subscribe and C30 sync tick, so
                     // a peer we already hold a link to (or are already dialing) would
