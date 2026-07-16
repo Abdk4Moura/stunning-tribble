@@ -2986,6 +2986,9 @@ const WARM_DORMANT_THRESHOLD: u32 = 5;
 struct WarmHold {
     /// Explicitly configured peers (from `warm-peers` setting)
     configured: std::collections::HashSet<String>,
+    /// Peers with active relationships (forward/expose/proxy/pty/bridge)
+    /// that should be auto-warmed while the relationship is active
+    active: std::collections::HashSet<String>,
     /// Recently-used peers in LRU order (most recent at back)
     recent: std::collections::VecDeque<String>,
     /// Per-peer last-use timestamp
@@ -3059,9 +3062,12 @@ impl WarmHold {
         }
     }
 
-    /// Check if a peer should be connected (configured OR recently used, not dormant)
+    /// Check if a peer should be connected (configured OR active OR recently used, not dormant)
     fn should_connect(&self, peer: &str) -> bool {
         if self.configured.contains(peer) {
+            return true;
+        }
+        if self.active.contains(peer) {
             return true;
         }
         if self.recent.contains(&peer.to_string()) {
@@ -3077,6 +3083,13 @@ impl WarmHold {
     /// Get all peers that should be connected
     fn peers_to_connect(&self) -> Vec<String> {
         let mut peers: Vec<String> = self.configured.iter().cloned().collect();
+        // Add active peers
+        for p in &self.active {
+            if !peers.contains(p) {
+                peers.push(p.clone());
+            }
+        }
+        // Add recent peers (not dormant)
         for p in &self.recent {
             if !peers.contains(p) {
                 if let Some(b) = self.backoff.get(p) {
@@ -3530,6 +3543,21 @@ impl Conn {
         self.warm_hold.note_use(peer);
     }
 
+    /// Auto-warm a peer with an active relationship (forward/expose/proxy/pty/bridge).
+    /// The peer stays warm as long as the relationship is active.
+    fn note_active_relationship(&mut self, peer: &str) {
+        self.warm_hold.note_use(peer);
+        // Also mark as actively warm (not just recently-used)
+        self.warm_hold.active.insert(peer.to_string());
+        ui::debug(&format!("warm-hold: auto-warming peer '{peer}' (active relationship)"));
+    }
+
+    /// Remove auto-warm for a peer when its relationship ends.
+    fn clear_active_relationship(&mut self, peer: &str) {
+        self.warm_hold.active.remove(peer);
+        ui::debug(&format!("warm-hold: removing auto-warm for '{peer}' (relationship ended)"));
+    }
+
     /// Load configured warm-peers from settings. Called at daemon startup and
     /// at the top of each warm_hold_tick to stay in sync with runtime changes.
     fn load_warm_peers_config(&mut self) {
@@ -3547,9 +3575,19 @@ impl Conn {
     /// Check for warm peers that need connections and establish them.
     /// Called periodically from the daemon event loop. Returns the list of
     /// peers we attempted to connect to.
-    async fn warm_hold_tick(&mut self) -> Vec<String> {
+    async fn warm_hold_tick(&mut self, l3_enabled: bool) -> Vec<String> {
         // Reload configured peers from settings to stay in sync
         self.load_warm_peers_config();
+        // L3 auto-warm: when L3 is enabled, auto-warm ALL online paired peers
+        // (the overlay is always-on, so every connection should be instant)
+        if l3_enabled {
+            for name in self.roster.values().filter_map(|v| v["name"].as_str()) {
+                if !self.warm_hold.should_connect(name) {
+                    self.warm_hold.note_use(name);
+                    ui::debug(&format!("warm-hold: L3 auto-warming peer '{name}'"));
+                }
+            }
+        }
         let mut connected = Vec::new();
         let peers = self.warm_hold.peers_to_connect();
         for peer in peers {
@@ -8572,6 +8610,10 @@ async fn recv_cmd(
                         } else if matches!(&req.kind, ctl::ReqKind::MountHealth { .. }) {
                             handle_mount_health(req, &daemon_mounts).await;
                         } else {
+                            // Auto-warm: track peer for active relationships (forward/expose/pty)
+                            if let ctl::ReqKind::Open { peer, .. } | ctl::ReqKind::Pty { peer, .. } = &req.kind {
+                                conn.note_active_relationship(peer);
+                            }
                             handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
                         }
                     }
@@ -8826,7 +8868,8 @@ async fn recv_cmd(
         // so `filament ping`/`ssh` is instant. Runs every 10s, daemon-only.
         if daemon && last_warm_hold_tick.elapsed() >= Duration::from_secs(10) {
             last_warm_hold_tick = Instant::now();
-            let _ = conn.warm_hold_tick().await;
+            let l3_enabled = l3.is_some();
+            let _ = conn.warm_hold_tick(l3_enabled).await;
         }
 
         // C12 live-pairing: pick up devices paired AFTER we started (a separate
