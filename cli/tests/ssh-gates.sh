@@ -205,8 +205,7 @@ fi
 # SSH-CEILING GUARDRAIL: warm ssh must complete under a time ceiling.
 # This catches the 18s L3-revive regression (fixed by Kimi's background-revive).
 # We test against a SYNTHETIC L3-DOWN peer to exercise the L3 revive path.
-# ASSERTION: warm ssh < 5s AND L3 path is exercised AND cold-establish counter
-# does NOT increment.
+# ASSERTION: warm ssh < 5s AND L3 path is exercised.
 say E
 
 # SYNTHETIC L3-DOWN REPRO: register boxB.mesh in /etc/hosts with a fake overlay
@@ -222,7 +221,6 @@ trap cleanup_hosts EXIT
 # Measure 3 ssh runs and assert median < 5s.
 SSH_TIMES=()
 L3_PATH_HIT=0
-COLD_EST_BEFORE=$(cat /proc/self/stat 2>/dev/null | awk '{print $22}' || echo 0)
 for i in 1 2 3; do
   START_SSH=$(date +%s%N)
   SSH_STDERR=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" ssh boxB 'echo SSH-CEILING-OK' 2>&1 </dev/null)
@@ -237,7 +235,6 @@ for i in 1 2 3; do
     echo "## L3 REVIVE PATH EXERCISED ✓"
   fi
 done
-COLD_EST_AFTER=$(cat /proc/self/stat 2>/dev/null | awk '{print $22}' || echo 0)
 
 # Sort and take median (middle of 3)
 IFS=$'\n' SORTED=($(sort -n <<<"${SSH_TIMES[*]}")); unset IFS
@@ -256,14 +253,6 @@ if [ "$L3_PATH_HIT" -eq 1 ]; then
   ok "gateE-2: L3 revive path exercised (synthetic L3-DOWN repro works)"
 else
   bad "gateE-2: L3 revive path NOT exercised (gate is false-safe!)"
-fi
-
-# ASSERT 3: cold-establish counter did NOT increment (warm path reused)
-if [ "$COLD_EST_AFTER" -eq "$COLD_EST_BEFORE" ] 2>/dev/null; then
-  ok "gateE-3: cold-establish counter did NOT increment (warm path reused)"
-else
-  echo "## NOTE: cold-est counter changed (may be other tests, not ssh)"
-  ok "gateE-3: cold-establish counter check (manual verification needed)"
 fi
 
 # ========================================================================= sum =
