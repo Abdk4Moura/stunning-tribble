@@ -8794,6 +8794,10 @@ async fn recv_cmd(
                         } else if matches!(&req.kind, ctl::ReqKind::MountHealth { .. }) {
                             handle_mount_health(req, &daemon_mounts).await;
                         } else {
+                            // Auto-warm: feed LRU for pty sessions (bounded, no leak).
+                            if let ctl::ReqKind::Pty { peer, .. } = &req.kind {
+                                conn.note_warm_use(peer);
+                            }
                             handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
                         }
                     }
