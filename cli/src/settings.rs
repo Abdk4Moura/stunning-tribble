@@ -319,7 +319,10 @@ fn global_put(store: &str, value: &str) -> Result<()> {
         .map(|l| l.to_string())
         .collect();
     lines.push(format!("{store} {value}"));
-    std::fs::write(&p, lines.join("\n") + "\n")?;
+    // Atomic write: temp file + rename (same as devices.json fix)
+    let tmp = p.with_extension("tmp");
+    std::fs::write(&tmp, lines.join("\n") + "\n")?;
+    std::fs::rename(&tmp, &p)?;
     Ok(())
 }
 
