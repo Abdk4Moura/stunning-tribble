@@ -41,7 +41,7 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$cand"
       - name: Build with mount-windows
         working-directory: cli
-        shell: bash
+        shell: pwsh
         run: cargo build --release --features mount-windows
 
   macos:
