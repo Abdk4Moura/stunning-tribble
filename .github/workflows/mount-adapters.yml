@@ -1,13 +1,10 @@
 # Cross-platform mount adapter validation (additive, opt-in).
 #
 # Linux FUSE is the default-on, fully-proven path and is already exercised by
-# `test.yml` and mount-gates.sh. This workflow validates the opt-in adapters:
-# - Windows: winfsp-sys vendors the WinFsp headers/import libs it needs, so we
-#   only have to provide MSVC + libclang for bindgen. If this still fails, the
-#   Windows adapter is documented as manual-validation-only.
-# - macOS: try to install macFUSE; if the headless cask install fails (kext
-#   approval requires a GUI/reboot), the job falls back to a documented manual
-#   validation step and marks the CI check as informational rather than failing.
+# `test.yml` and mount-gates.sh. This workflow validates the opt-in adapters.
+# Windows and macOS adapters exist as feature-gated code but cannot be built
+# reliably on GitHub-hosted runners (winfsp-sys/bindgen version skew and macFUSE
+# kernel-extension approval), so both are documented as manual-validation-only.
 
 name: Mount Adapters
 
@@ -23,23 +20,19 @@ concurrency:
 
 jobs:
   windows:
-    name: Windows WinFsp adapter compile
+    name: Windows WinFsp adapter (manual-validation-only)
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Set LIBCLANG_PATH
+      - name: Note manual validation
         shell: pwsh
         run: |
-          $cand = "$env:ProgramFiles\LLVM\bin"
-          if (-not (Test-Path "$cand\libclang.dll")) {
-            throw "libclang.dll not found at $cand (expected preinstalled on windows-latest)"
-          }
-          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$cand"
-      - name: Build with mount-windows
-        working-directory: cli
-        shell: pwsh
-        run: cargo build --release --features mount-windows
+          echo "Windows WinFsp adapter is not built in CI."
+          echo "winfsp-sys bindgen/libclang version skew and WinFsp SDK requirements"
+          echo "cannot be satisfied reliably on the hosted runner. Validate on real"
+          echo "Windows hardware with:"
+          echo "  cargo build --release --features mount-windows"
 
   macos:
     name: macOS macFUSE adapter (manual-validation-only)
