@@ -258,6 +258,9 @@ impl Mux {
     /// no `err` = the peer is done, also a drop (its data direction already
     /// EOF'd via the empty frame). Either way: abort pumps, close the socket.
     async fn on_close(&self, sid: u32, _err: Option<&str>) {
+        // Drop any pending mount-open-ack waiter for this sid so the caller
+        // gets a clean error rather than hanging on a oneshot that will never fire.
+        self.mount_ack_tx.lock().await.remove(&sid);
         self.drop_stream(sid).await;
     }
 
@@ -265,6 +268,7 @@ impl Mux {
     /// pump hangs forever waiting on a peer that will never speak again.
     pub async fn shutdown_all(&self) {
         self.resizers.lock().await.clear(); // H-1: no resizer outlives the mux
+        self.mount_ack_tx.lock().await.clear();
         let mut map = self.streams.lock().await;
         for (_, s) in map.drain() {
             if let Some(h) = s.read_pump {
@@ -1702,8 +1706,7 @@ pub(crate) async fn open_mount_stream(
     .await
     .map_err(|_| anyhow::anyhow!("mount-open-ack not received (timed out)"))?
     .map_err(|_| anyhow::anyhow!("mount-open-ack channel closed"))?;
-    let caps: crate::mount_proto::MountCaps = serde_json::from_value(caps_value)
-        .unwrap_or_default();
+    let caps = crate::mount_proto::parse_mount_caps(caps_value)?;
     // Send mount-cap-ack: the client confirms it accepts the server's caps.
     let _ = mux.transport.send_control(&json!({
         "type": "mount-cap-ack", "sid": sid,
@@ -2464,12 +2467,8 @@ pub async fn mount_cmd(
     guard.forget();
     let mux = Mux::new(t.clone());
     let _pump = tokio::spawn(pump_initiator(rx, mux.clone()));
-    let (sid, pipe_rx, caps) = open_mount_stream(&mux, root).await?;
-    let client = if caps.protocol_version >= 2 {
-        crate::mount_proto::MountClient::from_mux_v2(t.clone(), sid, pipe_rx)
-    } else {
-        crate::mount_proto::MountClient::from_mux(t.clone(), sid, pipe_rx)
-    };
+    let (sid, pipe_rx, _caps) = open_mount_stream(&mux, root).await?;
+    let client = crate::mount_proto::MountClient::from_mux_v2(t.clone(), sid, pipe_rx);
     Ok(client)
 }
 

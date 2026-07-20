@@ -186,6 +186,24 @@ pub fn mount_caps_for_root(root: &std::path::Path) -> MountCaps {
     }
 }
 
+/// Parse server capabilities from a mount-open-ack value and enforce a minimum
+/// supported protocol version. Fails loud on missing, unparseable, or
+/// too-old caps so the client never silently falls back to a broken path.
+pub fn parse_mount_caps(value: serde_json::Value) -> Result<MountCaps> {
+    if value.is_null() {
+        anyhow::bail!("peer did not advertise mount capabilities; upgrade filament");
+    }
+    let caps: MountCaps = serde_json::from_value(value)
+        .map_err(|e| anyhow::anyhow!("peer mount capabilities unreadable ({e}); upgrade filament"))?;
+    if caps.protocol_version < 2 {
+        anyhow::bail!(
+            "peer mount protocol version {} unsupported (need v2); upgrade filament",
+            caps.protocol_version
+        );
+    }
+    Ok(caps)
+}
+
 #[cfg(unix)]
 fn max_path_len_for(_root: &std::path::Path) -> u32 {
     // PATH_MAX is 4096 on Linux, 1024 on macOS. statvfs has f_namemax.
@@ -1016,5 +1034,48 @@ mod tests {
     fn mount_caps_for_root_has_version() {
         let caps = mount_caps_for_root(&std::path::PathBuf::from("/tmp"));
         assert_eq!(caps.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn parse_mount_caps_rejects_null() {
+        let err = parse_mount_caps(serde_json::Value::Null).unwrap_err().to_string();
+        assert!(err.contains("did not advertise"));
+    }
+
+    #[test]
+    fn parse_mount_caps_rejects_v1() {
+        let json = serde_json::json!({
+            "protocol_version": 1,
+            "case_sensitive": true,
+            "max_path_len": 4096,
+            "max_component_len": 255,
+            "supports_symlinks": true,
+            "supports_hardlinks": false,
+            "supports_fifo": false
+        });
+        let err = parse_mount_caps(json).unwrap_err().to_string();
+        assert!(err.contains("version 1 unsupported"));
+    }
+
+    #[test]
+    fn parse_mount_caps_rejects_unparseable() {
+        let json = serde_json::json!({ "protocol_version": "not-a-number", "case_sensitive": true });
+        let err = parse_mount_caps(json).unwrap_err().to_string();
+        assert!(err.contains("unreadable"));
+    }
+
+    #[test]
+    fn parse_mount_caps_accepts_v2() {
+        let json = serde_json::json!({
+            "protocol_version": 2,
+            "case_sensitive": true,
+            "max_path_len": 4096,
+            "max_component_len": 255,
+            "supports_symlinks": true,
+            "supports_hardlinks": false,
+            "supports_fifo": false
+        });
+        let caps = parse_mount_caps(json).unwrap();
+        assert_eq!(caps.protocol_version, 2);
     }
 }

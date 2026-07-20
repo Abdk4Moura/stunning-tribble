@@ -97,6 +97,9 @@ pub struct FilamentFs {
 
 impl FilamentFs {
     pub fn new(client: MountClient) -> Self {
+        // The mount protocol is v2+. A v1 client reaching here is a programming
+        // error; fail fast rather than silently return empty data.
+        assert!(client.binary_frames, "FilamentFs requires a v2 MountClient");
         FilamentFs {
             client: Mutex::new(client),
             inodes: Mutex::new(InodeMap::new()),
