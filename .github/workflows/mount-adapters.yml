@@ -42,23 +42,15 @@ jobs:
         run: cargo build --release --features mount-windows
 
   macos:
-    name: macOS macFUSE adapter compile (best-effort)
+    name: macOS macFUSE adapter (manual-validation-only)
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Install macFUSE
-        id: macfuse
-        continue-on-error: true
-        run: brew install --cask macfuse
-      - name: Build with mount-macos
-        working-directory: cli
+      - name: Note manual validation
         shell: bash
         run: |
-          if [ "${{ steps.macfuse.outcome }}" == "success" ]; then
-            cargo build --release --features mount-macos
-          else
-            echo "macFUSE cask install failed on headless runner (kext approval required)."
-            echo "The macOS adapter must be validated manually on real macOS hardware."
-            echo "This CI job is informational only."
-          fi
+          echo "macOS macFUSE adapter is not built in CI."
+          echo "macFUSE requires a kernel extension approval that cannot be granted"
+          echo "on headless GitHub runners. Validate on real macOS hardware with:"
+          echo "  cargo build --release --features mount-macos"
