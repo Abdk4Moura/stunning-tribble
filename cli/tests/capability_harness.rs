@@ -399,7 +399,6 @@ fn pair_and_transfer_smoke() {
 #[test]
 fn two_nodes_pair_each_other() {
     let h = Harness::new();
-    // Verify the backend + binary are reachable
     let bin = h.filament_bin().to_path_buf();
     let server = h.server_url();
 
@@ -410,4 +409,97 @@ fn two_nodes_pair_each_other() {
     assert!(out.status.success(), "binary help failed");
 
     eprintln!("two_nodes_pair_each_other: filament binary and backend OK");
+}
+
+#[test]
+fn pty_one_shot_exec_smoke() {
+    let mut h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let direct_flag =
+        std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+    let loopback_only =
+        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+
+    h.pair_daemons();
+
+    eprintln!("pty_one_shot_exec_smoke: daemons started");
+
+    let pair_word = format!("pairtest-{}", std::process::id());
+    let mut create = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "pair", "--word", &pair_word])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pair create");
+    let create_out = create.wait_with_output().expect("pair create result");
+    let create_stdout = String::from_utf8_lossy(&create_out.stdout).to_string();
+    let create_stderr = String::from_utf8_lossy(&create_out.stderr).to_string();
+    eprintln!("pair-create stdout: {create_stdout}");
+    eprintln!("pair-create stderr: {create_stderr}");
+
+    let pair_code: String = create_stderr
+        .lines()
+        .find(|l| l.contains(&pair_word))
+        .and_then(|l| {
+            l.split_whitespace()
+                .find(|w| w.starts_with(&pair_word) && w.split('-').count() >= 3)
+                .map(|w| w.to_string())
+        })
+        .unwrap_or_else(|| {
+            create_stdout
+                .lines()
+                .find(|l| l.contains(&pair_word))
+                .and_then(|l| {
+                    l.split_whitespace()
+                        .find(|w| w.starts_with(&pair_word) && w.split('-').count() >= 3)
+                        .map(|w| w.to_string())
+                })
+                .expect("could not find pair code in output")
+        });
+    eprintln!("pair code: {pair_code}");
+
+    let mut claim = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .args(["--server", &server, "pair", &pair_code])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pair claim");
+    let claim_out = claim.wait_with_output().expect("pair claim result");
+    eprintln!("pair-claim stdout: {}", String::from_utf8_lossy(&claim_out.stdout));
+    eprintln!("pair-claim stderr: {}", String::from_utf8_lossy(&claim_out.stderr));
+
+    std::thread::sleep(Duration::from_secs(5));
+
+    let nonce = format!("PTY-OK-{}", std::process::id());
+    let mut pty_proc = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "pty", "test-b", "--", "echo", &nonce])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pty");
+
+    let pty_out = pty_proc.wait_with_output().expect("pty result");
+    let pty_stdout = String::from_utf8_lossy(&pty_out.stdout);
+    let pty_stderr = String::from_utf8_lossy(&pty_out.stderr);
+    eprintln!("pty stdout: {pty_stdout}");
+    eprintln!("pty stderr: {pty_stderr}");
+
+    assert!(
+        pty_stdout.contains(&nonce) || pty_stderr.contains(&nonce),
+        "pty output does not contain nonce '{nonce}'\nstdout: {pty_stdout}\nstderr: {pty_stderr}"
+    );
 }
