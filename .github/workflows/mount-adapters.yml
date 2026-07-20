@@ -2,7 +2,9 @@
 #
 # Linux FUSE is the default-on, fully-proven path and is already exercised by
 # `test.yml` and mount-gates.sh. This workflow validates the opt-in adapters:
-# - Windows: install WinFsp via chocolatey and compile the `mount-windows` feature
+# - Windows: winfsp-sys vendors the WinFsp headers/import libs it needs, so we
+#   only have to provide MSVC + libclang for bindgen. If this still fails, the
+#   Windows adapter is documented as manual-validation-only.
 # - macOS: try to install macFUSE; if the headless cask install fails (kext
 #   approval requires a GUI/reboot), the job falls back to a documented manual
 #   validation step and marks the CI check as informational rather than failing.
@@ -23,12 +25,20 @@ jobs:
   windows:
     name: Windows WinFsp adapter compile
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: Install WinFsp
-        shell: powershell
-        run: choco install winfsp --no-progress
+      - uses: dtolnay/rust-toolchain@stable
+      - name: MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Locate libclang
+        shell: pwsh
+        run: |
+          $cand = "$env:ProgramFiles\LLVM\bin"
+          if (-not (Test-Path "$cand\libclang.dll")) {
+            throw "libclang.dll not found at $cand (expected preinstalled on windows-latest)"
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$cand"
       - name: Build with mount-windows
         working-directory: cli
         shell: bash
@@ -40,6 +50,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install macFUSE
         id: macfuse
         continue-on-error: true
