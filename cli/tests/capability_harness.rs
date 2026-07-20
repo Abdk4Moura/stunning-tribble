@@ -443,31 +443,28 @@ fn pty_one_shot_exec_smoke() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("pair create");
-    let create_out = create.wait_with_output().expect("pair create result");
-    let create_stdout = String::from_utf8_lossy(&create_out.stdout).to_string();
-    let create_stderr = String::from_utf8_lossy(&create_out.stderr).to_string();
-    eprintln!("pair-create stdout: {create_stdout}");
-    eprintln!("pair-create stderr: {create_stderr}");
 
-    let pair_code: String = create_stderr
-        .lines()
-        .find(|l| l.contains(&pair_word))
-        .and_then(|l| {
-            l.split_whitespace()
-                .find(|w| w.starts_with(&pair_word) && w.split('-').count() >= 3)
-                .map(|w| w.to_string())
-        })
-        .unwrap_or_else(|| {
-            create_stdout
-                .lines()
-                .find(|l| l.contains(&pair_word))
-                .and_then(|l| {
-                    l.split_whitespace()
-                        .find(|w| w.starts_with(&pair_word) && w.split('-').count() >= 3)
-                        .map(|w| w.to_string())
-                })
-                .expect("could not find pair code in output")
-        });
+    let stderr = create.stderr.take().unwrap();
+    let pair_word_clone = pair_word.clone();
+    let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            let line = line.unwrap_or_default();
+            eprintln!("[pair-create] {line}");
+            if line.contains(&pair_word_clone) {
+                if let Some(code) = line
+                    .split_whitespace()
+                    .find(|w| w.starts_with(&pair_word_clone) && w.split('-').count() >= 4)
+                {
+                    let _ = code_tx.send(code.to_string());
+                }
+            }
+        }
+    });
+
+    let pair_code = code_rx.recv_timeout(Duration::from_secs(60))
+        .expect("pair create did not mint a code within 60s");
     eprintln!("pair code: {pair_code}");
 
     let mut claim = Command::new(&bin)
@@ -483,6 +480,9 @@ fn pty_one_shot_exec_smoke() {
     let claim_out = claim.wait_with_output().expect("pair claim result");
     eprintln!("pair-claim stdout: {}", String::from_utf8_lossy(&claim_out.stdout));
     eprintln!("pair-claim stderr: {}", String::from_utf8_lossy(&claim_out.stderr));
+
+    let create_out = create.wait_with_output().expect("pair create result");
+    eprintln!("pair-create exit: {}", create_out.status);
 
     std::thread::sleep(Duration::from_secs(5));
 
