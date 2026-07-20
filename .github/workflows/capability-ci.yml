@@ -141,7 +141,8 @@ jobs:
           FILAMENT_WORKTREE: ${{ github.workspace }}
           RUST_MIN_STACK: 8388608
           FILAMENT_LOG: trace
-          FILAMENT_DIRECT_FLAG: ${{ runner.os == 'macOS' && '0' || '1' }}
+          FILAMENT_DIRECT_PER_OS: ${{ runner.os == 'macOS' && '0' || '1' }}
+          FILAMENT_HARNESS_ASYNC_MODE: ${{ runner.os == 'macOS' && 'threading' || 'eventlet' }}
         timeout-minutes: 15
 
   # Security gate: confirm capability_harness is ABSENT in release builds.
