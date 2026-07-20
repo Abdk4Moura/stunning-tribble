@@ -28,10 +28,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
-      - name: Locate libclang
+      - name: Set LIBCLANG_PATH
         shell: pwsh
         run: |
           $cand = "$env:ProgramFiles\LLVM\bin"
@@ -50,7 +47,6 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
       - name: Install macFUSE
         id: macfuse
         continue-on-error: true
