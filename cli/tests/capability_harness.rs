@@ -432,7 +432,7 @@ fn pty_one_shot_exec_smoke() {
 
     eprintln!("pty_one_shot_exec_smoke: daemons started");
 
-    let pair_word = format!("pairtest-mesh-{}", std::process::id());
+    let pair_word = format!("pairtest-mesh-p{:x}", std::process::id());
     let mut create = Command::new(&bin)
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
@@ -445,17 +445,20 @@ fn pty_one_shot_exec_smoke() {
         .expect("pair create");
 
     let stderr = create.stderr.take().unwrap();
-    let pair_word_clone = pair_word.clone();
+    let pair_word_lower = pair_word.to_lowercase();
     let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
             let line = line.unwrap_or_default();
             eprintln!("[pair-create] {line}");
-            if line.contains(&pair_word_clone) {
+            if line.to_lowercase().contains(&pair_word_lower) {
                 if let Some(code) = line
                     .split_whitespace()
-                    .find(|w| w.starts_with(&pair_word_clone) && w.split('-').count() >= 4)
+                    .find(|w| {
+                        w.to_lowercase().contains(&pair_word_lower)
+                            && w.split('-').count() >= 4
+                    })
                 {
                     let _ = code_tx.send(code.to_string());
                 }
