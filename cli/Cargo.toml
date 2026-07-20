@@ -28,7 +28,7 @@ test-hooks = []
 # Opt-in cross-platform mount adapters. Linux FUSE remains default-on and does
 # not require a feature. macOS needs macFUSE SDK; Windows needs WinFsp SDK.
 # These are OFF by default so stock CI runners (which lack the SDKs) stay green.
-mount-windows = ["dep:winfsp"]
+mount-windows = ["dep:winfsp", "dep:windows"]
 
 [dependencies]
 openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
@@ -106,12 +106,14 @@ fuser = "0.17"
 # Windows L3 backend: Wintun (WireGuard's userspace TUN driver) via wintun.dll,
 # loaded at runtime with libloading. The DLL is bundled beside filament.exe by the
 # release packaging; adapter creation needs Administrator.
+# Windows L3 backend: Wintun (WireGuard's userspace TUN driver) via wintun.dll,
+# loaded at runtime with libloading. The DLL is bundled beside filament.exe by the
+# release packaging; adapter creation needs Administrator.
 [target.'cfg(target_os = "windows")'.dependencies]
 wintun = "0.5"
-# Windows mount client adapter: WinFsp presents the mesh-native mount protocol
-# as a local filesystem on Windows. Pulled only when the `mount-windows` feature
-# is enabled because it requires the WinFsp SDK.
+# WinFsp mount adapter (opt-in via mount-windows feature).
 winfsp = { version = "0.13", optional = true }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Security_Authorization"], optional = true }
 
 [profile.release]
 lto = true

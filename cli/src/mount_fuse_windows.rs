@@ -33,9 +33,9 @@ use windows::Win32::Storage::FileSystem::{
 use winfsp::FspError;
 use winfsp::constants::FspCleanupFlags;
 use winfsp::filesystem::{
-    DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo, VolumeInfo,
+    DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo, VolumeInfo,
 };
-use winfsp::host::{FileSystemHost, VolumeParams};
+use winfsp::host::{FileSystemHost, FineGuard, VolumeParams};
 use winfsp::U16CStr;
 
 use crate::mount_proto::{FileKind, FileStat, MountClient, MountOp, MountResult, path_encode, path_decode};
@@ -129,11 +129,23 @@ fn now_filetime() -> u64 {
     now.as_secs() * 10_000_000 + (now.subsec_nanos() as u64) / 100 + 116_444_736_000_000_000
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct FileContext {
     fh: u64,
     path: String,
     is_directory: bool,
+    dir_buffer: DirBuffer,
+}
+
+impl Clone for FileContext {
+    fn clone(&self) -> Self {
+        Self {
+            fh: self.fh,
+            path: self.path.clone(),
+            is_directory: self.is_directory,
+            dir_buffer: DirBuffer::new(),
+        }
+    }
 }
 
 struct WindowsFs {
@@ -207,6 +219,7 @@ impl FileSystemContext for WindowsFs {
         &self,
         file_name: &U16CStr,
         _security_descriptor: Option<&mut [std::ffi::c_void]>,
+        _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> Result<FileSecurity, FspError> {
         let path = win32_to_protocol_path(&self.caps(), file_name)?;
         let enc = path_encode(Path::new(&path));
@@ -233,9 +246,10 @@ impl FileSystemContext for WindowsFs {
         let stat = parse_stat(&v).ok_or(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND.0))?;
         let is_directory = stat.mode & 0o170000 == 0o040000;
         *file_info.as_mut() = stat_to_file_info(&stat, self.caps().supports_fifo);
-        Ok(FileContext { fh: 0, path, is_directory })
+        Ok(FileContext { fh: 0, path, is_directory, dir_buffer: DirBuffer::new() })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create(
         &self,
         file_name: &U16CStr,
@@ -244,6 +258,8 @@ impl FileSystemContext for WindowsFs {
         file_attributes: u32,
         _security_descriptor: Option<&[std::ffi::c_void]>,
         _allocation_size: u64,
+        _extra_buffer: Option<&[u8]>,
+        _extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
     ) -> Result<Self::FileContext, FspError> {
         let caps = self.caps();
@@ -262,7 +278,7 @@ impl FileSystemContext for WindowsFs {
         let v = self.call_sync(MountOp::GetAttr { path: enc })?;
         let stat = parse_stat(&v).ok_or(FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND.0))?;
         *file_info.as_mut() = stat_to_file_info(&stat, caps.supports_fifo);
-        Ok(FileContext { fh: 0, path, is_directory })
+        Ok(FileContext { fh: 0, path, is_directory, dir_buffer: DirBuffer::new() })
     }
 
     fn read(
@@ -345,36 +361,36 @@ impl FileSystemContext for WindowsFs {
         let v = self.call_sync(MountOp::ReadDir { fh: 0, offset: 0 })?;
         let entries: Vec<serde_json::Value> = v.as_array().cloned().unwrap_or_default();
         let caps = self.caps();
-        let mut cursor: u32 = 0;
-        let mut dir_info: DirInfo<255> = DirInfo::new();
         let mut started = marker.is_none();
-        for e in entries {
-            let name = e["name"].as_str().unwrap_or("");
-            if name == "." || name == ".." { continue; }
-            if name.is_empty() { continue; }
-            let name_wide = name.encode_utf16().collect::<Vec<u16>>();
-            if !started {
-                if let Some(m) = marker.inner_as_cstr() {
-                    let m_slice: Vec<u16> = m.as_slice().iter().copied().collect();
-                    if m_slice == name_wide {
-                        started = true;
+        let marker_slice = marker.inner().map(|m| m.as_slice().to_vec());
+
+        if let Ok(lock) = context.dir_buffer.acquire(marker.is_none(), None) {
+            let mut dir_info: DirInfo<255> = DirInfo::new();
+            for e in entries {
+                let name = e["name"].as_str().unwrap_or("");
+                if name == "." || name == ".." { continue; }
+                if name.is_empty() { continue; }
+                let name_wide: Vec<u16> = name.encode_utf16().collect();
+                if !started {
+                    if let Some(ref m) = marker_slice {
+                        if *m == name_wide {
+                            started = true;
+                        }
+                        continue;
                     }
-                    continue;
                 }
-            }
-            let stat: FileStat = match serde_json::from_value(e["stat"].clone()) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            dir_info.reset();
-            *dir_info.file_info_mut() = stat_to_file_info(&stat, caps.supports_fifo);
-            dir_info.set_name_raw(&name_wide).map_err(|_| FspError::NTSTATUS(STATUS_INVALID_PARAMETER.0))?;
-            if !dir_info.append_to_buffer(buffer, &mut cursor) {
-                return Ok(cursor);
+                let stat: FileStat = match serde_json::from_value(e["stat"].clone()) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                dir_info.reset();
+                *dir_info.file_info_mut() = stat_to_file_info(&stat, caps.supports_fifo);
+                dir_info.set_name_raw(name_wide.as_slice())
+                    .map_err(|_| FspError::NTSTATUS(STATUS_INVALID_PARAMETER.0))?;
+                lock.write(&mut dir_info).map_err(|_| FspError::NTSTATUS(STATUS_INVALID_PARAMETER.0))?;
             }
         }
-        DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
-        Ok(cursor)
+        Ok(context.dir_buffer.read(marker, buffer))
     }
 
     fn set_delete(&self, _context: &Self::FileContext, _file_name: &U16CStr, _delete_file: bool) -> Result<(), FspError> {
@@ -439,9 +455,16 @@ pub fn run_mount(client: MountClient, mountpoint: &std::path::Path) -> anyhow::R
         .filesystem_name("Filament");
 
     let fs = WindowsFs::new(client);
-    let mut host = FileSystemHost::<WindowsFs>::new(volume_params, fs)?;
+    let init = winfsp::winfsp_init().context("WinFsp init failed (is WinFsp installed?)")?;
+    let mut host = FileSystemHost::<WindowsFs, FineGuard>::new(volume_params, fs)
+        .map_err(|e| anyhow::anyhow!("failed to create WinFsp host: {e:?}"))?;
     let wide: Vec<u16> = mountpoint.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let mount_point = U16CStr::from_slice_truncate(&wide)?;
-    host.mount(mount_point)?;
+    let mount_point = U16CStr::from_slice_truncate(&wide)
+        .map_err(|e| anyhow::anyhow!("invalid mount point: {e:?}"))?;
+    host.mount(mount_point)
+        .map_err(|e| anyhow::anyhow!("failed to mount at {}: {e:?}", mountpoint.display()))?;
+    host.start()
+        .map_err(|e| anyhow::anyhow!("failed to start dispatcher: {e:?}"))?;
+    let _ = init; // keep WinFsp loaded for the lifetime of the host
     Ok(())
 }
