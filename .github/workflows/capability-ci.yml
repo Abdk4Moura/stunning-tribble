@@ -145,7 +145,6 @@ jobs:
           RUST_MIN_STACK: 8388608
           FILAMENT_LOG: trace
           FILAMENT_DIRECT_PER_OS: ${{ runner.os == 'macOS' && '0' || '1' }}
-          FILAMENT_HARNESS_ASYNC_MODE: ${{ runner.os == 'macOS' && 'threading' || 'eventlet' }}
         timeout-minutes: 15
 
       - name: Upload harness log (macOS)
