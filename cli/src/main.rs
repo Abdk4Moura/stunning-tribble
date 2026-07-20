@@ -28,8 +28,10 @@ mod interact;
 mod l2;
 mod mount;
 mod mount_proto;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod mount_fuse;
+#[cfg(target_os = "windows")]
+mod mount_fuse_windows;
 mod backup;
 mod net;
 mod overlay;
@@ -6481,11 +6483,11 @@ async fn main() -> Result<()> {
                 let _auto_restore = save_auto;
                 let mut client = l2::mount_cmd(&server, &peer, relay, &remote).await?;
                 if let Some(local) = local {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                     {
                         return mount_fuse_cmd(client, &peer, &remote, &local).await;
                     }
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
                     {
                         let _ = &local;
                         ui::say(&format!(
@@ -6493,7 +6495,7 @@ async fn main() -> Result<()> {
                             ui::paint(ui::Tone::Ok, ui::glyph_ok())
                         ));
                         ui::say(&format!(
-                            "  {} local FUSE/WinFsp adapter not available on this OS yet; listing directory instead",
+                            "  {} local FUSE/WinFsp adapter not available on this OS; listing directory instead",
                             ui::paint(ui::Tone::Warn, "!")
                         ));
                     }
@@ -6550,7 +6552,7 @@ async fn main() -> Result<()> {
 /// clean pre-mount error, instead of a cryptic failure on the first `ls` after
 /// the kernel has already accepted the mount. On any failure we leave no stale
 /// mountpoint behind (the #22 contract).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn mount_fuse_cmd(
     mut client: crate::mount_proto::MountClient,
     peer: &str,
@@ -6606,7 +6608,10 @@ async fn mount_fuse_cmd(
     //    pump keeps draining the transport. ctrl-c triggers an unmount, which
     //    makes the blocking session loop return.
     let mnt_run = mnt.clone();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let session = tokio::task::spawn_blocking(move || crate::mount_fuse::run_mount(client, &mnt_run));
+    #[cfg(target_os = "windows")]
+    let session = tokio::task::spawn_blocking(move || crate::mount_fuse_windows::run_mount(client, &mnt_run));
 
     let result: Result<()> = tokio::select! {
         joined = session => {
@@ -6633,10 +6638,11 @@ async fn mount_fuse_cmd(
     result
 }
 
-/// Unmount a FUSE mountpoint. Tries fusermount3 then fusermount (older systems),
+/// Unmount a FUSE/macFUSE mountpoint. Tries fusermount3 then fusermount on Linux,
 /// falling back to a lazy unmount so a busy mount still detaches.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn unmount_fuse(local: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
     for bin in ["fusermount3", "fusermount"] {
         if std::process::Command::new(bin)
             .args(["-u", local])
@@ -6647,10 +6653,27 @@ fn unmount_fuse(local: &str) -> std::io::Result<()> {
             return Ok(());
         }
     }
-    // Last resort: lazy unmount so a busy handle does not wedge teardown.
-    let _ = std::process::Command::new("fusermount3")
-        .args(["-uz", local])
-        .status();
+    // Linux last resort: lazy unmount so a busy handle does not wedge teardown.
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("fusermount3")
+            .args(["-uz", local])
+            .status();
+    }
+    // macOS: use system umount.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("umount")
+            .args([local])
+            .status();
+    }
+    Ok(())
+}
+
+/// Windows: WinFsp handles unmount through its own control path; this is a no-op
+/// placeholder so the Linux/macOS cleanup flow compiles on Windows.
+#[cfg(target_os = "windows")]
+fn unmount_fuse(_local: &str) -> std::io::Result<()> {
     Ok(())
 }
 
