@@ -1,0 +1,57 @@
+# Cross-platform mount adapter validation (additive, opt-in).
+#
+# Linux FUSE is the default-on, fully-proven path and is already exercised by
+# `test.yml` and mount-gates.sh. This workflow validates the opt-in adapters:
+# - Windows: install WinFsp via chocolatey and compile the `mount-windows` feature
+# - macOS: try to install macFUSE; if the headless cask install fails (kext
+#   approval requires a GUI/reboot), the job falls back to a documented manual
+#   validation step and marks the CI check as informational rather than failing.
+
+name: Mount Adapters
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+concurrency:
+  group: mount-adapters-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows WinFsp adapter compile
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install WinFsp
+        shell: powershell
+        run: choco install winfsp --no-progress
+      - name: Build with mount-windows
+        working-directory: cli
+        shell: bash
+        run: cargo build --release --features mount-windows
+
+  macos:
+    name: macOS macFUSE adapter compile (best-effort)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install macFUSE
+        id: macfuse
+        continue-on-error: true
+        run: brew install --cask macfuse
+      - name: Build with mount-macos
+        working-directory: cli
+        shell: bash
+        run: |
+          if [ "${{ steps.macfuse.outcome }}" == "success" ]; then
+            cargo build --release --features mount-macos
+          else
+            echo "macFUSE cask install failed on headless runner (kext approval required)."
+            echo "The macOS adapter must be validated manually on real macOS hardware."
+            echo "This CI job is informational only."
+          fi

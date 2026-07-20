@@ -20,7 +20,10 @@
 //     session runs inside `spawn_blocking` while the mux pump tasks keep draining
 //     the transport on the tokio runtime.
 
-#![cfg(any(target_os = "linux", target_os = "macos"))]
+#![cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
+
+#[cfg(target_os = "macos")]
+use fuser_macos as fuser;
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};

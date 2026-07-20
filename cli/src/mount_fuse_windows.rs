@@ -11,7 +11,7 @@
 // path is being shaken out; see the PR description for the validated/unvalidated
 // split.
 
-#![cfg(target_os = "windows")]
+#![cfg(all(target_os = "windows", feature = "mount-windows"))]
 
 use std::collections::HashMap;
 use std::ffi::OsString;

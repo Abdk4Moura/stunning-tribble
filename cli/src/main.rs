@@ -28,9 +28,9 @@ mod interact;
 mod l2;
 mod mount;
 mod mount_proto;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
 mod mount_fuse;
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "mount-windows"))]
 mod mount_fuse_windows;
 mod backup;
 mod net;
@@ -6483,11 +6483,19 @@ async fn main() -> Result<()> {
                 let _auto_restore = save_auto;
                 let mut client = l2::mount_cmd(&server, &peer, relay, &remote).await?;
                 if let Some(local) = local {
-                    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                    #[cfg(any(
+                        target_os = "linux",
+                        all(target_os = "macos", feature = "mount-macos"),
+                        all(target_os = "windows", feature = "mount-windows")
+                    ))]
                     {
                         return mount_fuse_cmd(client, &peer, &remote, &local).await;
                     }
-                    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+                    #[cfg(not(any(
+                        target_os = "linux",
+                        all(target_os = "macos", feature = "mount-macos"),
+                        all(target_os = "windows", feature = "mount-windows")
+                    )))]
                     {
                         let _ = &local;
                         ui::say(&format!(
@@ -6552,7 +6560,11 @@ async fn main() -> Result<()> {
 /// clean pre-mount error, instead of a cryptic failure on the first `ls` after
 /// the kernel has already accepted the mount. On any failure we leave no stale
 /// mountpoint behind (the #22 contract).
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "macos", feature = "mount-macos"),
+    all(target_os = "windows", feature = "mount-windows")
+))]
 async fn mount_fuse_cmd(
     mut client: crate::mount_proto::MountClient,
     peer: &str,
@@ -6608,9 +6620,9 @@ async fn mount_fuse_cmd(
     //    pump keeps draining the transport. ctrl-c triggers an unmount, which
     //    makes the blocking session loop return.
     let mnt_run = mnt.clone();
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
     let session = tokio::task::spawn_blocking(move || crate::mount_fuse::run_mount(client, &mnt_run));
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "mount-windows"))]
     let session = tokio::task::spawn_blocking(move || crate::mount_fuse_windows::run_mount(client, &mnt_run));
 
     let result: Result<()> = tokio::select! {
@@ -6640,7 +6652,7 @@ async fn mount_fuse_cmd(
 
 /// Unmount a FUSE/macFUSE mountpoint. Tries fusermount3 then fusermount on Linux,
 /// falling back to a lazy unmount so a busy mount still detaches.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
 fn unmount_fuse(local: &str) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     for bin in ["fusermount3", "fusermount"] {
@@ -6672,7 +6684,7 @@ fn unmount_fuse(local: &str) -> std::io::Result<()> {
 
 /// Windows: WinFsp handles unmount through its own control path; this is a no-op
 /// placeholder so the Linux/macOS cleanup flow compiles on Windows.
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "mount-windows"))]
 fn unmount_fuse(_local: &str) -> std::io::Result<()> {
     Ok(())
 }
