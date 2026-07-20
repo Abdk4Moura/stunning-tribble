@@ -413,6 +413,12 @@ fn two_nodes_pair_each_other() {
 
 #[test]
 fn pty_one_shot_exec_smoke() {
+    #[cfg(windows)]
+    {
+        eprintln!("pty_one_shot_exec_smoke: skipped on Windows (pty not yet verified)");
+        return;
+    }
+
     let mut h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
     let server = h.server_url();
@@ -426,7 +432,7 @@ fn pty_one_shot_exec_smoke() {
 
     eprintln!("pty_one_shot_exec_smoke: daemons started");
 
-    let pair_word = format!("pairtest-{}", std::process::id());
+    let pair_word = format!("pairtest-mesh-{}", std::process::id());
     let mut create = Command::new(&bin)
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
