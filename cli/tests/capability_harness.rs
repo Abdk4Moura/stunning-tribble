@@ -411,3 +411,32 @@ fn two_nodes_pair_each_other() {
 
     eprintln!("two_nodes_pair_each_other: filament binary and backend OK");
 }
+
+#[test]
+fn shell_daemon_stays_up_with_zero_devices() {
+    // Proves the fix for main.rs:8381 — a `--shell` daemon started with
+    // no known devices in a non-interactive context must NOT bail. The
+    // previous code killed the daemon immediately when devices was empty
+    // and stdin was not a terminal (true in CI/test harness), making the
+    // live-pairing scan dead code.
+
+    let mut h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    // Start BOTH daemons with --shell, no prior pairing.
+    h.daemon_a = Some(spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir));
+    h.daemon_b = Some(spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir));
+    std::thread::sleep(Duration::from_secs(4));
+
+    // Core assertion: both daemons must still be alive. If either exited,
+    // the bail-at-empty-devices bug is still present.
+    assert!(
+        h.daemon_a.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "shell daemon A exited on empty devices (bail bug)"
+    );
+    assert!(
+        h.daemon_b.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "shell daemon B exited on empty devices (bail bug)"
+    );
+}
