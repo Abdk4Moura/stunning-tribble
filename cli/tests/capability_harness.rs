@@ -193,11 +193,12 @@ impl Harness {
             let _ = c.kill();
             let _ = c.wait();
         }
+        std::thread::sleep(Duration::from_secs(3));
         let bin = self.filament_bin().to_path_buf();
         let server = self.server_url();
         self.daemon_a = Some(spawn_daemon_inner(&bin, &server, "test-a", &self.a_dir));
         self.daemon_b = Some(spawn_daemon_inner(&bin, &server, "test-b", &self.b_dir));
-        std::thread::sleep(Duration::from_secs(8));
+        std::thread::sleep(Duration::from_secs(12));
     }
 }
 
