@@ -413,8 +413,15 @@ fn two_nodes_pair_each_other() {
 fn pty_one_shot_exec_smoke() {
     // PTY one-shot exec smoke: starts daemons, pairs them, then runs
     // `filament pty <peer> -- echo NONCE` and verifies the echo output.
-    // With the live-pairing fix (#41), the daemon discovers the newly
-    // paired device via the 2s devices_load scan — no restart needed.
+    //
+    // On Linux/Windows: uses live-pairing (daemon discovers newly paired
+    // device via 2s scan, no restart needed — proven by #41).
+    //
+    // On macOS: the cold PTY path uses direct QUIC which is unstable over
+    // the hyperkit bridge. We restart daemons AFTER pairing so they start
+    // fresh with known devices, giving the daemon warm link to stabilize
+    // before the PTY command. The 3s kill gap + 12s settle was proven
+    // effective in earlier CI runs (commit 1213120).
 
     #[cfg(windows)]
     {
@@ -492,12 +499,34 @@ fn pty_one_shot_exec_smoke() {
     let create_out = create.wait_with_output().expect("pair create result");
     eprintln!("pair-create exit: {}", create_out.status);
 
-    // Wait for live-pairing scan (devices_load every 2s) to discover the
-    // newly paired device. No restart needed — the fix in #41 ensures
-    // --shell daemons stay up and the scan at line ~9065 picks up the
-    // new devices.json entry.
-    eprintln!("pty_one_shot_exec_smoke: waiting for live-pairing discovery...");
-    std::thread::sleep(Duration::from_secs(15));
+    #[cfg(target_os = "macos")]
+    {
+        // Kill daemons, wait 3s, restart fresh. On restart they find the
+        // already-paired devices in devices.json and the warm link
+        // stabilizes before the PTY command's cold path kicks in.
+        eprintln!("pty_one_shot_exec_smoke: restarting daemons (macOS)");
+        if let Some(ref mut c) = h.daemon_a {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        if let Some(ref mut c) = h.daemon_b {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        h.daemon_a = None;
+        h.daemon_b = None;
+        std::thread::sleep(Duration::from_secs(3));
+        h.daemon_a = Some(spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir));
+        h.daemon_b = Some(spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir));
+        std::thread::sleep(Duration::from_secs(12));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Live-pairing: daemon discovers the newly paired device via the
+        // 2s devices_load scan. No restart needed (proven by #41).
+        eprintln!("pty_one_shot_exec_smoke: waiting for live-pairing discovery...");
+        std::thread::sleep(Duration::from_secs(15));
+    }
 
     let nonce = format!("PTY-OK-{}", std::process::id());
     let mut pty_proc = Command::new(&bin)
@@ -569,7 +598,7 @@ fn shell_daemon_live_pairing_no_restart() {
     // NOW pair A and B while the daemons are already running. This writes
     // devices.json AFTER the daemon started — the live-pairing scan must
     // pick it up without a restart.
-    let pair_word = format!("livescan-p{:x}", std::process::id());
+    let pair_word = format!("livescan-pair-p{:x}", std::process::id());
     let mut create = Command::new(&bin)
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
@@ -654,5 +683,200 @@ fn shell_daemon_live_pairing_no_restart() {
         pty_stdout.contains(&nonce) || pty_stderr.contains(&nonce),
         "live-pairing pty failed — daemon did not discover the newly paired device\n\
          nonce: {nonce}\nstdout: {pty_stdout}\nstderr: {pty_stderr}"
+    );
+}
+
+#[test]
+fn forward_port_smoke() {
+    // Smoke test for `filament forward`: starts daemons, pairs them via
+    // live-pairing, starts a simple HTTP server on daemon B, forwards a
+    // local port from daemon A to B's HTTP port, curls the forwarded port,
+    // and verifies the response contains the expected content.
+
+    #[cfg(windows)]
+    {
+        eprintln!("forward_port_smoke: skipped on Windows (forward not yet verified)");
+        return;
+    }
+
+    let mut h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let direct_flag =
+        std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+    let loopback_only =
+        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+
+    // Start daemons with --shell (must survive empty devices, test #41)
+    h.daemon_a = Some(spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir));
+    h.daemon_b = Some(spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir));
+    std::thread::sleep(Duration::from_secs(4));
+
+    assert!(
+        h.daemon_a.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "daemon A exited before pairing"
+    );
+    assert!(
+        h.daemon_b.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "daemon B exited before pairing"
+    );
+
+    // Pair A and B
+    let pair_word = format!("forward-smoke-p{:x}", std::process::id());
+    let mut create = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_NAME", "test-a")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "pair", "--word", &pair_word])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pair create");
+
+    let stderr = create.stderr.take().unwrap();
+    let pair_word_lower = pair_word.to_lowercase();
+    let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            let line = line.unwrap_or_default();
+            eprintln!("[fwd-pair-create] {line}");
+            if line.to_lowercase().contains(&pair_word_lower) {
+                if let Some(code) = line
+                    .split_whitespace()
+                    .find(|w| {
+                        w.to_lowercase().contains(&pair_word_lower)
+                            && w.split('-').count() >= 4
+                    })
+                {
+                    let _ = code_tx.send(code.to_string());
+                }
+            }
+        }
+    });
+
+    let pair_code = code_rx.recv_timeout(Duration::from_secs(60))
+        .expect("forward pair create did not mint a code within 60s");
+    eprintln!("forward pair code: {pair_code}");
+
+    let mut claim = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_NAME", "test-b")
+        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .args(["--server", &server, "pair", &pair_code])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pair claim");
+    let claim_out = claim.wait_with_output().expect("pair claim result");
+    eprintln!("fwd-claim stdout: {}", String::from_utf8_lossy(&claim_out.stdout));
+    eprintln!("fwd-claim stderr: {}", String::from_utf8_lossy(&claim_out.stderr));
+
+    let create_out = create.wait_with_output().expect("pair create result");
+    eprintln!("fwd-pair-create exit: {}", create_out.status);
+
+    // Wait for live-pairing discovery
+    eprintln!("forward_port_smoke: waiting for live-pairing discovery...");
+    std::thread::sleep(Duration::from_secs(15));
+
+    // Start a simple HTTP server on daemon B, serving h.b_dir
+    let http_port = find_free_port();
+    let nonce = format!("FWD-OK-{}", std::process::id());
+    let test_file = h.b_dir.join("forward-test.txt");
+    std::fs::write(&test_file, &nonce).expect("write forward test file");
+
+    let mut http_srv = Command::new(python_cmd())
+        .args(["-m", "http.server", &http_port.to_string()])
+        .env("PYTHONUNBUFFERED", "1")
+        .current_dir(&h.b_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("http server");
+    // Drain output
+    if let Some(s) = http_srv.stdout.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(s).lines() {
+                if let Ok(l) = line { eprintln!("[http-srv] {l}"); }
+            }
+        });
+    }
+    if let Some(s) = http_srv.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(s).lines() {
+                if let Ok(l) = line { eprintln!("[http-srv-err] {l}"); }
+            }
+        });
+    }
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Forward a local port to B's HTTP port
+    let fwd_port = find_free_port();
+    let mut fwd_proc = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args([
+            "--server", &server,
+            "forward",
+            &fwd_port.to_string(),
+            "test-b",
+            &http_port.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("forward");
+
+    let fwd_stderr = fwd_proc.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(fwd_stderr).lines() {
+            if let Ok(l) = line { eprintln!("[fwd] {l}"); }
+        }
+    });
+
+    // Wait for tunnel to establish
+    std::thread::sleep(Duration::from_secs(5));
+
+    // Curl the forwarded port
+    let resp = Command::new("curl")
+        .args([
+            "-s",
+            "-f",
+            "--retry", "5",
+            "--retry-delay", "1",
+            &format!("http://127.0.0.1:{fwd_port}/forward-test.txt"),
+        ])
+        .output()
+        .expect("curl");
+    eprintln!(
+        "forward curl: status={} stdout={} stderr={}",
+        resp.status,
+        String::from_utf8_lossy(&resp.stdout),
+        String::from_utf8_lossy(&resp.stderr),
+    );
+
+    // Cleanup
+    let _ = fwd_proc.kill();
+    let _ = fwd_proc.wait();
+    let _ = http_srv.kill();
+    let _ = http_srv.wait();
+
+    assert!(
+        resp.status.success(),
+        "curl to forwarded port failed: {}",
+        String::from_utf8_lossy(&resp.stderr)
+    );
+
+    let body = String::from_utf8_lossy(&resp.stdout);
+    assert!(
+        body.contains(&nonce),
+        "forwarded HTTP response does not contain nonce '{nonce}'\nbody: {body}"
     );
 }
