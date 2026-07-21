@@ -1,10 +1,10 @@
 # Cross-platform mount adapter validation (additive, opt-in).
 #
 # Linux FUSE is the default-on, fully-proven path and is already exercised by
-# `test.yml` and mount-gates.sh. This workflow validates the opt-in adapters.
-# Windows and macOS adapters exist as feature-gated code but cannot be built
-# reliably on GitHub-hosted runners (winfsp-sys/bindgen version skew and macFUSE
-# kernel-extension approval), so both are documented as manual-validation-only.
+# `test.yml` and mount-gates.sh. The Windows and macOS adapters were attempted
+# in this PR but could not be brought to a compile-validated state on GitHub
+# hosted runners, so they have been moved to dedicated follow-up work. This
+# workflow is retained as a placeholder and future home for adapter validation.
 
 name: Mount Adapters
 
@@ -19,31 +19,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  windows:
-    name: Windows WinFsp adapter (manual-validation-only)
-    runs-on: windows-latest
+  placeholder:
+    name: Adapter validation placeholder
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Note manual validation
-        shell: pwsh
-        run: |
-          echo "Windows WinFsp adapter is not built in CI."
-          echo "winfsp-sys bindgen/libclang version skew and WinFsp SDK requirements"
-          echo "cannot be satisfied reliably on the hosted runner. Validate on real"
-          echo "Windows hardware with:"
-          echo "  cargo build --release --features mount-windows"
-
-  macos:
-    name: macOS macFUSE adapter (manual-validation-only)
-    runs-on: macos-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - name: Note manual validation
+      - name: Note current scope
         shell: bash
         run: |
-          echo "macOS macFUSE adapter is not built in CI."
-          echo "macFUSE requires a kernel extension approval that cannot be granted"
-          echo "on headless GitHub runners. Validate on real macOS hardware with:"
-          echo "  cargo build --release --features mount-macos"
+          echo "Only the Linux FUSE adapter is included in this PR."
+          echo "Windows (WinFsp) and macOS (macFUSE) adapters will be pursued in"
+          echo "dedicated follow-up PRs where the required SDKs can be validated."
