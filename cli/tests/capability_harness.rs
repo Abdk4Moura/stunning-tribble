@@ -179,9 +179,22 @@ impl Harness {
         let bin = self.filament_bin().to_path_buf();
         let server = self.server_url();
 
-        // Start daemons first (they need devices.json, so we write a stub)
-        // Actually: send/recv doesn't need paired devices, it uses one-time codes.
-        // Just start daemons for the direct-QUIC path.
+        self.daemon_a = Some(spawn_daemon_inner(&bin, &server, "test-a", &self.a_dir));
+        self.daemon_b = Some(spawn_daemon_inner(&bin, &server, "test-b", &self.b_dir));
+        std::thread::sleep(Duration::from_secs(8));
+    }
+
+    fn restart_daemons(&mut self) {
+        if let Some(ref mut c) = self.daemon_a {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        if let Some(ref mut c) = self.daemon_b {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        let bin = self.filament_bin().to_path_buf();
+        let server = self.server_url();
         self.daemon_a = Some(spawn_daemon_inner(&bin, &server, "test-a", &self.a_dir));
         self.daemon_b = Some(spawn_daemon_inner(&bin, &server, "test-b", &self.b_dir));
         std::thread::sleep(Duration::from_secs(8));
@@ -489,7 +502,8 @@ fn pty_one_shot_exec_smoke() {
     let create_out = create.wait_with_output().expect("pair create result");
     eprintln!("pair-create exit: {}", create_out.status);
 
-    std::thread::sleep(Duration::from_secs(5));
+    h.restart_daemons();
+    eprintln!("pty_one_shot_exec_smoke: daemons restarted with paired devices");
 
     let nonce = format!("PTY-OK-{}", std::process::id());
     let mut pty_proc = Command::new(&bin)
