@@ -6590,11 +6590,11 @@ async fn main() -> Result<()> {
                 let _auto_restore = save_auto;
                 let mut client = l2::mount_cmd(&server, &peer, relay, &remote).await?;
                 if let Some(local) = local {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
                     {
                         return mount_fuse_cmd(client, &peer, &remote, &local).await;
                     }
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos"))))]
                     {
                         let _ = &local;
                         ui::say(&format!(
@@ -6659,7 +6659,7 @@ async fn main() -> Result<()> {
 /// clean pre-mount error, instead of a cryptic failure on the first `ls` after
 /// the kernel has already accepted the mount. On any failure we leave no stale
 /// mountpoint behind (the #22 contract).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
 async fn mount_fuse_cmd(
     mut client: crate::mount_proto::MountClient,
     peer: &str,
@@ -6744,30 +6744,38 @@ async fn mount_fuse_cmd(
 }
 
 /// Unmount a FUSE/macFUSE mountpoint. Tries fusermount3 then fusermount on Linux,
-/// falling back to a lazy unmount so a busy mount still detaches.
-#[cfg(target_os = "linux")]
+/// falling back to a lazy unmount so a busy mount still detaches. On macOS,
+/// uses umount or diskutil unmount.
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
 fn unmount_fuse(local: &str) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
-    for bin in ["fusermount3", "fusermount"] {
-        if std::process::Command::new(bin)
-            .args(["-u", local])
+    {
+        for bin in ["fusermount3", "fusermount"] {
+            if std::process::Command::new(bin)
+                .args(["-u", local])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+        }
+        // Linux last resort: lazy unmount so a busy handle does not wedge teardown.
+        let _ = std::process::Command::new("fusermount3")
+            .args(["-uz", local])
+            .status();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Try diskutil first (more reliable for macFUSE), fall back to umount.
+        if std::process::Command::new("diskutil")
+            .args(["unmount", "force", local])
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
         {
             return Ok(());
         }
-    }
-    // Linux last resort: lazy unmount so a busy handle does not wedge teardown.
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("fusermount3")
-            .args(["-uz", local])
-            .status();
-    }
-    // macOS: use system umount.
-    #[cfg(target_os = "macos")]
-    {
         let _ = std::process::Command::new("umount")
             .args([local])
             .status();
