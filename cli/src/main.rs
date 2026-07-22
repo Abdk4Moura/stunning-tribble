@@ -2115,12 +2115,7 @@ async fn up_cmd(
         let server = server.to_string();
         tokio::spawn(async move { direct::warm_public_ip(&server).await; });
     }
-    // Pass --no-proxy-fallback to recv_cmd via env (avoids changing recv_cmd's
-    // large parameter list for a single flag used only by `up`).
-    if no_proxy_fallback {
-        unsafe { std::env::set_var("FILAMENT_NO_PROXY_FALLBACK", "1") };
-    }
-    let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None, shell_policy, shell_user).await;
+    let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None, shell_policy, shell_user, no_proxy_fallback).await;
     let _ = std::fs::remove_file(pidfile());
     res
 }
@@ -6310,7 +6305,7 @@ async fn main() -> Result<()> {
             send_cmd(&server, paths, code || word.is_some(), word, room, to, name, relay, remember).await
         }
         Cmd::Recv { code, dir, yes, room, to, keep_open, remember, output } => {
-            recv_cmd(&server, code, dir, yes, room, to, keep_open, relay, remember, false, output, ShellPolicy::Granted, None).await
+            recv_cmd(&server, code, dir, yes, room, to, keep_open, relay, remember, false, output, ShellPolicy::Granted, None, false).await
         }
         Cmd::Set { key, value, peer, dry_run, reset, hard, .. } => settings::run_set(
             key.as_deref(),
@@ -8398,6 +8393,7 @@ async fn recv_cmd(
     // M-1: optional non-root account the web-shell/ssh PTY is dropped to. `None`
     // means the PTY runs as the up-process user (documented root risk).
     mut shell_user: Option<String>,
+    no_proxy_fallback: bool,
 ) -> Result<()> {
     let to_stdout = output.as_deref() == Some("-");
     // INTERACTIVE GATE (CLI `recv` only, never the daemon/`up`). With no code,
@@ -8739,7 +8735,7 @@ async fn recv_cmd(
                                 // Auto-start SOCKS5 proxy when kernel TUN is unavailable.
                                 // Opt-out via --no-proxy-fallback or `filament set auto-proxy off`.
                                 let auto_proxy = settings::get_bool("auto-proxy", None)
-                                    && std::env::var("FILAMENT_NO_PROXY_FALLBACK").as_deref() != Ok("1");
+                                    && !no_proxy_fallback;
                                 if auto_proxy {
                                     let server = server.to_string();
                                     tokio::spawn(async move {
