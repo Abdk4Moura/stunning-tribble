@@ -35,7 +35,9 @@ fn man_piped_emits_roff() {
 }
 
 /// Test that `filament man` with simulated TTY emits readable help.
+/// Gated to Linux: `script -qec` is util-linux syntax; macOS/Windows lack it.
 #[test]
+#[cfg(target_os = "linux")]
 fn man_tty_emits_readable_help() {
     let bin = filament_bin();
 
@@ -64,7 +66,9 @@ fn man_tty_emits_readable_help() {
 }
 
 /// Test that `filament man settings` (unknown page) shows error message.
+/// Gated to Linux: `script -qec` is util-linux syntax; macOS/Windows lack it.
 #[test]
+#[cfg(target_os = "linux")]
 fn man_unknown_page_shows_error() {
     let bin = filament_bin();
 
