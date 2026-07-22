@@ -285,29 +285,69 @@ impl Mux {
 /// aggregate backpressure, so a slow peer naturally stalls us here. Returns the
 /// kind of ending so the caller can pick FIN vs. RST in the trailing l2-close.
 ///
-/// TODO(credits): single-stream only relies on send_frame's per-link
-/// backpressure. With >1 concurrent heavy stream this needs a per-stream credit
-/// window (design §4) or one slow stream head-of-line-blocks the others.
+/// `eof_signal`: when the daemon receives an out-of-band EOF (ReqKind::Eof),
+/// it fires this watch channel. `socket_to_dc` then stops reading from the
+/// client socket and sends the L2 FIN to the remote. On Unix, the native
+/// socket EOF handles this naturally; the signal is the Windows path.
 async fn socket_to_dc<R: AsyncRead + Unpin>(
     transport: Arc<dyn Transport>,
     sid: u32,
     mut rd: R,
+    eof_signal: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
     let cap = transport.max_payload();
     let mut buf = vec![0u8; cap];
+    // Convert watch receiver to oneshot via a spawned task. The spawned task
+    // is DETACHED (not a child of this function), so it survives across
+    // serve_stream's join. This avoids the problem of select! dropping the
+    // losing branch's future.
+    let notify_rx = if let Some(mut rx) = eof_signal {
+        let (notify_tx, notify_rx) = tokio::sync::oneshot::channel();
+        // Spawn as a DETACHED task (not inside socket_to_dc's scope).
+        // It will complete when eof_signal fires or when the watch channel closes.
+        tokio::spawn(async move {
+            let _ = rx.changed().await;
+            let _ = notify_tx.send(());
+        });
+        Some(notify_rx)
+    } else {
+        None
+    };
+    let mut notify_rx = notify_rx;
     loop {
-        let n = rd.read(&mut buf).await?;
-        if n == 0 {
-            transport.send_frame(sid, 0, &[]).await?; // local FIN -> empty frame
-            return Ok(());
+        tokio::select! {
+            biased;
+            _ = async {
+                match &mut notify_rx {
+                    Some(rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                transport.send_frame(sid, 0, &[]).await?;
+                return Ok(());
+            }
+            r = rd.read(&mut buf) => {
+                match r {
+                    Ok(0) => {
+                        transport.send_frame(sid, 0, &[]).await?;
+                        return Ok(());
+                    }
+                    Ok(n) => transport.send_frame(sid, 0, &buf[..n]).await?,
+                    Err(e) => return Err(e.into()),
+                }
+            }
         }
-        transport.send_frame(sid, 0, &buf[..n]).await?;
     }
 }
 
 /// Pump data-channel frames -> local TCP writes. `None` = peer FIN: shutdown the
 /// write half so the local app sees a clean EOF, then end. A dropped pipe
 /// (channel closed without a `None`) = abort: shutdown anyway and end.
+/// `eof_signal`: when the client's stdin EOFs, `socket_to_dc` sends the L2 FIN
+/// and then signals this oneshot. `dc_to_socket` should NOT be aborted at that
+/// point -- it must keep reading the remote's response until the remote itself
+/// closes. If `eof_signal` fires, `dc_to_socket` ignores it (it continues
+/// reading). The real shutdown comes from the L2 pipe closing (remote FIN).
 async fn dc_to_socket<W: AsyncWrite + Unpin>(
     mut rx: mpsc::Receiver<PipeItem>,
     mut wr: W,
@@ -333,7 +373,7 @@ async fn dc_to_socket<W: AsyncWrite + Unpin>(
             }
         }
     }
-    let _ = wr.shutdown().await; // pipe dropped (teardown/abort)
+    let _ = wr.shutdown().await;
     Ok(())
 }
 
@@ -342,6 +382,12 @@ async fn dc_to_socket<W: AsyncWrite + Unpin>(
 /// teardown can wake it, and runs the read pump to completion. On exit, drops
 /// the stream and (optionally) sends a trailing l2-close (FIN or, on read error,
 /// RST with `err`).
+///
+/// HALF-CLOSE semantics: when the client's stdin EOFs (socket_to_dc finishes),
+/// the L2 FIN is already sent (socket_to_dc sends it on EOF). We do NOT abort
+/// dc_to_socket -- it must keep reading the remote's response until the remote
+/// itself closes (L2 pipe closes). This is the correct half-close: client sends
+/// FIN, then reads the response.
 async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mux: Arc<Mux>,
     sid: u32,
@@ -349,59 +395,53 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     rx: mpsc::Receiver<PipeItem>,
     send_close: bool,
     first: Option<PipeItem>,
+    eof_signal: Option<tokio::sync::watch::Receiver<bool>>,
 ) {
-    // Caller sets TCP_NODELAY where applicable (a unix socket has none); split
-    // generically so the same plumbing serves a TcpStream OR a local UnixStream
-    // (the warm-link reuse path bridges a unix socket to an L2 stream).
     let (rd, wr) = tokio::io::split(sock);
-    // `first`: a warm-reuse verify already pulled the first inbound frame off the
-    // wire to PROVE the link is live before the client was committed; replay it
-    // here so no peer bytes are lost.
     let mut writer = tokio::spawn(dc_to_socket(rx, wr, first));
-    let mut reader = tokio::spawn(socket_to_dc(mux.transport.clone(), sid, rd));
+    let mut reader = tokio::spawn(socket_to_dc(mux.transport.clone(), sid, rd, eof_signal));
     mux.set_read_pump(sid, reader.abort_handle()).await;
 
-    // Tear the bridge down when EITHER direction ends, not just the client->peer
-    // reader. When the PEER dies, dc_to_socket (writer) finishes as the mux pipe
-    // closes, but socket_to_dc (reader) stays parked on an IDLE client socket and
-    // never notices - so awaiting only the reader (the old behavior) DEADLOCKED the
-    // warm bridge, and thus the client's warm pty, until the user happened to type.
-    // A 2s liveness poll is the backstop for a transport that black-holes without
-    // ever closing the pipe. Whichever fires, we drop the socket so the client sees
-    // EOF and (for the pty) falls through to a cold reattach. (Kept short so a dead
-    // peer tears the warm pty down in ~2s rather than leaving it hung.)
-    // read_result: Some = reader finished (Ok=FIN sent, Err(join)=teardown aborted
-    // us); None = we tore down because the peer/link ended.
-    let mut ticker = tokio::time::interval(Duration::from_secs(2));
-    ticker.tick().await; // consume the immediate tick
-    let read_result;
-    loop {
-        tokio::select! {
-            r = &mut reader => { read_result = Some(r); writer.abort(); break; }
-            _ = &mut writer => { reader.abort(); read_result = None; break; }
-            _ = ticker.tick() => {
-                if !mux.transport.is_alive() {
-                    reader.abort();
-                    writer.abort();
-                    read_result = None;
-                    break;
-                }
-            }
-        }
-    }
-    // The stream may already be gone (teardown). Remove if still present.
+    // Wait for the reader to finish (client EOF + L2 FIN sent).
+    let read_result = reader.await;
+    // Now wait for the writer to finish (remote sends response, then closes).
+    // This handles half-close correctly: the writer continues until the remote
+    // closes its end of the L2 stream.
+    let _ = writer.await;
+
     mux.streams.lock().await.remove(&sid);
     if send_close {
         let close = match read_result {
-            Some(Ok(Ok(()))) => json!({ "type": "l2-close", "sid": sid }), // clean FIN
-            Some(Ok(Err(e))) => json!({ "type": "l2-close", "sid": sid, "err": e.to_string() }),
-            Some(Err(_aborted)) => return, // teardown owns the close; don't double-send
-            // Peer FIN or link death: ack a close so the peer reaps its half (a
-            // no-op if the transport is already gone).
-            None => json!({ "type": "l2-close", "sid": sid }),
+            Ok(Ok(())) => json!({ "type": "l2-close", "sid": sid }),
+            Ok(Err(e)) => json!({ "type": "l2-close", "sid": sid, "err": e.to_string() }),
+            Err(_aborted) => return,
         };
         let _ = mux.transport.send_control(&close).await;
     }
+}
+
+/// Test-only wrapper around `dc_to_socket`.
+#[cfg(test)]
+pub(crate) async fn dc_to_socket_for_test<W: AsyncWrite + Unpin>(
+    rx: mpsc::Receiver<PipeItem>,
+    wr: W,
+    first: Option<PipeItem>,
+) -> Result<()> {
+    dc_to_socket(rx, wr, first).await
+}
+
+/// Test-only wrapper around `serve_stream`.
+#[cfg(test)]
+pub(crate) async fn serve_stream_for_test<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mux: Arc<Mux>,
+    sid: u32,
+    sock: S,
+    rx: mpsc::Receiver<PipeItem>,
+    send_close: bool,
+    first: Option<PipeItem>,
+    eof_signal: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    serve_stream(mux, sid, sock, rx, send_close, first, eof_signal).await
 }
 
 // ----------------------------------------------------- PERSISTENT PTY SESSIONS --
@@ -909,7 +949,7 @@ impl Mux {
                     .transport
                     .send_control(&json!({ "type": "l2-open-ack", "sid": sid, "credit": 0 }))
                     .await;
-                serve_stream(self.clone(), sid, sock, rx, true, None).await;
+                serve_stream(self.clone(), sid, sock, rx, true, None, None).await;
                 self.accepted.lock().await.remove(&sid);
             }
             Err(e) => {
@@ -1617,7 +1657,7 @@ pub(crate) async fn open_stream(mux: &Arc<Mux>, rport: u16) -> Result<(u32, mpsc
 /// which the peer sends UNPROMPTED, so the wait overlaps work we needed anyway.
 /// Only a black-holed link burns the whole window. Override with
 /// FILAMENT_WARM_VERIFY_MS.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn warm_verify_window() -> std::time::Duration {
     let ms = std::env::var("FILAMENT_WARM_VERIFY_MS")
         .ok()
@@ -1636,7 +1676,7 @@ pub(crate) fn warm_verify_window() -> std::time::Duration {
 /// than handing the client a dead connection (which would stall until ITS own
 /// timeout - the 25s ssh ConnectTimeout we measured). Verifying first means the
 /// fallback is immediate and the client never sends bytes into a black hole.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn verify_first_frame(
     mux: &Arc<Mux>,
     sid: u32,
@@ -1662,7 +1702,7 @@ async fn verify_first_frame(
 /// Open an L2 stream over a warm link and CONFIRM the peer responds before the
 /// caller commits the client. Returns (sid, first_frame, remaining_rx) once the
 /// first inbound frame lands. `Err` on a zombie link (see `verify_first_frame`).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) async fn open_stream_verified(
     mux: &Arc<Mux>,
     rport: u16,
@@ -1674,16 +1714,35 @@ pub(crate) async fn open_stream_verified(
 }
 
 /// Bridge a verified warm stream to the client `sock`, replaying the already-read
-/// `first` frame so no peer bytes are lost.
-#[cfg(unix)]
+/// `first` frame so no peer bytes are lost. Creates a watch channel for OOB EOF
+/// signaling. Returns the watch Sender so the daemon can fire the signal.
+#[cfg(any(unix, windows))]
 pub(crate) async fn serve_verified_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mux: Arc<Mux>,
     sid: u32,
     sock: S,
     first: PipeItem,
     rx: mpsc::Receiver<PipeItem>,
-) {
-    serve_stream(mux, sid, sock, rx, true, Some(first)).await;
+) -> tokio::sync::watch::Sender<bool> {
+    let (eof_tx, eof_rx) = tokio::sync::watch::channel(false);
+    serve_stream(mux, sid, sock, rx, true, Some(first), Some(eof_rx)).await;
+    eof_tx
+}
+
+/// Bridge an already-opened L2 stream (`sid` + its inbound `rx`) to a local
+/// `stream` (the warm pty client's socket), running to completion (stream
+/// EOF or peer FIN). The daemon's warm-pty path uses this after a verified open.
+/// Creates a watch channel for OOB EOF signaling.
+#[cfg(any(unix, windows))]
+pub(crate) async fn serve_opened_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mux: Arc<Mux>,
+    sid: u32,
+    stream: S,
+    rx: mpsc::Receiver<PipeItem>,
+) -> tokio::sync::watch::Sender<bool> {
+    let (eof_tx, eof_rx) = tokio::sync::watch::channel(false);
+    serve_stream(mux, sid, stream, rx, true, None, Some(eof_rx)).await;
+    eof_tx
 }
 
 /// Open a mesh-native mount stream to the peer, sending `mount-open` with the
@@ -1750,7 +1809,7 @@ pub(crate) async fn open_pty_stream(
 /// peer sends it unprompted, so a healthy link costs nothing here; a zombie link
 /// yields nothing within `verify` and we `Err` so the caller drops it + falls
 /// back to a cold pty instead of handing the user a dead terminal.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) async fn open_pty_stream_verified(
     mux: &Arc<Mux>,
     session: &str,
@@ -1765,37 +1824,65 @@ pub(crate) async fn open_pty_stream_verified(
     Ok((sid, first, rx))
 }
 
-/// Bridge an already-opened L2 stream (`sid` + its inbound `rx`) to a local
-/// `stream` (the warm pty client's unix socket), running to completion (stream
-/// EOF or peer FIN). The daemon's warm-pty path uses this after a verified open.
-#[cfg(unix)]
-pub(crate) async fn serve_opened_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
-    mux: Arc<Mux>,
-    sid: u32,
-    stream: S,
-    rx: mpsc::Receiver<PipeItem>,
-) {
-    serve_stream(mux, sid, stream, rx, true, None).await;
-}
 
 /// Pump this process's stdio over a connected warm-reuse socket: stdin -> sock,
 /// sock -> stdout. Exit when the remote half closes (sock read EOF), the same
-/// "session over" semantics the cold netcat path has. Its OWN `tokio::io::stdin()`
-/// is fine here because netcat is a single-shot ProxyCommand (one process, one
-/// attach, no reconnect): the singleton is created once and never handed off.
+/// "session over" semantics the cold netcat path has.
+/// `eof_sid`: when set (and `FILAMENT_FORCE_OOB_EOF=1`), sends an out-of-band
+/// EOF signal via a separate ctl connection after stdin closes. This forces the
+/// OOB path on Unix for testing (normally Unix uses native half-close).
 #[cfg(unix)]
-async fn pump_stdio_over(sock: tokio::net::UnixStream) -> Result<()> {
+async fn pump_stdio_over(sock: tokio::net::UnixStream, eof_sid: Option<u32>) -> Result<()> {
     let (mut rd, mut wr) = tokio::io::split(sock);
     let writer = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let _ = tokio::io::copy(&mut stdin, &mut wr).await; // local EOF
-        let _ = wr.shutdown().await; // half-close so the remote sees our EOF
+        // On Unix, native half-close: shutdown the write half so the remote sees EOF.
+        let _ = wr.shutdown().await;
     });
     let mut stdout = tokio::io::stdout();
     tokio::io::copy(&mut rd, &mut stdout).await?;
     let _ = stdout.flush().await;
     writer.abort();
+    // Test hook: if FILAMENT_FORCE_OOB_EOF=1, send an OOB eof signal even on
+    // Unix. This lets us test the OOB path in Linux CI. The daemon ignores
+    // duplicate eof signals (the oneshot is already consumed), so this is safe.
+    if eof_sid.is_some()
+        && std::env::var("FILAMENT_FORCE_OOB_EOF").ok().as_deref() == Some("1")
+    {
+        if let Some(sid) = eof_sid {
+            let _ = crate::ctl::try_eof(sid).await;
+        }
+    }
     Ok(())
+}
+
+/// Windows variant: named pipes don't support half-close, so the client opens a
+/// SEPARATE ctl connection to send an out-of-band `eof` signal when stdin closes.
+/// The daemon receives it, sends the L2 FIN (remote sees EOF), and the client
+/// reads the response until the daemon closes its end of the data pipe.
+#[cfg(windows)]
+async fn pump_stdio_over(sock: crate::ctl::CtlClientStream, eof_sid: Option<u32>) -> Result<()> {
+    let mut sock = sock;
+    // Phase 1: pipe stdin -> daemon
+    {
+        let mut stdin = tokio::io::stdin();
+        let _ = tokio::io::copy(&mut stdin, &mut sock).await;
+    }
+    // Send out-of-band EOF signal (separate ctl connection).
+    if let Some(sid) = eof_sid {
+        let _ = crate::ctl::try_eof(sid).await;
+    }
+    // Phase 2: daemon -> stdout (until daemon closes its end of the pipe).
+    let mut stdout = tokio::io::stdout();
+    tokio::io::copy(&mut sock, &mut stdout).await?;
+    let _ = stdout.flush().await;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn pump_stdio_over(_sock: (), _eof_sid: Option<u32>) -> Result<()> {
+    bail!("warm reuse not supported on this platform")
 }
 
 /// Warm-pty variant of `pump_stdio_over` that draws input from the SHARED,
@@ -1841,6 +1928,67 @@ async fn pump_warm_pty_stdio(
     Ok(())
 }
 
+/// Windows variant of `pump_warm_pty_stdio`. Named pipes lack half-close, so
+/// stdin EOF is signaled via the in-band `MARKER_EOF`. The write side is
+/// spawned as a separate task; when it finishes, it sends the marker and drops
+/// the pipe handle. The daemon detects the marker and closes the L2 stream,
+/// which closes its end of the pipe, causing the read side to see EOF.
+#[cfg(windows)]
+async fn pump_warm_pty_stdio(
+    sock: crate::ctl::CtlClientStream,
+    stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    pending: &mut Option<Vec<u8>>,
+) -> Result<()> {
+    let mut sock = sock;
+    if let Some(buf) = pending.take() {
+        if sock.write_all(&buf).await.is_err() {
+            *pending = Some(buf);
+            return Ok(());
+        }
+        let _ = sock.flush().await;
+    }
+    let (rd, mut wr) = tokio::io::split(sock);
+    // Write task: pipe stdin_rx -> daemon, send MARKER_EOF on EOF.
+    let write_task = tokio::spawn(async move {
+        loop {
+            match stdin_rx.recv().await {
+                Some(c) if c.is_empty() => {
+                    let _ = wr.write_all(MARKER_EOF).await;
+                    let _ = wr.flush().await;
+                    return;
+                }
+                Some(c) => {
+                    if wr.write_all(&c).await.is_err() {
+                        return;
+                    }
+                    let _ = wr.flush().await;
+                }
+                None => {
+                    let _ = wr.write_all(MARKER_EOF).await;
+                    let _ = wr.flush().await;
+                    return;
+                }
+            }
+        }
+    });
+    // Read task: daemon -> stdout (until daemon closes its pipe end).
+    let mut stdout = tokio::io::stdout();
+    let mut buf = [0u8; 16 * 1024];
+    let mut rd = rd;
+    loop {
+        match rd.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                stdout.write_all(&buf[..n]).await?;
+                stdout.flush().await?;
+            }
+        }
+    }
+    let _ = stdout.flush().await;
+    let _ = write_task.await;
+    Ok(())
+}
+
 /// Pump a one-shot warm pty: stream output to stdout until the command exits.
 /// No raw mode, no SIGWINCH, no interactive features. Forwards stdin to match
 /// cold path parity (supports `echo hi | filament pty peer -- cat`).
@@ -1883,24 +2031,80 @@ async fn pump_warm_pty_one_shot(
     Ok(())
 }
 
+/// Windows variant of `pump_warm_pty_one_shot`. Same marker-based EOF as
+/// `pump_warm_pty_stdio` but without raw mode / SIGWINCH (scripted usage).
+#[cfg(windows)]
+async fn pump_warm_pty_one_shot(
+    sock: crate::ctl::CtlClientStream,
+    stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    pending: &mut Option<Vec<u8>>,
+) -> Result<()> {
+    let mut sock = sock;
+    if let Some(buf) = pending.take() {
+        if sock.write_all(&buf).await.is_err() {
+            *pending = Some(buf);
+            return Ok(());
+        }
+        let _ = sock.flush().await;
+    }
+    let (rd, mut wr) = tokio::io::split(sock);
+    let write_task = tokio::spawn(async move {
+        loop {
+            match stdin_rx.recv().await {
+                Some(c) if c.is_empty() => {
+                    let _ = wr.write_all(MARKER_EOF).await;
+                    let _ = wr.flush().await;
+                    return;
+                }
+                Some(c) => {
+                    if wr.write_all(&c).await.is_err() {
+                        return;
+                    }
+                    let _ = wr.flush().await;
+                }
+                None => {
+                    let _ = wr.write_all(MARKER_EOF).await;
+                    let _ = wr.flush().await;
+                    return;
+                }
+            }
+        }
+    });
+    let mut stdout = tokio::io::stdout();
+    let mut buf = [0u8; 16 * 1024];
+    let mut rd = rd;
+    loop {
+        match rd.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                stdout.write_all(&buf[..n]).await?;
+                stdout.flush().await?;
+            }
+        }
+    }
+    let _ = stdout.flush().await;
+    let _ = write_task.await;
+    Ok(())
+}
+
 /// `filament dial <peer> <port>`: wire this process's stdio to a service the peer
 /// EXPOSED on its overlay address, over L3 (the overlay-port counterpart of
 /// `netcat`; also an ssh ProxyCommand for an overlay-exposed sshd). Goes through the
 /// local daemon, which resolves the peer to its verified overlay address and dials
 /// it, so it works from a userspace node with no kernel route.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub async fn dial_cmd(peer: &str, port: u16) -> Result<()> {
     match crate::ctl::try_dial(peer, port).await {
-        Some(sock) => pump_stdio_over(sock).await,
+        Some(sock) => pump_stdio_over(sock, None).await,
         None => bail!(
             "could not dial {peer}.mesh:{port} over the overlay (is the daemon up, the peer paired, and the port expose'd on it?)"
         ),
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub async fn dial_cmd(_peer: &str, _port: u16) -> Result<()> {
-    bail!("filament dial needs the local daemon's control socket (unix only)")
+    bail!("filament dial needs the local daemon's control socket (unix/windows only)")
 }
 
 /// `filament netcat <peer> <rport>`: wire this process's stdio to one L2 stream.
@@ -1910,12 +2114,11 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
     // ride it (no signaling, no establishment, ~1s saved). Skipped under --relay
     // (the user forced a relay path; a warm link may be direct) and self-heals: any
     // miss / no daemon / dead stream falls through to a fresh establish below.
-    // Unix-only: the control socket is a unix-domain socket (no-op elsewhere).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if !relay {
-        if let Some(sock) = crate::ctl::try_open(peer, rport).await {
+        if let Some((sock, sid)) = crate::ctl::try_open(peer, rport).await {
             crate::ui::trace(&format!("filament: reusing warm link to '{peer}' (no establish)"));
-            return pump_stdio_over(sock).await;
+            return pump_stdio_over(sock, Some(sid)).await;
         }
     }
     // Bound the connect so an unreachable peer fails with a clear message
@@ -2192,6 +2395,8 @@ async fn pty_attach_once(
     } else {
         None
     };
+    #[cfg(windows)]
+    let winch: Option<tokio::task::JoinHandle<()>> = None; // SIGWINCH not available on Windows
 
     let t_in = mux.transport();
     // Input buffered-but-unsent by the PREVIOUS (dropped) attach goes out first, so
@@ -2271,8 +2476,8 @@ async fn pty_attach_once(
 /// stdio to it - raw mode + SIGWINCH forwarded as a `resize` op. Returns
 /// `Some(result)` once it has handled the session (stdio EOF = shell exit or a
 /// warm-link drop -> we exit), or `None` when there is no warm link, so the caller
-/// falls through to the cold resumable path. Unix-only (the control socket is unix).
-#[cfg(unix)]
+/// falls through to the cold resumable path.
+#[cfg(any(unix, windows))]
 async fn try_warm_pty(
     peer: &str,
     session: &str,
@@ -2373,7 +2578,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     //   unnecessary transport establishment after a clean logout.
     let mut warm_ended = false;
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if !relay && (interactive || !one_shot.is_empty()) {
         match try_warm_pty(peer, &session_id, &term, &one_shot, interactive, &mut raw, &mut stdin_rx, &mut pending).await {
             Some(Err(e)) => return Err(e),
@@ -2455,12 +2660,12 @@ fn port_in_use_msg(lport: u16, peer: &str, rport: u16) -> String {
     )
 }
 
-/// Bidirectionally copy an accepted local TCP connection and a warm-reuse unix
-/// socket (the daemon bridges the unix socket to an L2 stream over its existing
-/// link). One copy per direction; either side's EOF ends the pair. Unix-only.
-#[cfg(unix)]
-async fn bridge_streams(mut tcp: TcpStream, mut unix: tokio::net::UnixStream) -> std::io::Result<()> {
-    tokio::io::copy_bidirectional(&mut tcp, &mut unix).await.map(|_| ())
+/// Bidirectionally copy an accepted local TCP connection and a warm-reuse
+/// control socket (the daemon bridges it to an L2 stream over its existing
+/// link). One copy per direction; either side's EOF ends the pair.
+#[cfg(any(unix, windows))]
+async fn bridge_streams(mut tcp: TcpStream, mut ctl: crate::ctl::CtlClientStream) -> std::io::Result<()> {
+    tokio::io::copy_bidirectional(&mut tcp, &mut ctl).await.map(|_| ())
 }
 
 /// `filament forward <lport> <peer> <rport>`: local TCP listener; every accepted
@@ -2632,11 +2837,11 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
     // connections are then instant and open NO new presence on the peer (the
     // daemon is the one connected), and the daemon reports its own link state.
     // Probed once, up front.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let via_daemon = !relay && crate::ctl::daemon_present().await;
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let via_daemon = false;
-    let warm = via_daemon; // per-connection warm attempts (unix only)
+    let warm = via_daemon; // per-connection warm attempts
 
     // Cold link (no daemon): managed by a background task that establishes it,
     // WATCHES its liveness, and reconnects on loss, reporting lost/recovered so a
@@ -2696,9 +2901,9 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
         let _ = sock.set_nodelay(true);
         // Warm path: bridge this connection straight to the daemon's link. Retried
         // per connection so it is used whenever the daemon holds a warm link.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if warm {
-            if let Some(usock) = crate::ctl::try_open(peer, rport).await {
+            if let Some((usock, _sid)) = crate::ctl::try_open(peer, rport).await {
                 let guard = activity.begin();
                 tokio::spawn(async move {
                     let _guard = guard; // decrements + refreshes the activity line on close
@@ -2761,7 +2966,7 @@ pub async fn proxy_cmd(server: &str, bind: &str, port: u16, http_port: u16, rela
         "<peer>"
     ));
     crate::ui::say(&format!("  e.g.  curl --socks5-hostname {bind}:{port} http://<peer>.mesh:8080/"));
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if !crate::ctl::daemon_present().await {
         crate::ui::say(&crate::ui::paint(
             crate::ui::Tone::Dim,
@@ -2897,11 +3102,11 @@ async fn handle_socks(
             let peer = peer.to_string();
             // Warm path: ride the local daemon's live mesh link (instant, no extra
             // presence on the peer).
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             if crate::ctl::daemon_present().await {
                 // PRIMARY: the L2 loopback open reaches the peer's 127.0.0.1:dport
                 // over its opt-in acceptor (unchanged semantics).
-                if let Some(usock) = crate::ctl::try_open(&peer, dport).await {
+                if let Some((usock, _sid)) = crate::ctl::try_open(&peer, dport).await {
                     socks_reply(&mut sock, 0x00).await?;
                     return bridge_streams(sock, usock).await.map_err(Into::into);
                 }
@@ -3103,7 +3308,7 @@ async fn serve_cold_connection(
         };
         match open_stream(&mux, rport).await {
             Ok((sid, rx_pipe)) => {
-                serve_stream(mux, sid, sock, rx_pipe, true, None).await;
+                serve_stream(mux, sid, sock, rx_pipe, true, None, None).await;
                 return;
             }
             Err(_) => {
@@ -3289,7 +3494,7 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -
 /// `filament ssh` slow while `pty` was already warm: the bootstrap was the only
 /// remaining cold establish in the ssh path.
 async fn bootstrap_key(server: &str, peer: &str, relay: bool, ssh_port: u16) -> Result<BootstrapInfo> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if !relay {
         let pubkey = crate::sshkeys::ensure_managed_key()?;
         if let Some(v) = crate::ctl::try_bootstrap(peer, &pubkey, ssh_port).await {
@@ -3716,7 +3921,7 @@ async fn ensure_sshd(peer: &str, rport: u16, reported: Option<bool>) {
 #[cfg(unix)]
 async fn probe_sshd_warm(peer: &str, rport: u16) -> Option<bool> {
     use tokio::io::AsyncReadExt;
-    let mut s = crate::ctl::try_open(peer, rport).await?;
+    let (mut s, _sid) = crate::ctl::try_open(peer, rport).await?;
     let mut buf = [0u8; 8];
     match tokio::time::timeout(std::time::Duration::from_secs(3), s.read(&mut buf)).await {
         Ok(Ok(0)) => Some(false),  // refused: stream closed before any byte
@@ -3973,7 +4178,7 @@ mod h1_tests {
         // A duplex pair: one half is the bridge's "client socket", the other we keep
         // and NEVER write to, so the reader stays parked (the deadlock precondition).
         let (client, server_side) = tokio::io::duplex(1024);
-        let bridge = tokio::spawn(serve_stream(mux.clone(), sid, server_side, rx, true, None));
+        let bridge = tokio::spawn(serve_stream(mux.clone(), sid, server_side, rx, true, None, None));
         tokio::time::sleep(Duration::from_millis(50)).await; // let the reader park
         t.kill(); // transport dies with no clean FIN and no client input
         let r = tokio::time::timeout(Duration::from_secs(4), bridge).await;

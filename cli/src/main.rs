@@ -1718,10 +1718,43 @@ fn up_log() -> PathBuf {
     devices_path().with_file_name("up.log")
 }
 
+#[cfg(unix)]
 fn daemon_alive() -> Option<u32> {
     let pid: u32 = std::fs::read_to_string(pidfile()).ok()?.trim().parse().ok()?;
     let cmd = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).ok()?;
     cmd.contains("filament").then_some(pid)
+}
+
+/// Windows daemon_alive: read the PID from the pidfile, then verify it is a
+/// live filament process via OpenProcess + QueryFullProcessImageNameW (instead
+/// of /proc which does not exist on Windows). Returns Some(pid) if the process
+/// is alive and its image path contains "filament".
+#[cfg(windows)]
+fn daemon_alive() -> Option<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, OpenProcess, HANDLE};
+    use windows_sys::Win32::System::Threading::{GetProcessImageFileNameW, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let pid: u32 = std::fs::read_to_string(pidfile()).ok()?.trim().parse().ok()?;
+    let pid_i32 = i32::try_from(pid).ok()?;
+    unsafe {
+        let h: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid_i32);
+        if h == 0 {
+            return None;
+        }
+        let mut buf = [0u16; 260]; // MAX_PATH
+        let len = GetProcessImageFileNameW(h, buf.as_mut_ptr(), buf.len() as u32);
+        CloseHandle(h);
+        if len == 0 {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        path.to_lowercase().contains("filament").then_some(pid)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn daemon_alive() -> Option<u32> {
+    None
 }
 
 /// The argv for a web-shell PTY.
@@ -5605,35 +5638,49 @@ struct DaemonMounts {
 }
 
 /// Dispatch one warm-reuse control request to the right handler. Warm reuse is
-/// unix-only (the control socket is a unix-domain socket); on non-unix `ctl::Req`
-/// is uninhabited so this is never reached - it only keeps the event loop portable.
-#[cfg(not(unix))]
+/// unix/windows (the control socket is a unix-domain socket or named pipe);
+/// on other platforms `ctl::Req` is uninhabited so this is never reached.
+#[cfg(not(any(unix, windows)))]
 async fn handle_warm_req(
     _conn: &Conn,
     _l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
     _warm_ptys: &WarmPtys,
     _tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
+    _eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::watch::Sender<bool>)>,
+    _eof_senders: &mut HashMap<u32, tokio::sync::watch::Sender<bool>>,
 ) {
     match req {}
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn handle_warm_req(
     conn: &Conn,
     l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
     warm_ptys: &WarmPtys,
     tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
+    eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::watch::Sender<bool>)>,
+    eof_senders: &mut HashMap<u32, tokio::sync::watch::Sender<bool>>,
 ) {
     match &req.kind {
-        ctl::ReqKind::Open { .. } => handle_warm_open(conn, l2_muxes, tx, req).await,
+        ctl::ReqKind::Open { .. } => handle_warm_open(conn, l2_muxes, tx, req, eof_senders_tx).await,
         // Dial is handled inline in the daemon loop (it needs the L3 manager);
         // answer defensively if it ever reaches here.
         ctl::ReqKind::Dial { .. } => req.reject("dial not handled here").await,
-        ctl::ReqKind::Pty { .. } => handle_warm_pty(conn, l2_muxes, warm_ptys, tx, req).await,
+        ctl::ReqKind::Pty { .. } => handle_warm_pty(conn, l2_muxes, warm_ptys, tx, req, eof_senders_tx).await,
         ctl::ReqKind::Resize { .. } => handle_warm_resize(l2_muxes, warm_ptys, req).await,
         ctl::ReqKind::Ping { .. } => handle_warm_ping(conn, req).await,
+        // Out-of-band EOF: the client's stdin has closed. Signal the write pump
+        // to stop writing and close the socket write half (daemon sees EOF).
+        ctl::ReqKind::Eof { sid } => {
+            if let Some(tx) = eof_senders.remove(sid) {
+                let _ = tx.send(true);
+                req.reply(&json!({ "ok": true })).await;
+            } else {
+                req.reject("unknown stream id").await;
+            }
+        }
         // Bootstrap is dispatched before this (it defers its reply), so it never
         // reaches here; reject defensively so a future caller falls back to cold.
         ctl::ReqKind::Bootstrap { .. } => req.reject("bootstrap not handled here").await,
@@ -5899,7 +5946,7 @@ async fn sshd_listening(port: u16) -> bool {
 /// already measured the RTT/addr; the route is the link's own label/ICE state), so
 /// nothing is awaited from the peer and the F8 event-loop rule is not in play. A
 /// miss `reject`s so the client falls back to a cold establish-probe.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
     let ctl::ReqKind::Ping { peer } = &req.kind else { return };
     let peer = peer.clone();
@@ -5940,7 +5987,7 @@ async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
     req.reply(&reply).await;
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 /// A non-direct (relay/WebRTC) link has no QUIC keepalive, so an idle one may be
 /// silently NAT/relay-evicted while `is_alive()`/`is_dead()` still lag (the read
 /// loop hasn't seen the EOF yet). Container/DERP paths evict ~10s; reusing such a
@@ -5953,7 +6000,7 @@ async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
 /// tripping it means the keepalive stopped, so a fresh establish is the right answer.
 const WARM_RELAY_STALE_MS: u64 = 8_000;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 /// Resolve `peer` (matched case-insensitively on the PROVEN `verified_name`, the
 /// same key the L2 cap gate uses) to a warm, trusted, alive link, preferring a
 /// direct one. The single resolver for every warm-reuse op (open + pty), so the
@@ -5977,7 +6024,7 @@ fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn net::Transp
 
 /// DEBUG: dump every link's warm-reuse eligibility so a miss-despite-a-live-link
 /// is diagnosable (visible at `-v` / FILAMENT_LOG=debug only).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn log_warm_miss(conn: &Conn, peer: &str) {
     for (p, l) in conn.links.iter() {
         ui::debug(&format!(
@@ -5991,13 +6038,14 @@ fn log_warm_miss(conn: &Conn, peer: &str) {
 }
 
 /// Warm-reuse: open a raw L2 stream to `peer:rport` over its existing link and
-/// bridge it to the client's unix socket (netcat/ssh/forward fast path).
-#[cfg(unix)]
+/// bridge it to the client's unix socket / named pipe (netcat/ssh/forward fast path).
+#[cfg(any(unix, windows))]
 async fn handle_warm_open(
     conn: &Conn,
     l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
     tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
+    eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::watch::Sender<bool>)>,
 ) {
     let ctl::ReqKind::Open { peer, rport } = &req.kind else { return };
     let (peer, rport) = (peer.clone(), *rport);
@@ -6021,10 +6069,18 @@ async fn handle_warm_open(
     // timeout (the 25s ssh ConnectTimeout we measured). Spawned so the verify wait
     // never blocks the event loop (F8).
     tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
         match l2::open_stream_verified(&mux, rport, l2::warm_verify_window()).await {
             Ok((sid, first, rx)) => {
-                let sock = req.accept().await;
-                l2::serve_verified_stream(mux, sid, sock, first, rx).await;
+                // Include the stream ID in the reply so the client can send an
+                // out-of-band EOF signal for this specific stream.
+                let mut sock = req.sock;
+                let _ = sock.write_all(format!("{{\"ok\":true,\"sid\":{sid}}}\n").as_bytes()).await;
+                let _ = sock.flush().await;
+                let shutdown_tx = l2::serve_verified_stream(mux, sid, sock, first, rx).await;
+                // Store the shutdown sender so the event loop can signal it on
+                // an out-of-band EOF for this stream.
+                let _ = eof_senders_tx.send((sid, shutdown_tx));
             }
             Err(e) => {
                 ui::debug(&format!(
@@ -6040,13 +6096,14 @@ async fn handle_warm_open(
 /// Warm-reuse: open a PTY on `peer` over its existing link and bridge it to the
 /// client's stdio socket (the `filament pty` fast path). Records the session->sid
 /// so a later `pty-resize` can find it; the entry is dropped when the bridge ends.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn handle_warm_pty(
     conn: &Conn,
     l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
     warm_ptys: &WarmPtys,
     tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
+    eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::watch::Sender<bool>)>,
 ) {
     let ctl::ReqKind::Pty { peer, session, cols, rows, term, cmd } = &req.kind else { return };
     let (peer, session, cols, rows, term, cmd) = (peer.clone(), session.clone(), *cols, *rows, term.clone(), cmd.clone());
@@ -6066,13 +6123,17 @@ async fn handle_warm_pty(
     // pty rather than getting a dead terminal. Spawned so the verify wait never
     // blocks the event loop (F8).
     tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
         match l2::open_pty_stream_verified(&mux, &session, cols, rows, &term, &cmd, verify).await {
             Ok((sid, first, rx_pipe)) => {
                 if let Ok(mut m) = warm_ptys.lock() {
                     m.insert(session.clone(), (pid, sid));
                 }
-                let sock = req.accept().await;
-                l2::serve_verified_stream(mux, sid, sock, first, rx_pipe).await;
+                let mut sock = req.sock;
+                let _ = sock.write_all(format!("{{\"ok\":true,\"sid\":{sid}}}\n").as_bytes()).await;
+                let _ = sock.flush().await;
+                let shutdown_tx = l2::serve_verified_stream(mux, sid, sock, first, rx_pipe).await;
+                let _ = eof_senders_tx.send((sid, shutdown_tx));
                 // Bridge ended (shell exit / client gone / link drop): drop our
                 // entry, but only if it is still ours (a reconnect may have
                 // replaced it).
@@ -6094,7 +6155,7 @@ async fn handle_warm_pty(
 }
 
 /// Warm-reuse: relay a window-size change to an already-open warm PTY (by session).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn handle_warm_resize(
     l2_muxes: &HashMap<String, Arc<l2::Mux>>,
     warm_ptys: &WarmPtys,
@@ -6121,9 +6182,9 @@ async fn handle_warm_resize(
 /// deadline) and complete it from the `shell-bootstrap-ack`/`-deny` control arms,
 /// or reap it on timeout. A `Vec` per pid handles concurrent ssh to one peer (the
 /// ack is identical, so every waiter gets the same answer).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 type PendingBootstraps =
-    HashMap<String, Vec<(tokio::net::UnixStream, std::time::Instant)>>;
+    HashMap<String, Vec<(crate::ctl::CtlServerStream, std::time::Instant)>>;
 
 /// Warm-reuse the ssh `shell-bootstrap`: install the client's managed `pubkey` on
 /// `peer` over the daemon's EXISTING link instead of a fresh cold establish, the
@@ -6131,7 +6192,7 @@ type PendingBootstraps =
 /// the last cold-establish left). Sends `shell-bootstrap` and STASHES the reply
 /// socket; the ack/deny handler completes it. A miss falls the client back to the
 /// cold `shell_bootstrap`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn handle_warm_bootstrap(conn: &Conn, pending: &mut PendingBootstraps, req: ctl::Req) {
     let (peer, pubkey, ssh_port) = match &req.kind {
         ctl::ReqKind::Bootstrap { peer, pubkey, ssh_port } => (peer.clone(), pubkey.clone(), *ssh_port),
@@ -8880,8 +8941,18 @@ async fn recv_cmd(
     // Warm-pty session -> (pid, sid), so a `pty-resize` op relays to the right stream.
     let warm_ptys: WarmPtys = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
     // Warm ssh-bootstrap reply sockets awaiting the peer's ack (see PendingBootstraps).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let mut pending_bootstrap: PendingBootstraps = HashMap::new();
+    // Out-of-band EOF senders: stream ID -> shutdown channel sender. When a
+    // client sends an Eof ctl op, the daemon looks up the sender by stream ID
+    // and signals the write pump to stop writing and close the socket (daemon
+    // sees EOF on the data pipe). Spawned tasks send their shutdown_tx through
+    // eof_senders_tx; the event loop collects them.
+    #[cfg(any(unix, windows))]
+    let (eof_senders_tx, mut eof_senders_rx) =
+        mpsc::unbounded_channel::<(u32, tokio::sync::watch::Sender<bool>)>();
+    #[cfg(any(unix, windows))]
+    let mut eof_senders: HashMap<u32, tokio::sync::watch::Sender<bool>> = HashMap::new();
     // Warm-link reuse: ONLY the registered `up` daemon exposes the local control
     // socket (a short-lived `recv`/`send` must never bind it and steal the
     // daemon's path). When a sibling `filament ssh`/`netcat`/`forward` asks to
@@ -8890,8 +8961,9 @@ async fn recv_cmd(
     // held for the loop's life so the channel stays open (recv pends, never spins)
     // even when we are not the daemon and `serve` was not spawned.
     let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ctl::Req>();
-    // The control socket is a unix-domain socket, so warm-link reuse is unix-only.
-    #[cfg(unix)]
+    // The control socket is a unix-domain socket or Windows named pipe, so
+    // warm-link reuse works on both platforms.
+    #[cfg(any(unix, windows))]
     {
         if daemon_alive() == Some(std::process::id()) {
             let ctl_tx = ctl_tx.clone();
@@ -8903,8 +8975,8 @@ async fn recv_cmd(
         }
     }
     // Hold `ctl_tx` for the loop's life so `ctl_rx` stays open (recv pends, never
-    // spins) even when `serve` was not spawned (non-unix, or not the daemon).
-    #[cfg(not(unix))]
+    // spins) even when `serve` was not spawned (non-unix/windows, or not the daemon).
+    #[cfg(not(any(unix, windows)))]
     let _ = &ctl_tx;
     // web-shell (#4): persistent PTY sessions, keyed by a stable browser-chosen
     // session id, OUTLIVE the link that opened them. A dropped data channel
@@ -8995,6 +9067,11 @@ async fn recv_cmd(
     }
 
     loop {
+        // Collect eof senders from spawned warm-stream tasks (non-blocking).
+        #[cfg(any(unix, windows))]
+        while let Ok((sid, eof_tx)) = eof_senders_rx.try_recv() {
+            eof_senders.insert(sid, eof_tx);
+        }
         // systemd liveness watchdog: ping on a throttle (well under WatchdogSec).
         // If this loop WEDGES on an await, the pings stop and systemd restarts us
         // - the backstop for the stall that also freezes the reconnect code.
@@ -9020,7 +9097,7 @@ async fn recv_cmd(
                     // Bootstrap defers its reply (awaits the peer's ack via this
                     // loop), so it can't go through the inline handle_warm_req; it
                     // stashes the socket in pending_bootstrap instead.
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     {
                         // `filament set` live-reconfigure: re-read the changed key
                         // into this loop's live state, then report whether it took
@@ -9111,11 +9188,11 @@ async fn recv_cmd(
                             if let ctl::ReqKind::Pty { peer, .. } = &req.kind {
                                 conn.note_warm_use(peer);
                             }
-                            handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
+                            handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req, eof_senders_tx.clone(), &mut eof_senders).await;
                         }
                     }
-                    #[cfg(not(unix))]
-                    handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
+                    #[cfg(not(any(unix, windows)))]
+                    handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req, eof_senders_tx.clone(), &mut eof_senders).await;
                 }
                 None
             }
