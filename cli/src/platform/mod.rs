@@ -436,7 +436,7 @@ impl ServiceHost {
         {
             use std::os::windows::ffi::OsStrExt;
 
-            extern "system" {
+            unsafe extern "system" {
                 fn ShellExecuteW(
                     hwnd: isize,
                     lpOperation: *const u16,
