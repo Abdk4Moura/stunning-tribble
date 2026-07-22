@@ -8739,7 +8739,7 @@ async fn recv_cmd(
                                 if auto_proxy {
                                     let server = server.to_string();
                                     tokio::spawn(async move {
-                                        if let Err(e) = l2::proxy_cmd(&server, "127.0.0.1", 1080, relay).await {
+                                        if let Err(e) = l2::proxy_cmd(&server, "127.0.0.1", 1080, 0, relay).await {
                                             // Port already in use is expected (user started proxy manually);
                                             // only log unexpected errors.
                                             let msg = e.to_string();
