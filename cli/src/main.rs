@@ -592,6 +592,11 @@ enum Cmd {
         /// Internal: re-invoked after elevation to do the system-level install.
         #[arg(long, hide = true)]
         install_system: bool,
+        /// When kernel TUN is unavailable, auto-start a SOCKS5 proxy on port
+        /// 1080 so native tools (curl, ssh) can reach <peer>.mesh. Opt out
+        /// with --no-proxy-fallback or `filament set auto-proxy off`.
+        #[arg(long)]
+        no_proxy_fallback: bool,
     },
     /// Show whether the daemon runs and what it received recently
     Status {
@@ -1980,6 +1985,7 @@ async fn up_cmd(
     shell_program: Option<String>,
     shell_user: Option<String>,
     install_system_flag: bool,
+    no_proxy_fallback: bool,
 ) -> Result<()> {
     // Internal: re-invoked after elevation. Do the system-level install directly
     // and return. The privileged backend registers the service/daemon/task and exits.
@@ -2108,6 +2114,11 @@ async fn up_cmd(
     {
         let server = server.to_string();
         tokio::spawn(async move { direct::warm_public_ip(&server).await; });
+    }
+    // Pass --no-proxy-fallback to recv_cmd via env (avoids changing recv_cmd's
+    // large parameter list for a single flag used only by `up`).
+    if no_proxy_fallback {
+        unsafe { std::env::set_var("FILAMENT_NO_PROXY_FALLBACK", "1") };
     }
     let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None, shell_policy, shell_user).await;
     let _ = std::fs::remove_file(pidfile());
@@ -6405,7 +6416,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Up { install, system, userspace, dir, shell, shell_only, shell_program, shell_user, install_system } => {
+        Cmd::Up { install, system, userspace, dir, shell, shell_only, shell_program, shell_user, install_system, no_proxy_fallback } => {
             // `--userspace` forces the netstack backend; L3::start reads this env, so
             // set it before the daemon brings L3 up (same process). Safe: single
             // threaded at this point (the daemon's tasks are not spawned yet).
@@ -6423,7 +6434,7 @@ async fn main() -> Result<()> {
                 (Some(list), false) => Some(format!("{list},{}", peer_shell.join(","))),
                 (None, false) => Some(peer_shell.join(",")),
             };
-            up_cmd(&server, install, system, dir, relay, shell, shell_only, shell_program, shell_user, install_system).await
+            up_cmd(&server, install, system, dir, relay, shell, shell_only, shell_program, shell_user, install_system, no_proxy_fallback).await
         }
         Cmd::Status { json } => status_cmd(json),
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
@@ -8717,6 +8728,30 @@ async fn recv_cmd(
                                 ui::say(&ui::paint(ui::Tone::Warn,
                                     "    host firewall/nftables are NOT enforced here; only mesh membership + the expose allowlist gate access"));
                                 ui::say("    native tools reach <peer>.mesh via `filament proxy` / `filament dial` (no kernel route in userspace)");
+                                // Auto-start SOCKS5 proxy when kernel TUN is unavailable.
+                                // Opt-out via --no-proxy-fallback or `filament set auto-proxy off`.
+                                let auto_proxy = settings::get_bool("auto-proxy", None)
+                                    && std::env::var("FILAMENT_NO_PROXY_FALLBACK").as_deref() != Ok("1");
+                                if auto_proxy {
+                                    let server = server.to_string();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = l2::proxy_cmd(&server, "127.0.0.1", 1080, relay).await {
+                                            // Port already in use is expected (user started proxy manually);
+                                            // only log unexpected errors.
+                                            let msg = e.to_string();
+                                            if !msg.contains("already in use") {
+                                                ui::debug(&format!("auto-proxy: {e}"));
+                                            }
+                                        }
+                                    });
+                                    ui::say(&format!(
+                                        "  {} started SOCKS5 proxy on 127.0.0.1:1080 (set your tools' proxy to this)",
+                                        ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                                    ));
+                                    ui::say(&format!(
+                                        "    e.g.  curl --socks5-hostname 127.0.0.1:1080 http://<peer>.mesh:8080/"
+                                    ));
+                                }
                             } else {
                             // Kernel mode is dual-stack: show the v4 address too
                                 // (userspace has no v4 endpoint yet, so it is omitted
