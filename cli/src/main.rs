@@ -3794,9 +3794,6 @@ impl Conn {
     /// Check for warm peers that need connections and establish them.
     /// Called periodically from the daemon event loop. Returns the list of
     /// peers we attempted to connect to.
-    /// Check for warm peers that need connections and establish them.
-    /// Called periodically from the daemon event loop. Returns the list of
-    /// peers we attempted to connect to.
     ///
     /// `auto_warm`: sync the auto tier (ALL online paired peers) from the roster.
     /// Default ON (`auto-warm` setting); forced on while L3 is up. When off, the

@@ -938,13 +938,8 @@ fn warm_all_makes_first_contact_warm() {
     h.daemon_a = None;
     std::thread::sleep(Duration::from_secs(3));
 
-    let (child_a_off, log_a_off) = spawn_daemon_inner(
-        &bin, &server, "test-a", &h.a_dir,
-    );
-    // Override auto-warm to OFF via env
-    // Actually spawn_daemon_inner already sets FILAMENT_LOG=debug but not auto-warm.
-    // We need a custom spawn for the negative control.
-    drop(child_a_off);
+    // Spawn auto-warm-OFF daemon via custom Command (spawn_daemon_inner doesn't
+    // support FILAMENT_AUTO_WARM override).
     let mut daemon_a_off = Command::new(&bin)
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
         .env("FILAMENT_L3_USERSPACE", "1")
