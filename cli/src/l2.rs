@@ -1840,6 +1840,7 @@ async fn pump_warm_pty_stdio(
 /// Pump a one-shot warm pty: stream output to stdout until the command exits.
 /// No raw mode, no SIGWINCH, no interactive features. Forwards stdin to match
 /// cold path parity (supports `echo hi | filament pty peer -- cat`).
+#[cfg(unix)]
 async fn pump_warm_pty_one_shot(
     sock: tokio::net::UnixStream,
     stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
