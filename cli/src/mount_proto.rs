@@ -128,7 +128,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// Default max read/write payload size advertised by the server. Kept well
 /// below net::MAX_DC_PAYLOAD (60 KiB) so a single mount frame fits through
 /// WebRTC/relay DataChannels, not just direct-quic.
-pub const DEFAULT_MOUNT_MAX_SIZE: u32 = 512 * 1024;
+pub const DEFAULT_MOUNT_MAX_SIZE: u32 = 256 * 1024;
 
 /// Server capabilities advertised in `mount-open-ack`, per spec rule 5: the two
 /// ends exchange what they can represent before the first file op, so the client
@@ -1121,8 +1121,8 @@ mod tests {
         let caps = mount_caps_for_root(&std::path::PathBuf::from("/tmp"));
         assert!(caps.max_read_size > 0);
         assert!(caps.max_write_size > 0);
-        assert!(caps.max_read_size <= 60 * 1024);
-        assert!(caps.max_write_size <= 60 * 1024);
+        assert!(caps.max_read_size <= DEFAULT_MOUNT_MAX_SIZE);
+        assert!(caps.max_write_size <= DEFAULT_MOUNT_MAX_SIZE);
     }
 
     #[test]
