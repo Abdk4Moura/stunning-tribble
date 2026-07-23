@@ -7673,21 +7673,21 @@ async fn send_cmd(
                                 if let Some(r) = p.route().await {
                                     // CRITICAL: the route label is the value-prop,
                                     // direct vs relayed. Always shown, even under -q.
-                                    ui::critical(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
+                                    ui::debug(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
                                     // Relay honesty (§3.3): the quiet `route:` line
                                     // is legible but not loud. When the route is
                                     // actually the TURN relay, print the honest
                                     // one-line banner so the user is never unaware
                                     // they're on a middleman path. CRITICAL.
                                     if r == "relayed" {
-                                        ui::critical(&format!("    {}", relay_banner()));
+                                        ui::debug(&format!("    {}", relay_banner()));
                                     }
                                     break;
                                 }
                             }
                         });
                     } else if is_direct {
-                        ui::critical(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))));
+                        ui::debug(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))));
                     }
                     // L1-a: on the `--code` path, run the ephemeral SPAKE2
                     // ceremony BEFORE offering any byte. While auth is pending,
@@ -9982,21 +9982,21 @@ async fn recv_cmd(
                                 if let Some(r) = p.route().await {
                                     // CRITICAL: the route label is the value-prop,
                                     // direct vs relayed. Always shown, even under -q.
-                                    ui::critical(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
+                                    ui::debug(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
                                     // Relay honesty (§3.3): the quiet `route:` line
                                     // is legible but not loud. When the route is
                                     // actually the TURN relay, print the honest
                                     // one-line banner so the user is never unaware
                                     // they're on a middleman path. CRITICAL.
                                     if r == "relayed" {
-                                        ui::critical(&format!("    {}", relay_banner()));
+                                        ui::debug(&format!("    {}", relay_banner()));
                                     }
                                     break;
                                 }
                             }
                         });
                     } else if is_direct {
-                        ui::critical(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))));
+                        ui::debug(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))));
                     }
                 }
                 // Warm-reuse readiness: proactively prove our identity to a KNOWN
