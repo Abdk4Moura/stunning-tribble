@@ -1858,6 +1858,20 @@ async fn pump_warm_pty_one_shot(
         }
         let _ = wr.flush().await;
     }
+    // For scripted one-shot: on stdin-EOF, shut down the write-half to signal
+    // stdin-EOF to the daemon (cat etc. will see stdin EOF and exit), but do
+    // NOT let serve_stream tear down the pty session yet. The daemon's
+    // socket_to_dc sees the read-EOF and sends an empty frame (FIN) to the
+    // daemon transport, which closes the pty stdin. The daemon keeps the pty
+    // open until the command exits, then closes the socket (dc_to_socket
+    // finishes as the pty output pipe closes), which we see as read-EOF.
+    //
+    // Key insight: on a Unix socket, closing the write-half sends FIN to the
+    // reader, but the reader half stays open. socket_to_dc sees the FIN and
+    // returns Ok(()), but the writer (dc_to_socket) is NOT aborted until the
+    // daemon's pty output pipe closes. serve_stream's select! picks up the
+    // writer finishing AFTER the reader, not before.
+    let mut stdin_done = false;
     let mut stdout = tokio::io::stdout();
     let mut buf = [0u8; 16 * 1024];
     loop {
@@ -1869,13 +1883,22 @@ async fn pump_warm_pty_one_shot(
                     stdout.flush().await?;
                 }
             },
-            chunk = stdin_rx.recv() => match chunk {
-                Some(c) if c.is_empty() => { let _ = wr.shutdown().await; } // fd0 EOF
+            chunk = stdin_rx.recv(), if !stdin_done => match chunk {
+                Some(c) if c.is_empty() => {
+                    // stdin-EOF: shut down write-half to signal the daemon.
+                    // socket_to_dc sees read-EOF, sends FIN to daemon transport.
+                    // Daemon keeps pty open until command exits, then closes socket.
+                    let _ = wr.shutdown().await;
+                    stdin_done = true;
+                }
                 Some(c) => {
                     if wr.write_all(&c).await.is_err() { *pending = Some(c); break; }
                     let _ = wr.flush().await;
                 }
-                None => { let _ = wr.shutdown().await; }
+                None => {
+                    // Shared reader gone (only at shutdown) - don't close socket.
+                    stdin_done = true;
+                }
             },
         }
     }
@@ -2378,6 +2401,12 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
         match try_warm_pty(peer, &session_id, &term, &one_shot, interactive, &mut raw, &mut stdin_rx, &mut pending).await {
             Some(Err(e)) => return Err(e),
             Some(Ok(())) => {
+                // For one-shot exec: the warm bridge already streamed the command's
+                // output and waited for exit. Return immediately - do NOT enter the
+                // reconnect/resume loop which would cold-establish redundantly.
+                if !one_shot.is_empty() {
+                    return Ok(());
+                }
                 warm_ended = true;
                 role = "reconnect";
             }
