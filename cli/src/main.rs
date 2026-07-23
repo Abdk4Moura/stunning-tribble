@@ -7680,7 +7680,7 @@ async fn send_cmd(
                                     // one-line banner so the user is never unaware
                                     // they're on a middleman path. CRITICAL.
                                     if r == "relayed" {
-                                        ui::debug(&format!("    {}", relay_banner()));
+                                        ui::critical(&format!("    {}", relay_banner()));
                                     }
                                     break;
                                 }
@@ -9989,7 +9989,7 @@ async fn recv_cmd(
                                     // one-line banner so the user is never unaware
                                     // they're on a middleman path. CRITICAL.
                                     if r == "relayed" {
-                                        ui::debug(&format!("    {}", relay_banner()));
+                                        ui::critical(&format!("    {}", relay_banner()));
                                     }
                                     break;
                                 }
