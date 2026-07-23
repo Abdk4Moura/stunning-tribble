@@ -6740,8 +6740,7 @@ async fn mount_fuse_cmd(
     //    makes the blocking session loop return.
     let mnt_run = mnt.clone();
     #[cfg(target_os = "linux")]
-    let handle = tokio::runtime::Handle::current();
-    let session = tokio::task::spawn_blocking(move || crate::mount_fuse::run_mount(client, &mnt_run, handle));
+    let session = tokio::task::spawn_blocking(move || crate::mount_fuse::run_mount(client, &mnt_run));
     #[cfg(all(target_os = "windows", feature = "mount-windows"))]
     let session = tokio::task::spawn_blocking(move || crate::mount_winfsp::run_mount(client, &mnt_run));
 
