@@ -563,8 +563,21 @@ fn pty_one_shot_exec_smoke() {
     {
         // Live-pairing: daemon discovers the newly paired device via the
         // 2s devices_load scan. No restart needed (proven by #41).
+        // Poll deterministically for the discovery message instead of a fixed sleep.
         eprintln!("pty_one_shot_exec_smoke: waiting for live-pairing discovery...");
-        std::thread::sleep(Duration::from_secs(15));
+        let discovered = wait_for_line(
+            &h.daemon_a_log,
+            "known device 'test-b' appeared",
+            Duration::from_secs(30),
+        ) || wait_for_line(
+            &h.daemon_b_log,
+            "known device 'test-a' appeared",
+            Duration::from_secs(0),
+        );
+        assert!(
+            discovered,
+            "live-pairing discovery did not occur within 30s"
+        );
     }
 
     let nonce = format!("PTY-OK-{}", std::process::id());
