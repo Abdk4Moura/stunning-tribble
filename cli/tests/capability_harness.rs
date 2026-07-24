@@ -908,6 +908,11 @@ fn warm_all_makes_first_contact_warm() {
         Duration::from_secs(15),
     );
 
+    // Allow the warm link to be verified (pair-proof) before running ping.
+    // The warm-hold "established" message fires when the L2 stream opens,
+    // but the ping warm path requires verification.
+    std::thread::sleep(Duration::from_secs(10));
+
     // Assertion 2: FIRST CONTACT TAKES THE WARM PATH
     eprintln!("warm_all: running filament ping --json...");
     let mut ping_proc = Command::new(&bin)
@@ -1301,6 +1306,12 @@ fn warm_one_shot_pty_instant_eof() {
         warm_ready,
         "warm link to 'test-b' was not established within 40s after daemon restart"
     );
+
+    // Allow the warm link to be verified (pair-proof) before running pty.
+    // The warm-hold "established" message fires when the L2 stream opens,
+    // but the pty warm path requires verification. The 30s grace window
+    // in warm_hold_tick prevents churn, but we still need a brief settle.
+    std::thread::sleep(Duration::from_secs(5));
 
     // Run one-shot pty with INSTANT stdin-EOF (</dev/null).
     // This is the exact scenario #67 fixed: the client closes stdin immediately,
