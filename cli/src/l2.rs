@@ -358,40 +358,53 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // wire to PROVE the link is live before the client was committed; replay it
     // here so no peer bytes are lost.
     let mut writer = tokio::spawn(dc_to_socket(rx, wr, first));
-    let mut reader = tokio::spawn(socket_to_dc(mux.transport.clone(), sid, rd));
-    mux.set_read_pump(sid, reader.abort_handle()).await;
+    let reader_task = tokio::spawn(socket_to_dc(mux.transport.clone(), sid, rd));
+    mux.set_read_pump(sid, reader_task.abort_handle()).await;
+    let mut reader = Some(reader_task);
 
-    // Tear the bridge down when EITHER direction ends, not just the client->peer
-    // reader. When the PEER dies, dc_to_socket (writer) finishes as the mux pipe
-    // closes, but socket_to_dc (reader) stays parked on an IDLE client socket and
-    // never notices - so awaiting only the reader (the old behavior) DEADLOCKED the
-    // warm bridge, and thus the client's warm pty, until the user happened to type.
-    // A 2s liveness poll is the backstop for a transport that black-holes without
-    // ever closing the pipe. Whichever fires, we drop the socket so the client sees
-    // EOF and (for the pty) falls through to a cold reattach. (Kept short so a dead
-    // peer tears the warm pty down in ~2s rather than leaving it hung.)
-    // read_result: Some = reader finished (Ok=FIN sent, Err(join)=teardown aborted
-    // us); None = we tore down because the peer/link ended.
+    // Half-close semantics: reader-done (client stdin-EOF) is NON-TERMINAL.
+    // The reader finishing means the client closed its write-half (stdin-EOF /
+    // socket write-half closed). On a Unix socket, closing the write-half sends
+    // EOF to the reader (socket_to_dc sees it and sends FIN to daemon transport),
+    // but the read-half stays open. The daemon keeps the pty open until the
+    // command exits, then dc_to_socket finishes and the socket closes.
+    //
+    // Writer-done (dc_to_socket done = remote command exited / pty output pipe
+    // closed) IS terminal: this is when the command has finished and all output
+    // has been delivered. Only then do we send l2-close and tear down.
+    //
+    // Ticker+transport-dead is also terminal: a dead peer must not hang the
+    // bridge. The 2s poll tears down in ~2s (kept short so a dead peer doesn't
+    // leave the warm pty hung).
+    //
+    // read_result: Some = reader finished (Ok=FIN sent); None = we tore down
+    // because the peer/link ended (writer-done or transport-dead).
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
     ticker.tick().await; // consume the immediate tick
-    let read_result;
+    let mut reader_done = false;
+    let mut read_result = None;
     loop {
         tokio::select! {
-            r = &mut reader => {
-                // Client-side finished (stdin-EOF / socket write-half closed).
-                // DO NOT abort the writer here. On a Unix socket, closing the
-                // write-half sends EOF to the reader (socket_to_dc sees it and
-                // sends FIN to daemon transport), but the read-half stays open.
-                // The daemon keeps the pty open until the command exits, then
-                // dc_to_socket finishes and the socket closes. We must wait for
-                // the writer to finish naturally (daemon-side half-close).
+            r = async { reader.as_mut().unwrap().await }, if !reader_done => {
+                // Client-side finished: record result, disarm the arm, but DO
+                // NOT break. The writer (dc_to_socket) is still waiting for the
+                // remote command to exit. l2-close is sent only after the writer
+                // finishes (command exit), not here.
                 read_result = Some(r);
+                reader = None;   // disarm - must not re-poll a resolved future
+                reader_done = true;
+            }
+            _ = &mut writer => {
+                // Terminal: remote command exited / pty output pipe closed.
+                // All output delivered; safe to tear down.
+                if let Some(r) = reader.take() { r.abort(); }
+                read_result = None;
                 break;
             }
-            _ = &mut writer => { reader.abort(); read_result = None; break; }
             _ = ticker.tick() => {
                 if !mux.transport.is_alive() {
-                    reader.abort();
+                    // Terminal: transport dead. Abort both directions.
+                    if let Some(r) = reader.take() { r.abort(); }
                     writer.abort();
                     read_result = None;
                     break;
