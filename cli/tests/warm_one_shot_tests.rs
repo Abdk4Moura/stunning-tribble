@@ -52,6 +52,54 @@ fn one_shot_pty_timeout_respects_env_var() {
     );
 }
 
+/// Test that one-shot pty with instant stdin-EOF (</dev/null) exits promptly
+/// on the cold path. This exercises the same code path that #67 fixed for
+/// the warm path (pump_warm_pty_one_shot + serve_stream half-close).
+#[test]
+fn one_shot_pty_instant_eof_cold_path() {
+    let bin = filament_bin();
+    let connect_secs = 5;
+
+    let start = std::time::Instant::now();
+    let output = Command::new(&bin)
+        .env("FILAMENT_CONNECT_SECS", connect_secs.to_string())
+        .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-warm-one-shot-test-eof"))
+        .arg("pty")
+        .arg("definitely-unreachable-peer-12345")
+        .arg("--")
+        .arg("echo")
+        .arg("hi")
+        .stdin(std::process::Stdio::null()) // instant stdin-EOF
+        .output()
+        .expect("failed to execute filament");
+    let elapsed = start.elapsed();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should exit quickly (within connect_secs + some overhead)
+    assert!(
+        elapsed.as_secs() <= connect_secs + 5,
+        "Expected exit within {}s, took {:?}",
+        connect_secs + 5,
+        elapsed
+    );
+
+    // Should exit with nonzero code (peer is unreachable)
+    assert!(
+        !output.status.success(),
+        "Expected nonzero exit code, got: {:?}\nstderr: {}",
+        output.status,
+        stderr
+    );
+
+    // Should contain the peer name in the error
+    assert!(
+        stderr.contains("definitely-unreachable-peer-12345"),
+        "Expected peer name in stderr, got: {}",
+        stderr
+    );
+}
+
 /// Test that one-shot pty stdin forwarding works for cold path.
 #[test]
 fn one_shot_pty_stdin_forwarding() {
