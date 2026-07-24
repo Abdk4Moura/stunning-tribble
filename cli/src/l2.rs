@@ -377,7 +377,17 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let read_result;
     loop {
         tokio::select! {
-            r = &mut reader => { read_result = Some(r); writer.abort(); break; }
+            r = &mut reader => {
+                // Client-side finished (stdin-EOF / socket write-half closed).
+                // DO NOT abort the writer here. On a Unix socket, closing the
+                // write-half sends EOF to the reader (socket_to_dc sees it and
+                // sends FIN to daemon transport), but the read-half stays open.
+                // The daemon keeps the pty open until the command exits, then
+                // dc_to_socket finishes and the socket closes. We must wait for
+                // the writer to finish naturally (daemon-side half-close).
+                read_result = Some(r);
+                break;
+            }
             _ = &mut writer => { reader.abort(); read_result = None; break; }
             _ = ticker.tick() => {
                 if !mux.transport.is_alive() {
