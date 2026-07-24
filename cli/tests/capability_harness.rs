@@ -1147,7 +1147,24 @@ fn warm_one_shot_pty_reuse() {
     h.daemon_b = Some(child_b);
     h.daemon_a_log = log_a;
     h.daemon_b_log = log_b;
-    std::thread::sleep(Duration::from_secs(20));
+
+    // Wait for warm link to be established (deterministic poll).
+    let warm_ready = wait_for_line(
+        &h.daemon_a_log,
+        "warm-hold: established connection to 'test-b'",
+        Duration::from_secs(40),
+    ) || wait_for_line(
+        &h.daemon_a_log,
+        "warm-hold: skip 'test-b'",
+        Duration::from_secs(0),
+    );
+    assert!(
+        warm_ready,
+        "warm link to 'test-b' was not established within 40s"
+    );
+
+    // Allow verification to complete before running pty.
+    std::thread::sleep(Duration::from_secs(5));
 
     // Warm-hold tick (10s interval) runs during the 20s settle — daemon A
     // establishes a warm link to test-b. Now pty should hit the warm path.
