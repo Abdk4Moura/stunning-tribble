@@ -881,16 +881,31 @@ fn warm_all_makes_first_contact_warm() {
     // line (only fires when the peer is added to the auto set during the
     // tick, which can be skipped if roster sync populates it earlier), so
     // we assert on the "established" reliability marker instead.
+    // Also check for "skip" (link already alive within grace) which means
+    // the warm path is usable.
     eprintln!("warm_all: waiting for warm-hold to establish the link...");
     let link_held = wait_for_line(
         &h.daemon_a_log,
         "warm-hold: established connection to 'test-b'",
         Duration::from_secs(60),
+    ) || wait_for_line(
+        &h.daemon_a_log,
+        "warm-hold: skip 'test-b'",
+        Duration::from_secs(0),
     );
     assert!(
         link_held,
         "warm-hold did not establish a link to 'test-b' within 60s — \
          the auto-warm setting may not be defaulting to ON"
+    );
+
+    // Wait for BOTH sides to have discovered each other before running ping.
+    // daemon-a may have the warm link, but daemon-b needs to have discovered
+    // test-a via its own scan before the ping can succeed over the warm path.
+    wait_for_line(
+        &h.daemon_b_log,
+        "known device 'test-a' appeared",
+        Duration::from_secs(15),
     );
 
     // Assertion 2: FIRST CONTACT TAKES THE WARM PATH
