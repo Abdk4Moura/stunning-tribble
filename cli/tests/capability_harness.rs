@@ -1255,7 +1255,24 @@ fn warm_one_shot_pty_instant_eof() {
     h.daemon_b = Some(child_b);
     h.daemon_a_log = log_a;
     h.daemon_b_log = log_b;
-    std::thread::sleep(Duration::from_secs(20));
+
+    // Wait for warm link to daemon-b to be established (deterministic, not a
+    // fixed sleep). The warm-hold loop prints "established connection" when a
+    // new link comes up, or "skip ... (link alive, within grace)" when the
+    // link is already up. Either means the warm path is usable.
+    let warm_ready = wait_for_line(
+        &h.daemon_a_log,
+        "warm-hold: established connection to 'test-b'",
+        Duration::from_secs(40),
+    ) || wait_for_line(
+        &h.daemon_a_log,
+        "warm-hold: skip 'test-b'",
+        Duration::from_secs(0),
+    );
+    assert!(
+        warm_ready,
+        "warm link to 'test-b' was not established within 40s after daemon restart"
+    );
 
     // Run one-shot pty with INSTANT stdin-EOF (</dev/null).
     // This is the exact scenario #67 fixed: the client closes stdin immediately,
