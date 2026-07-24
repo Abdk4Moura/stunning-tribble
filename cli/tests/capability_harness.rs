@@ -1144,3 +1144,156 @@ fn warm_one_shot_pty_reuse() {
     );
 }
 
+#[test]
+fn warm_one_shot_pty_instant_eof() {
+    // Proves fix/warm-oneshot-pty-reuse: one-shot `pty <peer> -- printf ...`
+    // with INSTANT stdin-EOF (</dev/null) returns rc=0 with full output.
+    //
+    // Before the fix, the serve_stream reader-finished branch aborted the
+    // writer, tearing down the pty before output arrived (hang / rc=124).
+    // After the fix, the writer waits for the daemon to close the socket
+    // (command exit), so output is delivered and the client returns cleanly.
+
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        eprintln!("warm_one_shot_pty_instant_eof: skipped on {os}",
+            os = if cfg!(windows) { "Windows" } else { "macOS" });
+        return;
+    }
+
+    let mut h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let direct_flag =
+        std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+    let loopback_only =
+        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+
+    h.pair_daemons();
+    eprintln!("warm_one_shot_pty_instant_eof: daemons started");
+
+    // Pair a, claim b
+    let pair_word = format!("warm-eof-p{:x}", std::process::id());
+    let mut create = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_NAME", "test-a")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "pair", "--word", &pair_word])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pair create");
+
+    let stderr = create.stderr.take().unwrap();
+    let pair_word_lower = pair_word.to_lowercase();
+    let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            let line = line.unwrap_or_default();
+            eprintln!("[warm-eof-pair-create] {line}");
+            if line.to_lowercase().contains(&pair_word_lower) {
+                if let Some(code) = line
+                    .split_whitespace()
+                    .find(|w| {
+                        w.to_lowercase().contains(&pair_word_lower)
+                            && w.split('-').count() >= 4
+                    })
+                {
+                    let _ = code_tx.send(code.to_string());
+                }
+            }
+        }
+    });
+
+    let pair_code = code_rx.recv_timeout(Duration::from_secs(60))
+        .expect("warm-eof pair create did not mint a code within 60s");
+    eprintln!("warm-eof pair code: {pair_code}");
+
+    let mut claim = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_NAME", "test-b")
+        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .args(["--server", &server, "pair", &pair_code])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pair claim");
+    let claim_out = claim.wait_with_output().expect("pair claim result");
+    eprintln!("warm-eof-claim stderr: {}", String::from_utf8_lossy(&claim_out.stderr));
+
+    let create_out = create.wait_with_output().expect("pair create result");
+    eprintln!("warm-eof-pair-create exit: {}", create_out.status);
+
+    // Enable warm-hold and restart daemons.
+    let set = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "set", "warm-peers", "test-b"])
+        .output()
+        .expect("set warm-peers");
+    assert!(set.status.success(), "set warm-peers failed: {:?}", String::from_utf8_lossy(&set.stderr));
+
+    if let Some(ref mut c) = h.daemon_a {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    if let Some(ref mut c) = h.daemon_b {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    h.daemon_a = None;
+    h.daemon_b = None;
+    std::thread::sleep(Duration::from_secs(3));
+    let (child_a, log_a) = spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir);
+    let (child_b, log_b) = spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir);
+    h.daemon_a = Some(child_a);
+    h.daemon_b = Some(child_b);
+    h.daemon_a_log = log_a;
+    h.daemon_b_log = log_b;
+    std::thread::sleep(Duration::from_secs(20));
+
+    // Run one-shot pty with INSTANT stdin-EOF (</dev/null).
+    // This is the exact scenario #67 fixed: the client closes stdin immediately,
+    // serve_stream must NOT tear down the pty before output arrives.
+    let nonce = format!("WARM-EOF-OK-{}", std::process::id());
+    let out = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "pty", "test-b", "--", "printf", &nonce])
+        .stdin(Stdio::null())  // instant stdin-EOF
+        .output()
+        .expect("pty instant-eof");
+    let out_stdout = String::from_utf8_lossy(&out.stdout);
+    let out_stderr = String::from_utf8_lossy(&out.stderr);
+    eprintln!("warm pty instant-eof stdout: {out_stdout}");
+    eprintln!("warm pty instant-eof stderr: {out_stderr}");
+
+    // Must return rc=0 (not hang/timeout).
+    assert!(
+        out.status.success(),
+        "warm one-shot pty with instant stdin-EOF failed: rc={:?}\n\
+         stdout: {out_stdout}\nstderr: {out_stderr}",
+        out.status.code()
+    );
+
+    // Must use warm path (not cold establish).
+    assert!(
+        out_stderr.contains("reusing warm link") && out_stderr.contains("one-shot pty"),
+        "pty did NOT use warm link - expected 'reusing warm link ... for one-shot pty'\n\
+         stdout: {out_stdout}\nstderr: {out_stderr}"
+    );
+
+    // Must deliver full output.
+    assert!(
+        out_stdout.contains(&nonce),
+        "pty output does not contain nonce '{nonce}'\nstdout: {out_stdout}\nstderr: {out_stderr}"
+    );
+}
+
