@@ -136,7 +136,7 @@ pub fn err_pair_interactive() -> (String, i32) {
         format!(
             "{err} pair is interactive (it needs the spoken-words step). For automation, mint a key instead:\n  {fix}",
             err = ui::paint(Tone::Err, ui::glyph_err()),
-            fix = "use a pre-created auth key with `filament ephemeral mint`",
+            fix = "filament mint --external carol --ttl 1h --allow transfer",
         ),
         super::EXIT_BAD_ARG,
     )
@@ -214,4 +214,3 @@ mod tests {
         assert!(s.contains("joined your fleet"), "must confirm fleet join");
     }
 }
-
