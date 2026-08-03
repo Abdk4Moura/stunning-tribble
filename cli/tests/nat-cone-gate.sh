@@ -112,7 +112,7 @@ pair_and_transfer() {
     FILAMENT_HOLEPUNCH=1 FILAMENT_STUN="$SERVER_IP:$STUN_PORT" \
     "$BIN" send "$payload" --word "$word" --remember boxB --server "$server" >"$WORK/pair-a.log" 2>&1 &
   local pair_pid=$!
-  for _ in $(seq 1 60); do code=$(grep -oiE "$word-[0-9]{3,5}" "$WORK/pair-a.log" | head -1); [ -n "$code" ] && break; sleep .25; done
+  for _ in $(seq 1 60); do code=$(grep -oiE "$word-[0-9]{3,5}" "$WORK/pair-a.log" | head -1 || true); [ -n "$code" ] && break; sleep .25; done
   [ -n "$code" ] || die "pair code was not produced"
   ip netns exec "$CB" env FILAMENT_CONFIG_DIR="$cfg_b" FILAMENT_DIRECT_NO_PUBLIC=1 \
     FILAMENT_HOLEPUNCH=1 FILAMENT_STUN="$SERVER_IP:$STUN_PORT" timeout 90 \
