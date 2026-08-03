@@ -55,7 +55,48 @@ three fixes as independent booleans and checks all 2³ combinations, proving:
   becomes *independently* necessary; all fixes on → self-heals in bounded steps.
 
 The design write-up is [`docs/transport-lifecycle-state-machine.md`](../docs/transport-lifecycle-state-machine.md).
-Both proofs are required CI gates (`.github/workflows/proof.yml`).
+
+## Companion: the transport-upgrade proof
+
+`transport_upgrade_model.py` covers the layer the other two structurally cannot
+see. Both of them model a **single** transport slot, so the upgrade — two paths,
+one destroyed in order to try the other — is not representable in either. They
+stayed green through every defect below, and a clean run from an instrument that
+cannot represent the fault is not evidence.
+
+After the PAKE ceremony the code drops the authenticated WebRTC link and races a
+direct-QUIC dial ("Option A"). Six separate fixes over three days were each a way
+of making the resulting gap smaller: reordering `establish()`, carrying
+`expected_secret` across the rebuild, `DirectIntent::Promote`, the
+`direct_pending` removal that precedes a `bind_endpoint` failure, sync-digest
+roster reconciliation, and the macOS regression. They are one defect. This model
+makes it a state predicate:
+
+> **I-GAP** — no live path, and no armed successor.
+
+It checks three designs (`EAGER` = main, `LATE` = the promote-intent branches,
+`PATHSET` = build-alongside-then-promote) across 2⁴ environments, and refuses to
+report anything until it first reproduces the four outcomes CI actually produced
+on 2026-08-03. Results:
+
+- **T3/T4** `PATHSET` dominates **only** when the post-PAKE link can attach a data
+  plane on its own. While it cannot, destroying the link is the *only* route to a
+  live transport, so `PATHSET` is clean in 0/8 against `EAGER`'s 5/8. The obvious
+  first-principles redesign would be **strictly worse than main** if adopted
+  first. Data-plane attachment must be fixed *before* the redesign.
+- **T5** `LATE` (2/8) is strictly worse than `EAGER` (5/8) under the same
+  condition, which is the regression PRs #78/#79 shipped, derived rather than
+  guessed from a red check.
+- **T6** roster reconciliation is **load-bearing**: all three environments where
+  `EAGER` breaks have it off. It must not be removed.
+
+`ctrl_carries` (can the post-PAKE link mature without being rebuilt?) is a free
+parameter rather than an assumption. Gate 0 determines it: `False` is the only
+value reproducing all four observed outcomes. That is a derivation from CI, not a
+code reading, and it is falsifiable — a green `main` macOS log showing a transfer
+riding the **original** post-PAKE link would fail the gate.
+
+All three proofs are required CI gates (`.github/workflows/proof.yml`).
 
 ## The properties
 
