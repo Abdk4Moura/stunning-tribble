@@ -65,6 +65,23 @@ runuser -u nobody -- /bin/cat <scratch>/config/devices.json
 The result was nonzero in both owner cases. No real Filament config or running
 daemon was touched.
 
+## Existing Installs
+
+The writer fix does not change files that are never rewritten. A deployed
+`caps.json` created by an older release can therefore remain `0644` indefinitely
+even though new writes use `0600`; this was observed on the development box for
+the file dated July 27. Startup now repairs the known-sensitive files and the
+`peerconf` directory before command dispatch. It is idempotent and silent when
+nothing changes, but emits one repair message when it changes any path. The
+regression test creates a pre-existing `0644` file, then runs the repair and
+asserts `0600`; it does not write the file through `SecretFile` first.
+
+On Windows, startup reasserts the owner ACL on existing sensitive files via the
+same `icacls` path used by `SecretFile`; the config directory is not made a
+Unix-style mode boundary. `config` and `diag.jsonl` remain unclassified as
+secrets because they contain settings and diagnostics rather than device keys,
+capability state, or trust anchors.
+
 ## Deployment Cases
 
 - Root `up` plus `--shell-user nobody`: effective for the keys. Root owns the
