@@ -227,17 +227,18 @@ def successors(s, cfg):
         add('direct_wins', d=D_LIVE)
         add('direct_lost', d=D_FAILED)
 
-    # A pending can also be DESTROYED without ever expiring, which is a
-    # different route to the same gap and the one currently live on main. A
-    # later start_direct_inner call whose link_dead branch fires does
-    #     rel 41  self.direct_pending.remove(pid);
-    #     rel 42  self.drop_link(pid);
-    # and then hits bind_endpoint at rel 70, which returns at rel 86 -- 97 lines
-    # before the pending is re-inserted at rel 183. The pending is cancelled,
-    # not expired, so nothing will ever be reaped and nothing is scheduled.
-    # Only reachable where bind fails; with bind ok the pending is re-registered.
-    if s.d == D_PENDING and not cfg.bind_ok and cfg.design in (EAGER, LATE):
-        add('pending_cancelled_then_bind_fails', w=W_NONE, d=D_NONE)
+    # REMOVED (#85, merged as e0864ec): a pending used to be DESTROYED without
+    # ever expiring. The link_dead branch removed it at rel 41 and bind_endpoint
+    # returned at rel 86, ~100 lines before the re-insert, so nothing would ever
+    # be reaped and nothing was scheduled. #85 makes the supersede decision
+    # WITHOUT mutating (the insert replaces the entry at the first point a
+    # replacement is certain), so that transition is now unreachable in the code
+    # and has been deleted here rather than left describing a fixed defect.
+    #
+    # HONEST LIMITATION: the expiry check above tracks `ctrl_carries` only. It
+    # would NOT have caught this drift, because the transitions are a second
+    # staleness axis with no detector. If you change start_direct_inner's
+    # ordering, this file is on you.
 
     # PATHSET retires the old path only once the new one is LIVE, and only after
     # it is actually carrying the transfer. Modeled as legal but never required.
@@ -668,21 +669,29 @@ if __name__ == '__main__':
         print("      !! expected PATHSET to be beaten under ctrl_carries=False.")
         ok = False
 
-    print("\nT4. THE ORDER OF WORK IS FORCED, and it is not the order we were")
-    print("    working in. While the post-PAKE link cannot mature on its own,")
-    print("    destroying it is the ONLY route to a live data plane, so:")
-    print(f"      EAGER   (main today)  ctrl_carries=False: {survives(EAGER, False)}/8")
-    print(f"      LATE    (#78 / #79)   ctrl_carries=False: {survives(LATE, False)}/8")
-    print(f"      PATHSET (proposed)    ctrl_carries=False: {survives(PATHSET, False)}/8")
-    print("    Adopting PATHSET FIRST would be strictly worse than main.")
-    print("    Data-plane attachment must be fixed BEFORE the redesign, not after.")
+    print("\nT4. THE ORDER OF WORK WAS FORCED, AND HAS NOW BEEN SATISFIED.")
+    print("    While the post-PAKE link could not carry a transfer on its own,")
+    print("    destroying it was the ONLY route to a live data plane:")
+    print(f"      EAGER   (main before #83)  ctrl_carries=False: {survives(EAGER, False)}/8")
+    print(f"      LATE    (#78 / #79)        ctrl_carries=False: {survives(LATE, False)}/8")
+    print(f"      PATHSET (proposed)         ctrl_carries=False: {survives(PATHSET, False)}/8")
+    print("    Adopting PATHSET first would have been strictly worse than main,")
+    print("    which is the result that refuted the redesign this model was")
+    print("    written to justify. Data-plane attachment had to come FIRST.")
+    print()
+    print("    #83 did that, so the tree is now post-rearm and:")
+    print(f"      LATE    (main today)       ctrl_carries=True:  {survives(LATE, True)}/8")
+    print(f"      PATHSET (now unblocked)    ctrl_carries=True:  {survives(PATHSET, True)}/8")
+    print("    PATHSET is no longer blocked. It is not thereby URGENT: main is")
+    print("    at 7/8 and the remaining break is a real gap, not a formality.")
     if not (survives(PATHSET, False) < survives(EAGER, False)):
-        print("      !! PATHSET is not worse under ctrl_carries=False; T4 is wrong.")
+        print("      !! PATHSET was not worse under ctrl_carries=False; T4 is wrong.")
         ok = False
 
-    print("\nT5. LATE is strictly worse than EAGER while the link cannot mature,")
-    print("    which is the regression #78/#79 shipped, derived rather than")
-    print("    guessed from a red check:")
+    print("\nT5. LATE was strictly worse than EAGER while the link could not")
+    print("    mature, which is the regression #78/#79 shipped, derived rather")
+    print("    than guessed from a red check. It is why they were CLOSED and")
+    print("    then re-landed inside #83, where the re-emit makes them correct:")
     print(f"      EAGER {survives(EAGER, False)}/8   ->   LATE {survives(LATE, False)}/8")
     if not (survives(LATE, False) < survives(EAGER, False)):
         print("      !! LATE is not worse than EAGER; T5 does not hold.")
