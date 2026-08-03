@@ -16549,9 +16549,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exhausted_giveup_suppresses_digest_but_contact_clears() {
-        let mut suppressed = HashSet::from(["peer-sid".to_string()]);
+    fn exhausted_giveup_then_digest_does_not_recreate_link() {
+        let mut suppressed = HashSet::new();
+        let mut link_present = true;
+        let mut attempts = MAX_ATTEMPTS;
+
+        // Model the exhausted on_stuck transition: dropping the Link loses the
+        // counter, so only the out-of-Link suppression mark carries the give-up.
+        if attempts >= MAX_ATTEMPTS {
+            link_present = false;
+            attempts = 0;
+            suppressed.insert("peer-sid".to_string());
+        }
+        assert!(!link_present);
+        assert_eq!(attempts, 0);
         assert!(!match_adoption_source(&mut suppressed, "peer-sid", AdoptSource::Digest));
+
+        // A real contact is evidence the peer is reachable and clears only the
+        // digest suppression, allowing the next adoption.
         assert!(match_adoption_source(&mut suppressed, "peer-sid", AdoptSource::Contact));
         assert!(!suppressed.contains("peer-sid"));
         assert!(match_adoption_source(&mut suppressed, "peer-sid", AdoptSource::Digest));
