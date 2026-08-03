@@ -32,33 +32,33 @@ command -v ip >/dev/null || unclassified "iproute2 is required"
 command -v iptables >/dev/null || unclassified "iptables is required"
 python3 -c 'import flask' 2>/dev/null || unclassified "python3 Flask dependency is required"
 
-new_ns() { ip netns add "$1"; ip -n "$1" link set lo up; }
+new_ns() { ip netns add "$1" || return 1; ip -n "$1" link set lo up || return 1; }
 link_ns() {
   local left="$1" right="$2" lip="$3" rip="$4" li="$5" ri="$6"
-  ip link add "$li" type veth peer name "$ri"
-  ip link set "$li" netns "$left"; ip link set "$ri" netns "$right"
-  ip -n "$left" addr add "$lip" dev "$li"; ip -n "$right" addr add "$rip" dev "$ri"
-  ip -n "$left" link set "$li" up; ip -n "$right" link set "$ri" up
+  ip link add "$li" type veth peer name "$ri" || return 1
+  ip link set "$li" netns "$left" || return 1; ip link set "$ri" netns "$right" || return 1
+  ip -n "$left" addr add "$lip" dev "$li" || return 1; ip -n "$right" addr add "$rip" dev "$ri" || return 1
+  ip -n "$left" link set "$li" up || return 1; ip -n "$right" link set "$ri" up || return 1
 }
 route_default() { ip netns exec "$1" ip route add default via "$2"; }
 
 setup_topology() {
-  new_ns "$WAN"; new_ns "$RA"; new_ns "$RB"; new_ns "$CA"; new_ns "$CB"
-  link_ns "$WAN" "$RA" 10.220.1.1/30 10.220.1.2/30 wa ra-wan
-  link_ns "$WAN" "$RB" 10.220.2.1/30 10.220.2.2/30 wb rb-wan
-  link_ns "$RA" "$CA" 10.221.1.1/24 10.221.1.2/24 ra-lan ca-lan
-  link_ns "$RB" "$CB" 10.221.2.1/24 10.221.2.2/24 rb-lan cb-lan
-  ip -n "$WAN" addr add "$SERVER_IP/32" dev lo
-  ip -n "$WAN" addr add 10.220.100.2/32 dev lo
-  ip netns exec "$WAN" sysctl -q -w net.ipv4.ip_forward=1
-  ip netns exec "$RA" sysctl -q -w net.ipv4.ip_forward=1
-  ip netns exec "$RB" sysctl -q -w net.ipv4.ip_forward=1
-  route_default "$CA" 10.221.1.1; route_default "$CB" 10.221.2.1
-  route_default "$RA" 10.220.1.1; route_default "$RB" 10.220.2.1
-  ip -n "$WAN" route add 10.220.1.2/32 dev wa; ip -n "$WAN" route add 10.220.2.2/32 dev wb
+  new_ns "$WAN" || return 1; new_ns "$RA" || return 1; new_ns "$RB" || return 1; new_ns "$CA" || return 1; new_ns "$CB" || return 1
+  link_ns "$WAN" "$RA" 10.220.1.1/30 10.220.1.2/30 wa ra-wan || return 1
+  link_ns "$WAN" "$RB" 10.220.2.1/30 10.220.2.2/30 wb rb-wan || return 1
+  link_ns "$RA" "$CA" 10.221.1.1/24 10.221.1.2/24 ra-lan ca-lan || return 1
+  link_ns "$RB" "$CB" 10.221.2.1/24 10.221.2.2/24 rb-lan cb-lan || return 1
+  ip -n "$WAN" addr add "$SERVER_IP/32" dev lo || return 1
+  ip -n "$WAN" addr add 10.220.100.2/32 dev lo || return 1
+  ip netns exec "$WAN" sysctl -q -w net.ipv4.ip_forward=1 || return 1
+  ip netns exec "$RA" sysctl -q -w net.ipv4.ip_forward=1 || return 1
+  ip netns exec "$RB" sysctl -q -w net.ipv4.ip_forward=1 || return 1
+  route_default "$CA" 10.221.1.1 || return 1; route_default "$CB" 10.221.2.1 || return 1
+  route_default "$RA" 10.220.1.1 || return 1; route_default "$RB" 10.220.2.1 || return 1
+  ip -n "$WAN" route add 10.220.1.2/32 dev wa || return 1; ip -n "$WAN" route add 10.220.2.2/32 dev wb || return 1
   for r in "$RA" "$RB"; do
-    ip netns exec "$r" iptables -A FORWARD -j ACCEPT
-    ip netns exec "$r" iptables -t nat -A POSTROUTING -o "${r##*-}-wan" -j MASQUERADE
+    ip netns exec "$r" iptables -A FORWARD -j ACCEPT || return 1
+    ip netns exec "$r" iptables -t nat -A POSTROUTING -o "${r##*-}-wan" -j MASQUERADE || return 1
   done
 }
 
