@@ -1737,13 +1737,18 @@ fn freeze_stall_detector_classification() {
         .arg("recv").arg(&code).arg("--yes").arg("--dir").arg(&recv_dir)
         .arg("--server").arg(&server);
     let recv = spawn_captured(recv).expect("spawn measured receiver");
-    let recv_result = recv.wait_until(Duration::from_secs(90));
+    const RECOVERY_DEADLINE: Duration = Duration::from_secs(90);
+    let recv_result = recv.wait_until(RECOVERY_DEADLINE);
     let send_result = send.wait_until(Duration::from_secs(10));
     let logs = format!("{}\n{}\n{}\n{}", send_result.stdout, send_result.stderr,
         recv_result.stdout, recv_result.stderr);
     let armed = logs.contains("STALL_WATCHDOG_ARMED idle_ms_tracked");
     let froze = logs.contains("data-path FREEZE engaged");
     let detected = logs.contains("stall detected") || logs.contains("inbound stall");
+    let recovery_started = logs.contains("repairing the link")
+        || logs.contains("re-establish")
+        || logs.contains("re-dial")
+        || logs.contains("stall correction");
     let received = recv_dir.join("stall_payload.bin");
     let recovered = matches!(recv_result.outcome, ChildOutcome::ExitedSuccess(_))
         && received.exists()
@@ -1762,7 +1767,10 @@ fn freeze_stall_detector_classification() {
         panic!("FAIL: freeze engaged but no stall detector event was observed");
     }
     if !recovered {
-        panic!("DETECTED_NOT_RECOVERED: stall was detected but transfer did not complete byte-exact");
+        if recovery_started {
+            panic!("DETECTED_NOT_RECOVERED_WITHIN_DEADLINE: recovery started but did not complete within {RECOVERY_DEADLINE:?}");
+        }
+        panic!("DETECTED_RECOVERY_UNOBSERVED: detector fired but no recovery marker was observed");
     }
     eprintln!("PASS: freeze injected, detector fired, and transfer recovered byte-exact");
 }
