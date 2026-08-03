@@ -1737,8 +1737,13 @@ fn freeze_stall_detector_classification() {
         .arg("recv").arg(&code).arg("--yes").arg("--dir").arg(&recv_dir)
         .arg("--server").arg(&server);
     let recv = spawn_captured(recv).expect("spawn measured receiver");
-    const RECOVERY_DEADLINE: Duration = Duration::from_secs(90);
-    let recv_result = recv.wait_until(RECOVERY_DEADLINE);
+    let deadline_secs = std::env::var("FILAMENT_STALL_MEASUREMENT_DEADLINE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(90);
+    let recovery_deadline = Duration::from_secs(deadline_secs);
+    let recv_result = recv.wait_until(recovery_deadline);
     let send_result = send.wait_until(Duration::from_secs(10));
     let logs = format!("{}\n{}\n{}\n{}", send_result.stdout, send_result.stderr,
         recv_result.stdout, recv_result.stderr);
@@ -1768,7 +1773,7 @@ fn freeze_stall_detector_classification() {
     }
     if !recovered {
         if recovery_started {
-            panic!("DETECTED_NOT_RECOVERED_WITHIN_DEADLINE: recovery started but did not complete within {RECOVERY_DEADLINE:?}");
+            panic!("DETECTED_NOT_RECOVERED_WITHIN_DEADLINE: recovery started but did not complete within {recovery_deadline:?}");
         }
         panic!("DETECTED_RECOVERY_UNOBSERVED: detector fired but no recovery marker was observed");
     }
