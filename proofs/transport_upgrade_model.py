@@ -410,12 +410,26 @@ if __name__ == '__main__':
     # the expiry remedy from being fakeable: bumping CALIBRATED_FOR without
     # actually re-deriving leaves these tags behind, and the check below
     # catches it. Step 4 alone must not clear an expiry.
+    # Each row records the TREE STATE it was observed on AND the CI run that
+    # produced it. The tree-state tag stops a bumped CALIBRATED_FOR from being a
+    # one-line fake remedy. The run reference stops the tags themselves from
+    # being relabelled: editing a word is free, but pointing at a run anyone can
+    # open and see contradicts the label is a categorically different act, and
+    # it is checkable from OUTSIDE this repository by a reviewer with no context.
+    #
+    # This is the last rung of that kind. Below it you are asking whether the CI
+    # provider is lying, which is a different threat model and not ours.
+    #
+    # A row with run=None is NOT anchored. That is reported rather than hidden,
+    # because an unanchored row is weaker evidence than an anchored one and the
+    # reader is entitled to know which is which. Do not invent a run id to make
+    # the count look better; an unanchored row is honest, a fabricated one is not.
     OBSERVED = [
-        # (label,               design, direct_ok, bind_ok, roster, expect, observed_on)
-        ('main    macOS  GREEN', EAGER,   False, True,  True,  True,  'pre-rearm'),
-        ('#78     macOS  RED  ', LATE,    False, True,  True,  False, 'pre-rearm'),
-        ('#79     macOS  RED  ', LATE,    False, True,  False, False, 'pre-rearm'),
-        ('#78/#79 ubuntu GREEN', LATE,    True,  True,  True,  True,  'pre-rearm'),
+        # (label,           design, direct_ok, bind_ok, roster, expect, observed_on, run, job)
+        ('main    macOS  GREEN', EAGER, False, True,  True,  True,  'pre-rearm', 30825113095, 91724637129),
+        ('#78     macOS  RED  ', LATE,  False, True,  True,  False, 'pre-rearm', 30824271188, 91721922115),
+        ('#79     macOS  RED  ', LATE,  False, True,  False, False, 'pre-rearm', None,        91719654747),
+        ('#78/#79 ubuntu GREEN', LATE,  True,  True,  True,  True,  'pre-rearm', None,        None),
     ]
     print("\n[Gate 0: reproduce the four outcomes observed in CI on 2026-08-03]")
     print("ctrl_carries=False: a transfer cannot COMPLETE over the post-PAKE link")
@@ -433,7 +447,7 @@ if __name__ == '__main__':
     print("  not do. Kept observational anyway: this model only needs that no")
     print("  transfer COMPLETES without a rebuild, which is true either way.")
     gate_ok = True
-    for label, design, dok, bok, ros, expect, _on in OBSERVED:
+    for label, design, dok, bok, ros, expect, _on, _run, _job in OBSERVED:
         cfg = Cfg(design, dok, bok, ros, False)
         r = check(cfg)
         got = is_clean(r)
@@ -529,13 +543,18 @@ if __name__ == '__main__':
     print(f"  calibration current: tree is {tree_state}, calibrated for")
     print(f"  {CALIBRATED_FOR}. Fails LOUD on drift; cleared by re-deriving and")
     print("  bumping CALIBRATED_FOR, never by deleting the check.")
+    anchored = [r for r in OBSERVED if r[7] or r[8]]
+    print(f"  evidence anchoring: {len(anchored)}/{len(OBSERVED)} rows cite a CI run.")
+    for r in OBSERVED:
+        if not (r[7] or r[8]):
+            print(f"      UNANCHORED, weaker evidence: {r[0].strip()}")
     print("  gate passed: all four reproduce, and ONLY with ctrl_carries=False.")
     ok &= gate_ok
 
     # Show that ctrl_carries=True does NOT reproduce, so the gate genuinely
     # determines the parameter instead of merely being consistent with it.
     disc = [is_clean(check(Cfg(d, dok, bok, ros, True))) == exp
-            for _, d, dok, bok, ros, exp, _on in OBSERVED]
+            for _, d, dok, bok, ros, exp, _on, _r, _j in OBSERVED]
     print(f"  same four rows with ctrl_carries=True reproduce: {sum(disc)}/4 "
           f"-> {'DISCRIMINATES' if not all(disc) else 'does NOT discriminate'}")
     ok &= not all(disc)
