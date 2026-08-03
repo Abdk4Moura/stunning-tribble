@@ -6434,6 +6434,47 @@ impl Conn {
             .unwrap_or(false)
     }
 
+    /// Re-emit `ChannelReady` for a link that ALREADY holds a live transport.
+    ///
+    /// The `--code` path DEFERS every offer until the PAKE confirms. The offer
+    /// site says so, and states who is supposed to wake it:
+    ///
+    ///     // ...on confirm the Signal handler sets `pake_done` and re-emits
+    ///     // ChannelReady to fall through here and offer.
+    ///     if use_code && !is_direct && !pake_done {
+    ///         continue; // offers/remember wait for PAKE confirm
+    ///     }
+    ///
+    /// The Signal handler sets `pake_done`. It has never re-emitted anything.
+    /// What actually woke the loop was the Option A teardown: dropping the link
+    /// forced a rebuild, and the rebuilt link's FRESH `ChannelReady` fell through
+    /// the (now satisfied) guard and carried the offer. A destroy-and-rebuild
+    /// cycle was standing in for an event dispatch.
+    ///
+    /// That is why removing the unconditional teardown wedged macOS. With direct
+    /// disabled there was nothing to promote, so nothing dropped, so nothing was
+    /// rebuilt, so no second `ChannelReady` ever arrived. The sender sat on a
+    /// healthy authenticated link and never attempted a byte, which is exactly
+    /// what the #78 artifact shows: `authenticated, sending`, then 15 minutes of
+    /// nothing but 30s backend syncs.
+    ///
+    /// So this honours the contract the comment already documents. It mirrors
+    /// the direct-upgrade re-emit in `adopt_direct_transport`, which does the
+    /// same thing for the same reason: a transport that becomes usable without a
+    /// fresh channel-open still has to tell the loop.
+    ///
+    /// No-op when the link is gone or its transport is dead, so it is safe to
+    /// call unconditionally after a promotion attempt: if the promotion DID
+    /// happen the link was replaced and the new transport will announce itself.
+    fn rearm_channel_ready(&self, pid: &str) {
+        let Some(l) = self.links.get(pid) else { return };
+        let Some(t) = l.transport.as_ref() else { return };
+        if t.is_dead() {
+            return;
+        }
+        let _ = self.tx.send(Ev::ChannelReady(pid.to_string(), t.clone()));
+    }
+
     /// `#[track_caller]` so a teardown NAMES the path that ordered it. There are
     /// 17 call sites, and a link that dies 40ms after authenticating leaves a
     /// `timed out waiting for a peer` whose guard cannot distinguish "no peer
@@ -11049,6 +11090,11 @@ async fn send_cmd(
                                         if conn.active.is_none() {
                                             conn.active = Some(from.clone());
                                         }
+                                        // Offers were deferred pending this confirm. If no
+                                        // promotion took the link away, nothing else will
+                                        // announce it, so wake the offer path here rather
+                                        // than relying on a teardown to do it by accident.
+                                        conn.rearm_channel_ready(&from);
                                     }
                                 }
                             }
@@ -13878,6 +13924,9 @@ async fn recv_cmd(
                         if conn.active.is_none() {
                             conn.active = Some(from.clone());
                         }
+                        // Same contract as the sender: the retained link must be
+                        // announced, or it is never used.
+                        conn.rearm_channel_ready(&from);
                         // Replay any buffered transport-offer that arrived before PAKE
                         // (now that start_direct created a DirectPending with the secret)
                         if let Some((cands, srflx)) = recv_pending_direct.remove(&from) {
