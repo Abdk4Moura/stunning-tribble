@@ -406,12 +406,16 @@ if __name__ == '__main__':
     # than assuming it. If new-renewer's log read comes back showing a green main
     # macOS transfer riding the ORIGINAL post-PAKE link, this gate is what will
     # fail, and the model is wrong.
+    # Each row records the TREE STATE it was observed on. That is what stops
+    # the expiry remedy from being fakeable: bumping CALIBRATED_FOR without
+    # actually re-deriving leaves these tags behind, and the check below
+    # catches it. Step 4 alone must not clear an expiry.
     OBSERVED = [
-        # (label,               design, direct_ok, bind_ok, roster, expect_clean)
-        ('main    macOS  GREEN', EAGER,   False, True,  True,  True),
-        ('#78     macOS  RED  ', LATE,    False, True,  True,  False),
-        ('#79     macOS  RED  ', LATE,    False, True,  False, False),
-        ('#78/#79 ubuntu GREEN', LATE,    True,  True,  True,  True),
+        # (label,               design, direct_ok, bind_ok, roster, expect, observed_on)
+        ('main    macOS  GREEN', EAGER,   False, True,  True,  True,  'pre-rearm'),
+        ('#78     macOS  RED  ', LATE,    False, True,  True,  False, 'pre-rearm'),
+        ('#79     macOS  RED  ', LATE,    False, True,  False, False, 'pre-rearm'),
+        ('#78/#79 ubuntu GREEN', LATE,    True,  True,  True,  True,  'pre-rearm'),
     ]
     print("\n[Gate 0: reproduce the four outcomes observed in CI on 2026-08-03]")
     print("ctrl_carries=False: a transfer cannot COMPLETE over the post-PAKE link")
@@ -429,7 +433,7 @@ if __name__ == '__main__':
     print("  not do. Kept observational anyway: this model only needs that no")
     print("  transfer COMPLETES without a rebuild, which is true either way.")
     gate_ok = True
-    for label, design, dok, bok, ros, expect in OBSERVED:
+    for label, design, dok, bok, ros, expect, _on in OBSERVED:
         cfg = Cfg(design, dok, bok, ros, False)
         r = check(cfg)
         got = is_clean(r)
@@ -475,35 +479,63 @@ if __name__ == '__main__':
         print("  The calibration cannot be confirmed current. Refusing to report.")
         sys.exit(1)
 
-    if "fn rearm_channel_ready" in tree:
+    # The calibration names the tree state it was derived against. The check
+    # compares, rather than testing for a symptom.
+    #
+    # This distinction is the difference between a detector that survives and
+    # one that gets deleted. An earlier version fired on the mere PRESENCE of
+    # `rearm_channel_ready`, which is in the tree permanently once it lands, so
+    # it would have fired forever and re-deriving would not have cleared it.
+    # The only way to get main green again would have been to DELETE the check,
+    # under time pressure, by someone who just wanted a green board. A detector
+    # whose sole available remedy is its own removal is not a detector.
+    #
+    # Here the remedy is the correct action: re-derive, bump this constant, the
+    # check goes quiet and SURVIVES to catch the next drift.
+    CALIBRATED_FOR = "pre-rearm"
+    tree_state = "post-rearm" if "fn rearm_channel_ready" in tree else "pre-rearm"
+
+    stale = [r[0] for r in OBSERVED if r[6] != CALIBRATED_FOR]
+    if stale:
+        print(f"\n  GATE 0 INCOHERENT: CALIBRATED_FOR is {CALIBRATED_FOR!r} but")
+        print("  these rows were observed on a different tree state:")
+        for lbl in stale:
+            print(f"      {lbl.strip()}")
+        print("  Bumping the constant is not a re-derivation. Replace the rows")
+        print("  with observations from the tree the constant now names.")
+        sys.exit(1)
+
+    if tree_state != CALIBRATED_FOR:
         print("\n  GATE 0 EXPIRED.")
-        print("  cli/src/main.rs defines `rearm_channel_ready`, which makes a")
-        print("  transfer complete over the RETAINED post-PAKE link. So")
-        print("  ctrl_carries=False no longer describes this tree, and the four")
-        print("  outcomes above were observed on a tree that predates the fix.")
+        print(f"  calibrated for a {CALIBRATED_FOR} tree; this tree is {tree_state}.")
+        print("  `rearm_channel_ready` makes a transfer complete over the RETAINED")
+        print("  post-PAKE link, so ctrl_carries=False no longer describes this")
+        print("  tree and the outcomes above predate the change.")
         print()
         print("  Re-derive gate 0 before trusting anything below it:")
-        print("    1. record post-fix macOS/ubuntu/windows outcomes for the")
-        print("       LATE design (the promote-intent restructure that shipped")
-        print("       alongside the fix)")
+        print("    1. take main's OWN post-merge CI outcomes for the three")
+        print("       platforms, not a feature branch's runs against an older")
+        print("       base. Gate 0's whole point is reproducing what was")
+        print("       OBSERVED, so branch runs on a base main no longer has")
+        print("       would reintroduce staleness inside the staleness detector")
         print("    2. set the OBSERVED table to those, with their run ids")
         print("    3. expect ctrl_carries=True to be the value that reproduces")
         print("       them, which flips LATE from 1/8 to 7/8 and unblocks")
         print("       PATHSET from 0/8 to 8/8 (T2/T4 predicted exactly this)")
-        print("    4. move this expiry check to whatever the NEXT unproven")
-        print("       assumption is, or delete it and say why nothing expires")
+        print(f'    4. set CALIBRATED_FOR = "{tree_state}" in this file')
+        print("  Do NOT delete this check to clear it. Step 4 is the remedy.")
         sys.exit(1)
 
-    print("  calibration current: `rearm_channel_ready` is absent from the tree,")
-    print("  so ctrl_carries=False still describes it. This check fails LOUD when")
-    print("  that stops being true, rather than going quietly stale.")
+    print(f"  calibration current: tree is {tree_state}, calibrated for")
+    print(f"  {CALIBRATED_FOR}. Fails LOUD on drift; cleared by re-deriving and")
+    print("  bumping CALIBRATED_FOR, never by deleting the check.")
     print("  gate passed: all four reproduce, and ONLY with ctrl_carries=False.")
     ok &= gate_ok
 
     # Show that ctrl_carries=True does NOT reproduce, so the gate genuinely
     # determines the parameter instead of merely being consistent with it.
     disc = [is_clean(check(Cfg(d, dok, bok, ros, True))) == exp
-            for _, d, dok, bok, ros, exp in OBSERVED]
+            for _, d, dok, bok, ros, exp, _on in OBSERVED]
     print(f"  same four rows with ctrl_carries=True reproduce: {sum(disc)}/4 "
           f"-> {'DISCRIMINATES' if not all(disc) else 'does NOT discriminate'}")
     ok &= not all(disc)
