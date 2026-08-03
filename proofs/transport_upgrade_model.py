@@ -106,6 +106,7 @@ Faithfulness -- state <-> code:
 """
 from collections import deque, namedtuple
 from itertools import product
+import os
 import sys
 
 # design x the four environment/config axes
@@ -420,8 +421,13 @@ if __name__ == '__main__':
     print("  green main run 30825113095 job 91724637129 -- drop at main.rs:10871,")
     print("  ICE closes, second gather on new host port 57792, sha256 delivery")
     print("  success only AFTER the rebuild. The green path rides a rebuilt link.")
-    print("  Still open: whether the retained link cannot carry data, or the")
-    print("  sender never starts. Both fit; this model does not distinguish them.")
+    print("  RESOLVED to the second reading: the retained link is FINE and the")
+    print("  sender never starts. #78 artifact job 91721922115 shows no offer,")
+    print("  stream, chunk, byte counter or send error with the debug channel")
+    print("  live throughout; and the fix delivers a verified file 19ms after")
+    print("  auth on a retained link, which a link unable to carry data could")
+    print("  not do. Kept observational anyway: this model only needs that no")
+    print("  transfer COMPLETES without a rebuild, which is true either way.")
     gate_ok = True
     for label, design, dok, bok, ros, expect in OBSERVED:
         cfg = Cfg(design, dok, bok, ros, False)
@@ -436,6 +442,61 @@ if __name__ == '__main__':
         print("\n  GATE 0 FAILED: the model does not reproduce observed CI.")
         print("  The model is wrong. Do not read anything below it.")
         sys.exit(1)
+
+    # ---------------------------------------------------- gate 0 EXPIRY
+    # Gate 0 is a STATIC table of outcomes observed on a specific tree. That is
+    # what makes it a calibration and not a test, and it is also how it rots: it
+    # would keep passing forever while asserting ctrl_carries=False, long after
+    # the tree stopped behaving that way, and a green proof is more persuasive
+    # than a green test. Nothing about the table itself would ever signal drift.
+    #
+    # So the calibration carries an expiry condition, and the condition is read
+    # from the tree rather than remembered by a human.
+    #
+    # `rearm_channel_ready` is the fix that makes a transfer complete over the
+    # RETAINED post-PAKE link (it dispatches the ChannelReady the offer site's
+    # comment always claimed the Signal handler sent). Its presence means
+    # ctrl_carries=False is no longer a true description of this tree, so every
+    # number below it is answering a question about a world that no longer
+    # exists, and gate 0 must be re-derived against post-fix CI.
+    #
+    # Failing LOUD here is the point. The alternative is a proof that stays
+    # green while describing something that stopped being true, which is the
+    # defect class this whole file exists to catch.
+    here = os.path.dirname(os.path.abspath(__file__))
+    main_rs = os.path.join(here, os.pardir, "cli", "src", "main.rs")
+    try:
+        with open(main_rs, encoding="utf-8", errors="replace") as fh:
+            tree = fh.read()
+    except OSError as e:
+        # An expiry check that cannot read the tree has not passed, it has
+        # failed to run. Never let that read as a pass.
+        print(f"\n  GATE 0 EXPIRY UNVERIFIABLE: cannot read {main_rs} ({e}).")
+        print("  The calibration cannot be confirmed current. Refusing to report.")
+        sys.exit(1)
+
+    if "fn rearm_channel_ready" in tree:
+        print("\n  GATE 0 EXPIRED.")
+        print("  cli/src/main.rs defines `rearm_channel_ready`, which makes a")
+        print("  transfer complete over the RETAINED post-PAKE link. So")
+        print("  ctrl_carries=False no longer describes this tree, and the four")
+        print("  outcomes above were observed on a tree that predates the fix.")
+        print()
+        print("  Re-derive gate 0 before trusting anything below it:")
+        print("    1. record post-fix macOS/ubuntu/windows outcomes for the")
+        print("       LATE design (the promote-intent restructure that shipped")
+        print("       alongside the fix)")
+        print("    2. set the OBSERVED table to those, with their run ids")
+        print("    3. expect ctrl_carries=True to be the value that reproduces")
+        print("       them, which flips LATE from 1/8 to 7/8 and unblocks")
+        print("       PATHSET from 0/8 to 8/8 (T2/T4 predicted exactly this)")
+        print("    4. move this expiry check to whatever the NEXT unproven")
+        print("       assumption is, or delete it and say why nothing expires")
+        sys.exit(1)
+
+    print("  calibration current: `rearm_channel_ready` is absent from the tree,")
+    print("  so ctrl_carries=False still describes it. This check fails LOUD when")
+    print("  that stops being true, rather than going quietly stale.")
     print("  gate passed: all four reproduce, and ONLY with ctrl_carries=False.")
     ok &= gate_ok
 
