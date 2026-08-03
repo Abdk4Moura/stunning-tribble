@@ -78,9 +78,13 @@ asserts `0600`; it does not write the file through `SecretFile` first.
 
 On Windows, startup reasserts the owner ACL on existing sensitive files via the
 same `icacls` path used by `SecretFile`; the config directory is not made a
-Unix-style mode boundary. `config` and `diag.jsonl` remain unclassified as
-secrets because they contain settings and diagnostics rather than device keys,
-capability state, or trust anchors.
+Unix-style mode boundary. `config` remains unclassified as a secret because it
+contains settings only. `diag.jsonl` is repaired to owner-only access because
+its fields include peer identifiers, session identifiers, phases, and roles.
+That metadata discloses the owner's private peer topology and session history
+under the trusted-group threat model. This may break workflows that tail
+diagnostics as another user; operators should use an explicit log export or ACL
+rather than silently expose the file world-readably.
 
 ## Deployment Cases
 

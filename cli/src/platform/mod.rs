@@ -162,6 +162,7 @@ fn repair_sensitive_permissions_in(dir: &Path) -> std::io::Result<usize> {
         "peerconf",
         "identity.ed25519",
         "overlay.ed25519",
+        "diag.jsonl",
     ] {
         let path = dir.join(name);
         if !path.exists() {
