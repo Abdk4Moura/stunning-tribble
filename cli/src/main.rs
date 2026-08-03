@@ -5443,6 +5443,33 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
 /// `answerer: true`, `has_flowed() -> true`, `expected_secret: None`. This
 /// makes the meaningless combination unrepresentable instead of merely
 /// unreachable-by-convention.
+/// What a promotion did to the serving WebRTC link.
+///
+/// Carried rather than inferred at the call site, because the two outcomes need
+/// opposite follow-ups and getting it wrong is silent both ways:
+///
+///   Replaced  the link was torn down and a successor is coming; announcing the
+///             old transport would advertise something already gone.
+///   Retained  direct was disabled, or setup failed before registering a
+///             pending, so the ORIGINAL link is still live and NOTHING else
+///             will announce it. That silence is the macOS wedge.
+///
+/// The `#[must_use]` is the point, and so is taking this by value in
+/// `rearm_channel_ready`: it keeps re-announcement unreachable from a `Normal`
+/// or `Probe` start_direct, both of which register a pending WITHOUT dropping,
+/// where re-announcing would advertise a transport with a live direct race
+/// pending against it. Same argument that made `DirectIntent` an enum rather
+/// than two bools.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[must_use = "a promotion that RETAINED the link leaves its transport \
+              unannounced, and nothing else will announce it. Pass this to \
+              `rearm_channel_ready`, or explain in a comment why this command \
+              does not need the retained link announced."]
+enum Promotion {
+    Replaced,
+    Retained,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DirectIntent {
     /// Never disturb a live link.
@@ -6466,7 +6493,10 @@ impl Conn {
     /// No-op when the link is gone or its transport is dead, so it is safe to
     /// call unconditionally after a promotion attempt: if the promotion DID
     /// happen the link was replaced and the new transport will announce itself.
-    fn rearm_channel_ready(&self, pid: &str) {
+    fn rearm_channel_ready(&self, pid: &str, outcome: Promotion) {
+        if outcome == Promotion::Replaced {
+            return; // the replacement transport announces itself
+        }
         let Some(l) = self.links.get(pid) else { return };
         let Some(t) = l.transport.as_ref() else { return };
         if t.is_dead() {
@@ -6781,8 +6811,17 @@ impl Conn {
     /// happens inside `start_direct_inner` AFTER `direct_pending` is registered,
     /// so a failure anywhere in setup leaves WebRTC serving and the fallback
     /// reaper has an attempt to expire.
-    async fn start_direct_promote(&mut self, pid: &str, name: &str, secret: &str) {
-        self.start_direct_inner(pid, name, secret, DirectIntent::Promote).await
+    async fn start_direct_promote(&mut self, pid: &str, name: &str, secret: &str) -> Promotion {
+        self.start_direct_inner(pid, name, secret, DirectIntent::Promote).await;
+        // The promotion drops the link ONLY after registering a pending (the
+        // insert and the drop are straight-line, nothing returns between them),
+        // so the link's continued existence is an exact witness of which
+        // outcome happened and does not need threading out of the early returns.
+        if self.links.contains_key(pid) {
+            Promotion::Retained
+        } else {
+            Promotion::Replaced
+        }
     }
 
     /// P5 (GAP-6): arm a relay->direct UPGRADE probe, a direct dial run
@@ -11086,15 +11125,16 @@ async fn send_cmd(
                                         // If direct wins: transfer rides QUIC (130+ MB/s).
                                         // If direct fails: expired_direct → establish → WebRTC fallback
                                         //   (bounded ~5s gap for NAT-blocked peers, then WebRTC reconnects).
-                                        conn.start_direct_promote(&from, &from, &sec).await;
+                                        let promo = conn
+                                            .start_direct_promote(&from, &from, &sec)
+                                            .await;
                                         if conn.active.is_none() {
                                             conn.active = Some(from.clone());
                                         }
-                                        // Offers were deferred pending this confirm. If no
-                                        // promotion took the link away, nothing else will
-                                        // announce it, so wake the offer path here rather
-                                        // than relying on a teardown to do it by accident.
-                                        conn.rearm_channel_ready(&from);
+                                        // Offers were deferred pending this confirm, and
+                                        // the ChannelReady handler ignores a non-active
+                                        // pid, so this must follow the claim above.
+                                        conn.rearm_channel_ready(&from, promo);
                                     }
                                 }
                             }
@@ -13920,13 +13960,14 @@ async fn recv_cmd(
                         ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, receiving"));
                         // Option A: start the direct-QUIC race. start_direct owns
                         // replacement after all fallible setup and pending registration.
-                        conn.start_direct_promote(&from, &from, &sec).await;
+                        let promo = conn.start_direct_promote(&from, &from, &sec).await;
                         if conn.active.is_none() {
                             conn.active = Some(from.clone());
                         }
-                        // Same contract as the sender: the retained link must be
-                        // announced, or it is never used.
-                        conn.rearm_channel_ready(&from);
+                        // A retained link is unannounced here too, and this loop's
+                        // ChannelReady arm sends `caps` and the signed L3 announce,
+                        // which a peer on a retained link would otherwise never get.
+                        conn.rearm_channel_ready(&from, promo);
                         // Replay any buffered transport-offer that arrived before PAKE
                         // (now that start_direct created a DirectPending with the secret)
                         if let Some((cands, srflx)) = recv_pending_direct.remove(&from) {
