@@ -105,6 +105,19 @@ jobs:
           s.close()
           PY
 
+      # direct-QUIC candidates EXCLUDE loopback (direct.rs:433 filters
+      # is_loopback), so two peers on one host must reach each other via the
+      # host's OWN interface address: a UDP hairpin. The local-tcp path does not
+      # need this, it dials 127.0.0.1 explicitly, which is a candidate mechanism
+      # for macOS completing transfers over "direct over lo" while never once
+      # completing direct-QUIC.
+      #
+      # Linux baseline, measured: hairpin works, so this is not the blocker there.
+      - name: Probe same-host UDP hairpin (diagnostic)
+        continue-on-error: true
+        shell: bash
+        run: python3 experiments/py/hairpin_probe.py
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
