@@ -81,20 +81,42 @@ on 2026-08-03. Results:
 
 - **T3/T4** `PATHSET` dominates **only** when the post-PAKE link can attach a data
   plane on its own. While it cannot, destroying the link is the *only* route to a
-  live transport, so `PATHSET` is clean in 0/8 against `EAGER`'s 5/8. The obvious
+  live transport, so `PATHSET` is clean in 0/8 against `EAGER`'s 4/8. The obvious
   first-principles redesign would be **strictly worse than main** if adopted
   first. Data-plane attachment must be fixed *before* the redesign.
-- **T5** `LATE` (2/8) is strictly worse than `EAGER` (5/8) under the same
+- **T5** `LATE` (1/8) is strictly worse than `EAGER` (4/8) under the same
   condition, which is the regression PRs #78/#79 shipped, derived rather than
   guessed from a red check.
-- **T6** roster reconciliation is **load-bearing**: all three environments where
-  `EAGER` breaks have it off. It must not be removed.
+- **T6** roster reconciliation is **load-bearing**: all four environments where
+  `EAGER` breaks have it off. It must not be removed. Given the `D_BURNT`
+  correction it is also the only thing standing between a failed fallback attempt
+  and I-GAP, so it is *more* load-bearing than the first version of this model
+  said, not less.
 
-`ctrl_carries` (can the post-PAKE link mature without being rebuilt?) is a free
-parameter rather than an assumption. Gate 0 determines it: `False` is the only
-value reproducing all four observed outcomes. That is a derivation from CI, not a
-code reading, and it is falsifiable — a green `main` macOS log showing a transfer
-riding the **original** post-PAKE link would fail the gate.
+Two corrections from `claude-advisor` are folded in, and both made `main` look
+worse rather than better. `D_FAILED` buys exactly **one fallible, unretried**
+recovery attempt (`main.rs:7608` logs the `establish()` failure and moves on),
+not an armed successor, so a `D_BURNT` state was added; and a pending can be
+**cancelled** rather than expired by the `link_dead` branch, which reaches the
+same gap by a second route. Together they cost `EAGER` an environment (5/8 → 4/8)
+and `LATE` one (2/8 → 1/8).
+
+`ctrl_carries` — *can a transfer **complete** over the post-PAKE link without that
+link first being destroyed and rebuilt?* — is a free parameter rather than an
+assumption. Gate 0 derives it: `False` is the only value reproducing all four
+observed outcomes (2/4 with it `True`). Four points against one free bit is a fit
+as much as a derivation, so the falsification test carried the weight, and it has
+now **run**: the green `main` macOS artifact (run 30825113095, job 91724637129)
+shows the drop at `main.rs:10871`, ICE closing, a second gather on a new host
+port, and sha256 delivery success only *after* the rebuild. The green path rides
+a rebuilt link. Confirmed by artifact, not by fit.
+
+The definition is deliberately **observational**. Two readings still fit and this
+model does not distinguish them: (A) the retained link genuinely cannot carry
+data, or (B) the link is fine and the sender never progresses because it waits on
+a transition only a rebuild emits. They imply different fixes, so nothing here
+should be read as asserting A. The discriminator is whether the sender ever
+*attempted* to send file data on the retained link.
 
 All three proofs are required CI gates (`.github/workflows/proof.yml`).
 

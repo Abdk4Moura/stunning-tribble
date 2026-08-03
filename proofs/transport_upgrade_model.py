@@ -53,18 +53,36 @@ THE THREE DESIGNS
 
 THE FREE PARAMETER, AND WHY IT IS FREE
 
-`ctrl_carries` asks whether the post-PAKE WebRTC link can mature into a
-transfer-carrying transport ON ITS OWN, without being destroyed and rebuilt.
+`ctrl_carries` is defined OBSERVATIONALLY, and the wording matters:
+
+    can a transfer COMPLETE over the post-PAKE link without that link first
+    being destroyed and rebuilt?
+
+Not "does the link have a transport". The distinction is deliberate, because two
+readings fit the evidence and they are not distinguished here:
+
+    A  the retained link genuinely cannot carry data
+    B  the link is fine, and the SENDER never progresses, because it waits on a
+       state transition that only a rebuild emits
+
+Both produce a transfer that never completes, which is what this model needs.
+They imply very different fixes, so the model must not be read as asserting A.
+The discriminator (claude-advisor's): did the sender ever ATTEMPT to send file
+data on the retained link? Attempted-and-stalled is A; never-attempted is B.
+
+CONFIRMED FALSE, by artifact, not by fit. Gate 0 derives ctrl_carries=False from
+four CI outcomes, which is four points against one free bit and would be a fit as
+much as a derivation. It is independently confirmed from the green `main` macOS
+artifact of run 30825113095 (job 91724637129): sender peer xKm57McGHTIu6h-mAAAD
+drops at the Option A site (main.rs:10871) after auth, ICE closes, a second
+gather opens a new host port 57792, and the sha256 delivery success appears only
+AFTER that rebuild. The green path rides a rebuilt link.
 
     Link { peer: Option<Arc<Peer>>, transport: Option<Arc<dyn Transport>>, .. }
 
-`peer` is the WebRTC connection the PAKE rode. `transport` is the data plane and
+`peer` is the WebRTC connection the PAKE rode; `transport` is the data plane and
 is independently `None` until a data channel opens (main.rs:6614 builds a link
-with `transport: None`). Whether it opens on the post-PAKE link is NOT settled
-here, so it is a config axis rather than an assumption. That is deliberate: the
-model reports what follows under EACH value, and the necessity matrix below
-turns out to determine the value from the observed CI outcomes rather than
-requiring us to know it in advance.
+with `transport: None`). Which of A or B that reflects is still open.
 
 VALIDATION GATE
 
@@ -106,7 +124,17 @@ W_NONE, W_CTRL, W_LIVE = 'NONE', 'CTRL', 'LIVE'
 # PENDING  direct_pending registered; an expiry IS armed, so a loss is observed
 # LIVE     authenticated QUIC transport up
 # FAILED   the race was lost and expired_direct fired
-D_NONE, D_PENDING, D_LIVE, D_FAILED = 'NONE', 'PENDING', 'LIVE', 'FAILED'
+# BURNT    the one recovery attempt that D_FAILED buys has itself failed. NOT a
+#          synonym for NONE: nothing further is scheduled. main.rs:7608
+#              if let Err(e) = self.establish(info).await {
+#                  ui::debug("  WebRTC fallback for {pid} failed: {e}");
+#          establish() does a fetch_config network round trip; on failure this is
+#          logged and the loop moves on. expired_direct has already REAPED the
+#          pending, so the trigger is consumed and no successor exists. Making
+#          the discard loud (which we did, and which was right) improved
+#          VISIBILITY, not RECOVERABILITY.
+D_NONE, D_PENDING, D_LIVE, D_FAILED, D_BURNT = \
+    'NONE', 'PENDING', 'LIVE', 'FAILED', 'BURNT'
 
 # ---- the transfer -----------------------------------------------------------
 X_IDLE, X_RUNNING, X_DONE = 'IDLE', 'RUNNING', 'DONE'
@@ -148,8 +176,16 @@ def successors(s, cfg):
         # or by roster reconciliation (the accidental one).
         if s.d == D_FAILED:
             add('establish_after_direct_lost', w=W_LIVE, d=D_NONE)
+            # ...and that attempt is FALLIBLE and UNRETRIED (main.rs:7608).
+            # D_FAILED buys exactly one attempt, not a successor.
+            add('establish_fails_abandoned', d=D_BURNT)
+
+        # Roster re-adoption is gated on `!links.contains_key(&peer_id)`, so it
+        # fires ONLY when the link is absent. That is why it never ran on
+        # #78/#79: nothing dropped, so the precondition was never met. The
+        # guard is why this transition sits under `w == W_NONE`.
         if cfg.roster:
-            add('roster_reconcile', w=W_LIVE)
+            add('roster_reconcile', w=W_LIVE, d=D_NONE)
 
     # ============================================================= the upgrade
     # Fires once, from the post-PAKE state, before any transfer starts.
@@ -189,6 +225,18 @@ def successors(s, cfg):
     if s.d == D_PENDING:
         add('direct_wins', d=D_LIVE)
         add('direct_lost', d=D_FAILED)
+
+    # A pending can also be DESTROYED without ever expiring, which is a
+    # different route to the same gap and the one currently live on main. A
+    # later start_direct_inner call whose link_dead branch fires does
+    #     rel 41  self.direct_pending.remove(pid);
+    #     rel 42  self.drop_link(pid);
+    # and then hits bind_endpoint at rel 70, which returns at rel 86 -- 97 lines
+    # before the pending is re-inserted at rel 183. The pending is cancelled,
+    # not expired, so nothing will ever be reaped and nothing is scheduled.
+    # Only reachable where bind fails; with bind ok the pending is re-registered.
+    if s.d == D_PENDING and not cfg.bind_ok and cfg.design in (EAGER, LATE):
+        add('pending_cancelled_then_bind_fails', w=W_NONE, d=D_NONE)
 
     # PATHSET retires the old path only once the new one is LIVE, and only after
     # it is actually carrying the transfer. Modeled as legal but never required.
@@ -365,7 +413,15 @@ if __name__ == '__main__':
         ('#78/#79 ubuntu GREEN', LATE,    True,  True,  True,  True),
     ]
     print("\n[Gate 0: reproduce the four outcomes observed in CI on 2026-08-03]")
-    print("assumes ctrl_carries=False (the post-PAKE link cannot mature on its own)")
+    print("ctrl_carries=False: a transfer cannot COMPLETE over the post-PAKE link")
+    print("unless that link is first destroyed and rebuilt.")
+    print("  derived here from 4 outcomes against 1 free bit, which alone would be")
+    print("  a fit as much as a derivation. Independently CONFIRMED by artifact:")
+    print("  green main run 30825113095 job 91724637129 -- drop at main.rs:10871,")
+    print("  ICE closes, second gather on new host port 57792, sha256 delivery")
+    print("  success only AFTER the rebuild. The green path rides a rebuilt link.")
+    print("  Still open: whether the retained link cannot carry data, or the")
+    print("  sender never starts. Both fit; this model does not distinguish them.")
     gate_ok = True
     for label, design, dok, bok, ros, expect in OBSERVED:
         cfg = Cfg(design, dok, bok, ros, False)
