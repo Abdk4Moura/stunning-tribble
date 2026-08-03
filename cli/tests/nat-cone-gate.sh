@@ -15,6 +15,7 @@ BACKEND_PORT=8189; STUN_PORT=3478; REF_PORT=49000
 SERVER_IP=10.220.100.1
 
 die() { printf 'nat-cone-gate: FAIL: %s\n' "$*" >&2; exit 1; }
+unclassified() { printf 'nat-cone-gate: UNCLASSIFIED: %s\n' "$*" >&2; exit 3; }
 cleanup() {
   for ns in "$CA" "$CB" "$RA" "$RB" "$WAN"; do
     for pid in $(ip netns pids "$ns" 2>/dev/null || true); do kill "$pid" 2>/dev/null || true; done
@@ -25,11 +26,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-[[ "$(id -u)" -eq 0 ]] || die "run as root"
-[[ -x "$BIN" ]] || die "build first: $BIN"
-command -v ip >/dev/null || die "iproute2 is required"
-command -v iptables >/dev/null || die "iptables is required"
-python3 -c 'import flask' 2>/dev/null || die "python3 Flask dependency is required"
+[[ "$(id -u)" -eq 0 ]] || unclassified "run as root"
+[[ -x "$BIN" ]] || unclassified "build first: $BIN"
+command -v ip >/dev/null || unclassified "iproute2 is required"
+command -v iptables >/dev/null || unclassified "iptables is required"
+python3 -c 'import flask' 2>/dev/null || unclassified "python3 Flask dependency is required"
 
 new_ns() { ip netns add "$1"; ip -n "$1" link set lo up; }
 link_ns() {
@@ -67,8 +68,8 @@ start_service() {
     >"$WORK/backend.log" 2>&1 & PIDS+=("$!")
   ip netns exec "$WAN" python3 "$STUN" 0.0.0.0 "$STUN_PORT" >"$WORK/stun.log" 2>&1 & PIDS+=("$!")
   for _ in $(seq 1 40); do ip netns exec "$WAN" curl --noproxy '*' -fsS "http://$SERVER_IP:$BACKEND_PORT/api/health" >/dev/null 2>&1 && break; sleep .25; done
-  ip netns exec "$WAN" curl --noproxy '*' -fsS "http://$SERVER_IP:$BACKEND_PORT/api/health" >/dev/null || die "backend did not come up"
-  grep -q READY "$WORK/stun.log" || die "STUN did not come up"
+  ip netns exec "$WAN" curl --noproxy '*' -fsS "http://$SERVER_IP:$BACKEND_PORT/api/health" >/dev/null || return 1
+  grep -q READY "$WORK/stun.log" || return 1
 }
 
 prove_cone() {
@@ -79,13 +80,18 @@ prove_cone() {
     sleep .2
     local result
     result=$(ip netns exec "$client" python3 "$PROBE" probe --bind 0.0.0.0 --port 40000 \
-      --target A="$SERVER_IP:$REF_PORT" --target B=10.220.100.2:$((REF_PORT+1))) || die "NAT topology unproven for $client"
+      --target A="$SERVER_IP:$REF_PORT" --target B=10.220.100.2:$((REF_PORT+1))) \
+      || { printf 'nat-cone-gate: UNCLASSIFIED: NAT probe did not produce a verdict for %s\n' "$client" >&2; return 3; }
     printf '%s cone probe: %s\n' "$client" "$result"
-    python3 - "$result" <<'PY'
+    if ! python3 - "$result" <<'PY'
 import json, sys
 if json.loads(sys.argv[1])["mapping"] != "endpoint-independent":
     raise SystemExit("UNCLASSIFIED: NAT is not endpoint-independent")
 PY
+    then
+      printf 'nat-cone-gate: UNCLASSIFIED: %s is not a cone NAT\n' "$client" >&2
+      return 3
+    fi
     for pid in "${ref_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
   done
 }
@@ -120,7 +126,7 @@ pair_and_transfer() {
   printf 'nat-cone-gate: PASS: cone proven, holepunched route, byte-exact payload\n'
 }
 
-setup_topology
-start_service
-prove_cone
+if ! setup_topology; then unclassified "topology setup failed"; fi
+if ! start_service; then unclassified "signaling or STUN service did not start"; fi
+if ! prove_cone; then unclassified "NAT topology was not proven"; fi
 pair_and_transfer
