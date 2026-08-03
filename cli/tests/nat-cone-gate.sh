@@ -13,6 +13,8 @@ WAN="${PREFIX}-wan"; RA="${PREFIX}-ra"; RB="${PREFIX}-rb"; CA="${PREFIX}-ca"; CB
 WORK="$(mktemp -d)"; PIDS=()
 BACKEND_PORT=8189; STUN_PORT=3478; REF_PORT=49000
 SERVER_IP=10.220.100.1
+REF_A_IP=10.220.100.2
+REF_B_IP=10.220.100.3
 
 die() { printf 'nat-cone-gate: FAIL: %s\n' "$*" >&2; exit 1; }
 unclassified() { printf 'nat-cone-gate: UNCLASSIFIED: %s\n' "$*" >&2; exit 3; }
@@ -22,7 +24,11 @@ cleanup() {
   done
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
   for ns in "$CA" "$CB" "$RA" "$RB" "$WAN"; do ip netns del "$ns" 2>/dev/null || true; done
-  rm -rf "$WORK"
+  if [[ -n "${KEEP_WORK:-}" ]]; then
+    printf 'nat-cone-gate: logs kept in %s\n' "$WORK" >&2
+  else
+    rm -rf "$WORK"
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -49,7 +55,8 @@ setup_topology() {
   link_ns "$RA" "$CA" 10.221.1.1/24 10.221.1.2/24 ra-lan ca-lan || return 1
   link_ns "$RB" "$CB" 10.221.2.1/24 10.221.2.2/24 rb-lan cb-lan || return 1
   ip -n "$WAN" addr add "$SERVER_IP/32" dev lo || return 1
-  ip -n "$WAN" addr add 10.220.100.2/32 dev lo || return 1
+  ip -n "$WAN" addr add "$REF_A_IP/32" dev lo || return 1
+  ip -n "$WAN" addr add "$REF_B_IP/32" dev lo || return 1
   ip netns exec "$WAN" sysctl -q -w net.ipv4.ip_forward=1 || return 1
   ip netns exec "$RA" sysctl -q -w net.ipv4.ip_forward=1 || return 1
   ip netns exec "$RB" sysctl -q -w net.ipv4.ip_forward=1 || return 1
@@ -75,12 +82,12 @@ start_service() {
 prove_cone() {
   for client in "$CA" "$CB"; do
     local ref_pids=()
-    ip netns exec "$WAN" python3 "$PROBE" server --bind 0.0.0.0 --port "$REF_PORT" --label A >"$WORK/ref-$client.log" 2>&1 & ref_pids+=("$!")
-    ip netns exec "$WAN" python3 "$PROBE" server --bind 10.220.100.2 --port "$((REF_PORT+1))" --label B >>"$WORK/ref-$client.log" 2>&1 & ref_pids+=("$!")
+    ip netns exec "$WAN" python3 "$PROBE" server --bind "$REF_A_IP" --port "$REF_PORT" --label A >"$WORK/ref-$client.log" 2>&1 & ref_pids+=("$!")
+    ip netns exec "$WAN" python3 "$PROBE" server --bind "$REF_B_IP" --port "$((REF_PORT+1))" --label B >>"$WORK/ref-$client.log" 2>&1 & ref_pids+=("$!")
     sleep .2
     local result
     result=$(ip netns exec "$client" python3 "$PROBE" probe --bind 0.0.0.0 --port 40000 \
-      --target A="$SERVER_IP:$REF_PORT" --target B=10.220.100.2:$((REF_PORT+1))) \
+      --target A="$REF_A_IP:$REF_PORT" --target B="$REF_B_IP:$((REF_PORT+1))") \
       || { printf 'nat-cone-gate: UNCLASSIFIED: NAT probe did not produce a verdict for %s\n' "$client" >&2; return 3; }
     printf '%s cone probe: %s\n' "$client" "$result"
     if ! python3 - "$result" <<'PY'
