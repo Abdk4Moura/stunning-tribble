@@ -22,11 +22,114 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const CODE_WORD: &str = "gigantic-element-tango";
+
+/// Result of waiting for a captured child. Timeout is deliberately distinct
+/// from an ordinary non-zero exit: a stalled transfer is a different finding
+/// from a process that failed cleanly.
+#[derive(Debug)]
+enum ChildOutcome {
+    ExitedSuccess(ExitStatus),
+    ExitedFailure(ExitStatus),
+    TimedOut,
+    SpawnFailed(String),
+}
+
+#[derive(Debug)]
+struct CapturedChild {
+    outcome: ChildOutcome,
+    stdout: String,
+    stderr: String,
+}
+
+/// A spawned child whose stdout and stderr are drained continuously. Keeping
+/// the buffers shared makes diagnostics available before the child exits.
+struct LiveChild {
+    child: Child,
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    readers: Vec<std::thread::JoinHandle<()>>,
+}
+
+fn drain_pipe<R: Read + Send + 'static>(pipe: R, buffer: Arc<Mutex<Vec<u8>>>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut reader = pipe;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buffer.lock().unwrap().extend_from_slice(&chunk[..n]),
+            }
+        }
+    })
+}
+
+fn spawn_captured(mut command: Command) -> Result<LiveChild, String> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let readers = vec![
+        drain_pipe(child.stdout.take().ok_or("child stdout was not piped")?, stdout.clone()),
+        drain_pipe(child.stderr.take().ok_or("child stderr was not piped")?, stderr.clone()),
+    ];
+    Ok(LiveChild { child, stdout, stderr, readers })
+}
+
+fn run_captured(command: Command, deadline: Duration) -> CapturedChild {
+    match spawn_captured(command) {
+        Ok(child) => child.wait_until(deadline),
+        Err(error) => CapturedChild {
+            outcome: ChildOutcome::SpawnFailed(error),
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    }
+}
+
+impl LiveChild {
+    fn snapshot(&self) -> (String, String) {
+        let stdout = String::from_utf8_lossy(&self.stdout.lock().unwrap()).into_owned();
+        let stderr = String::from_utf8_lossy(&self.stderr.lock().unwrap()).into_owned();
+        (stdout, stderr)
+    }
+
+    fn wait_until(mut self, deadline: Duration) -> CapturedChild {
+        let started = std::time::Instant::now();
+        let outcome = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    break if status.success() {
+                        ChildOutcome::ExitedSuccess(status)
+                    } else {
+                        ChildOutcome::ExitedFailure(status)
+                    };
+                }
+                Ok(None) if started.elapsed() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break ChildOutcome::TimedOut;
+                }
+                Err(_) => break ChildOutcome::TimedOut,
+            }
+        };
+        for reader in std::mem::take(&mut self.readers) {
+            let _ = reader.join();
+        }
+        let (stdout, stderr) = self.snapshot();
+        CapturedChild { outcome, stdout, stderr }
+    }
+}
 
 // ---------------------------------------------------------------- helpers ---
 
@@ -1432,6 +1535,87 @@ fn warm_one_shot_pty_reuse() {
         out_stdout.contains(&nonce),
         "pty output does not contain nonce '{nonce}'\nstdout: {out_stdout}\nstderr: {out_stderr}"
     );
+}
+
+#[cfg(test)]
+mod captured_child_tests {
+    use super::*;
+
+    fn command_that_prints_then_waits() -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "echo live && ping -n 4 127.0.0.1 >NUL"]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf 'live\\n'; sleep 3"]);
+            command
+        }
+    }
+
+    fn hanging_command() -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("ping");
+            command.args(["-n", "20", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("20");
+            command
+        }
+    }
+
+    fn failing_command() -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "exit 7"]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exit 7"]);
+            command
+        }
+    }
+
+    #[test]
+    fn captured_child_exposes_output_before_exit() {
+        let child = spawn_captured(command_that_prints_then_waits()).expect("spawn");
+        let started = std::time::Instant::now();
+        let mut observed = false;
+        while started.elapsed() < Duration::from_secs(2) {
+            let (stdout, stderr) = child.snapshot();
+            if stdout.contains("live") || stderr.contains("live") {
+                observed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(observed, "child output was not readable before child exit");
+        let result = child.wait_until(Duration::from_secs(5));
+        assert!(matches!(result.outcome, ChildOutcome::ExitedSuccess(_)));
+    }
+
+    #[test]
+    fn captured_child_timeout_is_distinct_from_failure() {
+        let started = std::time::Instant::now();
+        let result = run_captured(hanging_command(), Duration::from_millis(150));
+        assert!(matches!(result.outcome, ChildOutcome::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(2), "timeout did not fire promptly");
+    }
+
+    #[test]
+    fn captured_child_reports_nonzero_exit_separately() {
+        let result = run_captured(failing_command(), Duration::from_secs(2));
+        assert!(matches!(result.outcome, ChildOutcome::ExitedFailure(_)));
+    }
+
+    #[test]
+    fn captured_child_reports_spawn_failure() {
+        let mut command = Command::new("filament-test-command-that-does-not-exist");
+        command.arg("--version");
+        let result = run_captured(command, Duration::from_millis(100));
+        assert!(matches!(result.outcome, ChildOutcome::SpawnFailed(_)));
+    }
 }
 
 #[test]
