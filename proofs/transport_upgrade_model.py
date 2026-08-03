@@ -425,34 +425,65 @@ if __name__ == '__main__':
     # reader is entitled to know which is which. Do not invent a run id to make
     # the count look better; an unanchored row is honest, a fabricated one is not.
     OBSERVED = [
-        # (label,           design, direct_ok, bind_ok, roster, expect, observed_on, run, job)
+        # (label,           design, direct_ok, bind_ok, roster, expect, era, run, job)
+        #
+        # --- pre-rearm: before the ChannelReady contract was honoured (#83) ---
         ('main    macOS  GREEN', EAGER, False, True,  True,  True,  'pre-rearm', 30825113095, 91724637129),
         ('#78     macOS  RED  ', LATE,  False, True,  True,  False, 'pre-rearm', 30824271188, 91721922115),
         ('#79     macOS  RED  ', LATE,  False, True,  False, False, 'pre-rearm', None,        91719654747),
         ('#78/#79 ubuntu GREEN', LATE,  True,  True,  True,  True,  'pre-rearm', None,        None),
+        #
+        # --- post-rearm: main's OWN CI after #83 merged (47f756c) -------------
+        # Not #83's branch runs. Gate 0 reproduces what was OBSERVED, and branch
+        # runs sit on a base main no longer has, which would reintroduce
+        # staleness inside the artefact built to detect it.
+        #
+        # The macOS row is the discriminator: LATE with direct DISABLED is
+        # BROKEN under ctrl_carries=False and CLEAN under True, so main going
+        # green there is only reproducible if the retained post-PAKE link can
+        # now carry a transfer. ubuntu/windows are clean under both and are
+        # recorded for completeness, not for discrimination.
+        ('main    macOS  GREEN', LATE,  False, True,  True,  True,  'post-rearm', 30831946455, 91747790666),
+        ('main    ubuntu GREEN', LATE,  True,  True,  True,  True,  'post-rearm', 30831946455, 91747790537),
+        ('main    windows GREEN', LATE, True,  True,  True,  True,  'post-rearm', 30831946455, 91747790573),
     ]
-    print("\n[Gate 0: reproduce the four outcomes observed in CI on 2026-08-03]")
-    print("ctrl_carries=False: a transfer cannot COMPLETE over the post-PAKE link")
-    print("unless that link is first destroyed and rebuilt.")
-    print("  derived here from 4 outcomes against 1 free bit, which alone would be")
-    print("  a fit as much as a derivation. Independently CONFIRMED by artifact:")
-    print("  green main run 30825113095 job 91724637129 -- drop at main.rs:10871,")
-    print("  ICE closes, second gather on new host port 57792, sha256 delivery")
-    print("  success only AFTER the rebuild. The green path rides a rebuilt link.")
-    print("  RESOLVED to the second reading: the retained link is FINE and the")
-    print("  sender never starts. #78 artifact job 91721922115 shows no offer,")
-    print("  stream, chunk, byte counter or send error with the debug channel")
-    print("  live throughout; and the fix delivers a verified file 19ms after")
-    print("  auth on a retained link, which a link unable to carry data could")
-    print("  not do. Kept observational anyway: this model only needs that no")
-    print("  transfer COMPLETES without a rebuild, which is true either way.")
+
+    # Each era has its own value for the derived parameter. This is what turns
+    # the prediction recorded in #83's PR body ("this flips ctrl_carries to
+    # True") into an assertion the proof CHECKS, rather than a claim that was
+    # right once and then deleted. Both eras must reproduce, each under its own
+    # value, or the flip did not happen the way we said it would.
+    ERA_CTRL = {'pre-rearm': False, 'post-rearm': True}
+    print("\n[Gate 0: reproduce every outcome observed in CI, across BOTH eras]")
+    print("ctrl_carries: can a transfer COMPLETE over the post-PAKE link without")
+    print("that link first being destroyed and rebuilt?")
+    print("  pre-rearm  False. Derived from 4 outcomes against 1 free bit, then")
+    print("             CONFIRMED by artifact: green main run 30825113095 job")
+    print("             91724637129 shows the drop at main.rs:10871, ICE closing,")
+    print("             a second gather on a new host port, and sha256 delivery")
+    print("             success only AFTER the rebuild.")
+    print("  post-rearm True. #83 dispatched the ChannelReady the offer site's")
+    print("             comment always claimed the Signal handler sent. main's")
+    print("             own run 30831946455 then went green on macOS with direct")
+    print("             DISABLED, which is BROKEN under False and CLEAN under")
+    print("             True, so that row alone forces the flip.")
+    print("  The flip was PREDICTED in #83's PR body before its checks ran, and")
+    print("  is kept here as a checked assertion rather than a claim that was")
+    print("  right once and then deleted. Both eras must reproduce.")
+    print("  Cause, resolved: the retained link was always fine; the SENDER was")
+    print("  never told. #78 artifact job 91721922115 shows no offer, stream,")
+    print("  chunk, byte counter or send error with the debug channel live")
+    print("  throughout, and the fix delivers a verified file 19ms after auth on")
+    print("  a retained link. Kept observational regardless: the model only needs")
+    print("  that no transfer COMPLETES without a rebuild.")
     gate_ok = True
-    for label, design, dok, bok, ros, expect, _on, _run, _job in OBSERVED:
-        cfg = Cfg(design, dok, bok, ros, False)
+    for label, design, dok, bok, ros, expect, era, _run, _job in OBSERVED:
+        cfg = Cfg(design, dok, bok, ros, ERA_CTRL[era])
         r = check(cfg)
         got = is_clean(r)
         mark = 'ok ' if got == expect else 'MISMATCH'
-        print(f"  {label}  model={'CLEAN' if got else 'BROKEN'}  "
+        print(f"  {label}  [{era:10s} ctrl={str(ERA_CTRL[era]):5s}] "
+              f"model={'CLEAN' if got else 'BROKEN'}  "
               f"observed={'GREEN' if expect else 'RED'}   {mark}")
         if got != expect:
             gate_ok = False
@@ -506,17 +537,24 @@ if __name__ == '__main__':
     #
     # Here the remedy is the correct action: re-derive, bump this constant, the
     # check goes quiet and SURVIVES to catch the next drift.
-    CALIBRATED_FOR = "pre-rearm"
+    CALIBRATED_FOR = "post-rearm"
     tree_state = "post-rearm" if "fn rearm_channel_ready" in tree else "pre-rearm"
 
-    stale = [r[0] for r in OBSERVED if r[6] != CALIBRATED_FOR]
-    if stale:
-        print(f"\n  GATE 0 INCOHERENT: CALIBRATED_FOR is {CALIBRATED_FOR!r} but")
-        print("  these rows were observed on a different tree state:")
-        for lbl in stale:
+    unknown = [r[0] for r in OBSERVED if r[6] not in ERA_CTRL]
+    if unknown:
+        print(f"\n  GATE 0 INCOHERENT: rows tagged with an era that has no")
+        print("  ctrl_carries value:")
+        for lbl in unknown:
             print(f"      {lbl.strip()}")
-        print("  Bumping the constant is not a re-derivation. Replace the rows")
-        print("  with observations from the tree the constant now names.")
+        sys.exit(1)
+    # The calibration must be ANCHORED in the tree it claims to describe. Rows
+    # from older eras are kept deliberately (they are the evidence that the
+    # parameter flipped), but at least one row must come from the current one,
+    # or bumping the constant would again be a free way to silence an expiry.
+    if not any(r[6] == CALIBRATED_FOR for r in OBSERVED):
+        print(f"\n  GATE 0 INCOHERENT: CALIBRATED_FOR is {CALIBRATED_FOR!r} but no")
+        print("  observed row comes from that tree state. Bumping the constant")
+        print("  is not a re-derivation; add the observations.")
         sys.exit(1)
 
     if tree_state != CALIBRATED_FOR:
@@ -553,11 +591,12 @@ if __name__ == '__main__':
 
     # Show that ctrl_carries=True does NOT reproduce, so the gate genuinely
     # determines the parameter instead of merely being consistent with it.
-    disc = [is_clean(check(Cfg(d, dok, bok, ros, True))) == exp
-            for _, d, dok, bok, ros, exp, _on, _r, _j in OBSERVED]
-    print(f"  same four rows with ctrl_carries=True reproduce: {sum(disc)}/4 "
-          f"-> {'DISCRIMINATES' if not all(disc) else 'does NOT discriminate'}")
-    ok &= not all(disc)
+    flipped = [is_clean(check(Cfg(d, dok, bok, ros, not ERA_CTRL[era]))) == exp
+               for _, d, dok, bok, ros, exp, era, _r, _j in OBSERVED]
+    print(f"  with each era's ctrl_carries FLIPPED, rows still reproducing: "
+          f"{sum(flipped)}/{len(OBSERVED)} -> "
+          f"{'DISCRIMINATES' if not all(flipped) else 'does NOT discriminate'}")
+    ok &= not all(flipped)
 
     # -------------------------------------------------------------- matrix
     print("\n[Full matrix: 3 designs x 2^4 environments]")
