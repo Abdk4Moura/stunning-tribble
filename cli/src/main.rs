@@ -4562,6 +4562,9 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
                         conn.maybe_adopt(p, false).await?;
                     }
                     for p in &roster.channel_peers {
+                        if is_self_uid(&conn.my_uid, p["uid"].as_str()) {
+                            continue;
+                        }
                         let ch = p["channel"].as_str().unwrap_or_default();
                         let (is_b, secret, name) = if ch == channel_of(&a_sec) {
                             (false, &a_sec, &a_name)
