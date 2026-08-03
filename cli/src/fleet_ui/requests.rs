@@ -95,7 +95,7 @@ fn capability_label(capability: &str) -> &str {
 
 fn deliberate_explanation(capability: &str) -> &str {
     match capability {
-        "shell" => "this is owner-equivalent access — a terminal that can act as you on this machine",
+        "shell" => "this is deliberate access, owner-equivalent: a real terminal that can act as you on this machine",
         "mount" => "this is deliberate access — can change or delete your files",
         "all-ports" => "this is deliberate access — reaches ports beyond those exposed",
         _ => "this is deliberate access",
