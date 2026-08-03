@@ -586,7 +586,8 @@ if __name__ == '__main__':
     for r in OBSERVED:
         if not (r[7] or r[8]):
             print(f"      UNANCHORED, weaker evidence: {r[0].strip()}")
-    print("  gate passed: all four reproduce, and ONLY with ctrl_carries=False.")
+    print(f"  gate passed: all {len(OBSERVED)} rows reproduce, each under its own")
+    print("  era's ctrl_carries value.")
     ok &= gate_ok
 
     # Show that ctrl_carries=True does NOT reproduce, so the gate genuinely
