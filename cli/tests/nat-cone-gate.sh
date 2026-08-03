@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Slice B: two Filament peers behind independently configured cone NATs.
 # Proves the NAT class first, then asserts hole-punched, byte-exact transfer.
+# To verify only the netns lab and prober, run: FILAMENT_BIN=/bin/true bash "$0"
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -32,11 +33,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-[[ "$(id -u)" -eq 0 ]] || unclassified "run as root"
-[[ -x "$BIN" ]] || unclassified "build first: $BIN"
-command -v ip >/dev/null || unclassified "iproute2 is required"
-command -v iptables >/dev/null || unclassified "iptables is required"
-python3 -c 'import flask' 2>/dev/null || unclassified "python3 Flask dependency is required"
+[[ "$(id -u)" -eq 0 ]] || unclassified "stage=setup: run as root"
+[[ -x "$BIN" ]] || unclassified "stage=setup: build first: $BIN"
+command -v ip >/dev/null || unclassified "stage=setup: iproute2 is required"
+command -v iptables >/dev/null || unclassified "stage=setup: iptables is required"
+python3 -c 'import flask' 2>/dev/null || unclassified "stage=service: python3 Flask dependency is required"
 
 new_ns() { ip netns add "$1" || return 1; ip -n "$1" link set lo up || return 1; }
 link_ns() {
@@ -88,7 +89,7 @@ prove_cone() {
     local result
     result=$(ip netns exec "$client" python3 "$PROBE" probe --bind 0.0.0.0 --port 40000 \
       --target A="$REF_A_IP:$REF_PORT" --target B="$REF_B_IP:$((REF_PORT+1))") \
-      || { printf 'nat-cone-gate: UNCLASSIFIED: NAT probe did not produce a verdict for %s\n' "$client" >&2; return 3; }
+      || { printf 'nat-cone-gate: UNCLASSIFIED: stage=prober: no verdict for %s\n' "$client" >&2; return 3; }
     printf '%s cone probe: %s\n' "$client" "$result"
     if ! python3 - "$result" <<'PY'
 import json, sys
@@ -96,7 +97,7 @@ if json.loads(sys.argv[1])["mapping"] != "endpoint-independent":
     raise SystemExit("UNCLASSIFIED: NAT is not endpoint-independent")
 PY
     then
-      printf 'nat-cone-gate: UNCLASSIFIED: %s is not a cone NAT\n' "$client" >&2
+      printf 'nat-cone-gate: UNCLASSIFIED: stage=non-cone: %s is not a cone NAT\n' "$client" >&2
       return 3
     fi
     for pid in "${ref_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
@@ -133,7 +134,7 @@ pair_and_transfer() {
   printf 'nat-cone-gate: PASS: cone proven, holepunched route, byte-exact payload\n'
 }
 
-if ! setup_topology; then unclassified "topology setup failed"; fi
-if ! start_service; then unclassified "signaling or STUN service did not start"; fi
-if ! prove_cone; then unclassified "NAT topology was not proven"; fi
+if ! setup_topology; then unclassified "stage=setup: topology setup failed"; fi
+if ! start_service; then unclassified "stage=service: signaling or STUN service did not start"; fi
+if ! prove_cone; then unclassified "stage=prober: NAT topology was not proven"; fi
 pair_and_transfer
