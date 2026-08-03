@@ -13722,14 +13722,16 @@ async fn recv_cmd(
                             let pid = p["id"].as_str().unwrap_or_default().to_string();
                             let (name, secret) = (name.clone(), secret.clone());
                             conn.start_direct(&pid, &name, &secret).await;
-                            conn.maybe_adopt_from(p, true, AdoptSource::Digest).await?;
+                            // Channel-digest recovery remains intentionally outside
+                            // the room give-up suppression scope.
+                            conn.maybe_adopt(p, true).await?;
                             if let Some(l) = conn.link_mut(&pid) {
                                 l.expected_secret = Some((name, secret));
                             }
                         } else if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
                             let enroll_channel = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
                             if p["channel"].as_str() == Some(enroll_channel.as_str()) {
-                                conn.maybe_adopt_from(p, true, AdoptSource::Digest).await?;
+                                conn.maybe_adopt(p, true).await?;
                             }
                         }
                     }
