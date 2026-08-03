@@ -2499,14 +2499,19 @@ impl ShellPolicy {
     }
 }
 
+fn shell_root_note() -> &'static str {
+    #[cfg(unix)]
+    {
+        if unsafe { libc::geteuid() } == 0 {
+            return " This process is root, so the shell can control the whole machine.";
+        }
+    }
+    ""
+}
+
 fn require_shell_owner_ack(shell_enabled: bool, shell_user: Option<&str>, i_know: bool) -> Result<()> {
     if shell_enabled && shell_user.is_none() && !i_know {
-        let root_note = if unsafe { libc::geteuid() } == 0 {
-            " This process is root, so the shell can control the whole machine."
-        } else {
-            ""
-        };
-        bail!("serving a shell without --shell-user grants the peer the owner's authority, because the PTY runs as this process's user and can read the config directory.{root_note} Pass --shell-user or --i-know to continue.");
+        bail!("serving a shell without --shell-user grants the peer the owner's authority, because the PTY runs as this process's user and can read the config directory.{} Pass --shell-user or --i-know to continue.", shell_root_note());
     }
     Ok(())
 }
@@ -2829,12 +2834,7 @@ async fn up_cmd(
         let warning = if let Some(user) = shell_user.as_deref() {
             format!("  note: shell PTYs run as {user}; verify this account cannot read FILAMENT_CONFIG_DIR or the drop is cosmetic")
         } else {
-            let root_note = if unsafe { libc::geteuid() } == 0 {
-                " This process is root, so the shell can control the whole machine."
-            } else {
-                ""
-            };
-            format!("  {} serving shell without --shell-user grants the peer the owner's authority because the PTY runs as this process's user and can read the config directory.{root_note}", ui::paint(ui::Tone::Warn, "!"))
+            format!("  {} serving shell without --shell-user grants the peer the owner's authority because the PTY runs as this process's user and can read the config directory.{}", ui::paint(ui::Tone::Warn, "!"), shell_root_note())
         };
         ui::say(&warning);
     }
