@@ -1773,6 +1773,9 @@ fn freeze_stall_detector_classification() {
     }
     if !recovered {
         if recovery_started {
+            if !matches!(recv_result.outcome, ChildOutcome::TimedOut) {
+                panic!("DETECTED_NOT_RECOVERED: recovery started, receiver exited before the {recovery_deadline:?} deadline without byte-exact completion");
+            }
             panic!("DETECTED_NOT_RECOVERED_WITHIN_DEADLINE: recovery started but did not complete within {recovery_deadline:?}");
         }
         panic!("DETECTED_RECOVERY_UNOBSERVED: detector fired but no recovery marker was observed");
