@@ -39,7 +39,7 @@ HEALTH_URL = SERVER.rstrip("/") + "/api/health"
 STATE_FILE = os.environ.get(
     "MONITOR_STATE", os.path.expanduser("~/.cache/filament-signaling-monitor.json")
 )
-ALERT_TO = os.environ.get("MONITOR_ALERT_TO", "cadaynstudio@gmail.com")
+ALERT_TO = os.environ.get("MONITOR_ALERT_TO", "pro.kaiserlautern@gmail.com")
 ALERT_FROM = os.environ.get("MONITOR_ALERT_FROM", "Filament Monitor <monitor@send.autumated.com>")
 RESEND_KEY_FILE = os.environ.get("RESEND_KEY_FILE", os.path.expanduser("~/secret_keys/resend_api_key"))
 # Consecutive failed checks before declaring DOWN (debounce transient blips).

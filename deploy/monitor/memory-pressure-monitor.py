@@ -29,7 +29,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.environ.get(
     "MEMORY_MONITOR_STATE", os.path.expanduser("~/.cache/filament-memory-pressure.json")
 )
-ALERT_TO = os.environ.get("MONITOR_ALERT_TO", "cadaynstudio@gmail.com")
+ALERT_TO = os.environ.get("MONITOR_ALERT_TO", "pro.kaiserlautern@gmail.com")
 ALERT_FROM = os.environ.get("MONITOR_ALERT_FROM", "Filament Monitor <monitor@send.autumated.com>")
 RESEND_KEY_FILE = os.environ.get("RESEND_KEY_FILE", os.path.expanduser("~/secret_keys/resend_api_key"))
 TIMEOUT = int(os.environ.get("MONITOR_TIMEOUT", "10"))
