@@ -111,12 +111,12 @@ pair_and_transfer() {
   # Pair on the lab WAN before placing the already-known identities behind
   # separate NATs. The gate measures NAT traversal for the known-device path;
   # pairing itself is not the route under test.
-  ip netns exec "$WAN" env FILAMENT_CONFIG_DIR="$cfg_a" FILAMENT_STUN="$SERVER_IP:$STUN_PORT" \
+  ip netns exec "$WAN" env FILAMENT_CONFIG_DIR="$cfg_a" FILAMENT_DIRECT=0 FILAMENT_STUN="$SERVER_IP:$STUN_PORT" \
     "$BIN" -v send "$payload" --word "$word" --remember boxB --server "$server" >"$WORK/pair-a.log" 2>&1 &
   local pair_pid=$!
   for _ in $(seq 1 60); do code=$(grep -oiE "$word-[0-9]{3,5}" "$WORK/pair-a.log" | head -1 || true); [ -n "$code" ] && break; sleep .25; done
   [ -n "$code" ] || die "pair code was not produced"
-  ip netns exec "$WAN" env FILAMENT_CONFIG_DIR="$cfg_b" FILAMENT_STUN="$SERVER_IP:$STUN_PORT" timeout 90 \
+  ip netns exec "$WAN" env FILAMENT_CONFIG_DIR="$cfg_b" FILAMENT_DIRECT=0 FILAMENT_STUN="$SERVER_IP:$STUN_PORT" timeout 90 \
     "$BIN" -v recv "$code" -y --remember boxA --dir "$out" --server "$server" >"$WORK/pair-b.log" 2>&1 || die "pairing failed"
   kill "$pair_pid" 2>/dev/null || true; wait "$pair_pid" 2>/dev/null || true
   [ -s "$cfg_a/devices.json" ] || die "pairing produced no sender device store"
