@@ -86,6 +86,10 @@ start_service() {
     for ns in "$WAN" "$RA" "$RB" "$CA" "$CB"; do
       ip netns exec "$ns" ip route >"$WORK/route-$ns.txt"
     done
+    for router in "$RA" "$RB"; do
+      ip netns exec "$router" iptables -S >"$WORK/iptables-$router.txt"
+      ip netns exec "$router" iptables -t nat -S >"$WORK/iptables-nat-$router.txt"
+    done
   fi
   ip netns exec "$WAN" env PORT="$BACKEND_PORT" FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
     FIL_ICE_SERVERS="[{\"urls\":[\"stun:$SERVER_IP:$STUN_PORT\"]}]" python3 "$CLI_DIR/../backend/app.py" \
