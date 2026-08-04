@@ -93,6 +93,9 @@ start_service() {
   if [[ -n "${CAPTURE:-}" ]]; then
     for client in "$CA" "$CB"; do
       ip netns exec "$client" curl --noproxy '*' -fsS "http://$SERVER_IP:$BACKEND_PORT/api/config" >"$WORK/config-$client.json" || return 1
+      if command -v turnutils_stunclient >/dev/null; then
+        timeout 5 ip netns exec "$client" turnutils_stunclient -p "$STUN_PORT" "$SERVER_IP" >"$WORK/stock-stun-$client.log" 2>&1 || true
+      fi
     done
   fi
 }
