@@ -81,8 +81,8 @@ setup_topology() {
 start_service() {
   if [[ -n "${CAPTURE:-}" ]] && command -v tcpdump >/dev/null; then
     ip netns exec "$WAN" tcpdump -ni any -w "$WORK/wan.pcap" udp >/dev/null 2>&1 & PIDS+=("$!")
-    ip netns exec "$CA" tcpdump -ni ca-lan -w "$WORK/client-ca.pcap" 'udp port 3478' >/dev/null 2>&1 & PIDS+=("$!")
-    ip netns exec "$CB" tcpdump -ni cb-lan -w "$WORK/client-cb.pcap" 'udp port 3478' >/dev/null 2>&1 & PIDS+=("$!")
+    ip netns exec "$CA" tcpdump -ni ca-lan -w "$WORK/client-ca.pcap" udp >/dev/null 2>&1 & PIDS+=("$!")
+    ip netns exec "$CB" tcpdump -ni cb-lan -w "$WORK/client-cb.pcap" udp >/dev/null 2>&1 & PIDS+=("$!")
     for ns in "$WAN" "$RA" "$RB" "$CA" "$CB"; do
       ip netns exec "$ns" ip route >"$WORK/route-$ns.txt"
     done
