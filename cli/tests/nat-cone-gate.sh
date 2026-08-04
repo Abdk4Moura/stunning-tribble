@@ -94,6 +94,9 @@ start_service() {
         (while sleep 1; do ip netns exec "$router" conntrack -L -p udp 2>/dev/null; done) >"$WORK/conntrack-$router.log" 2>&1 & PIDS+=("$!")
       fi
     done
+    ip netns exec "$WAN" sysctl -a 2>/dev/null | grep -E '(^|\.)rp_filter|ip_forward' >"$WORK/sysctl-$WAN.txt"
+    ip netns exec "$WAN" iptables -S >"$WORK/iptables-$WAN.txt"
+    ip netns exec "$WAN" iptables -t nat -S >"$WORK/iptables-nat-$WAN.txt"
   fi
   ip netns exec "$WAN" env PORT="$BACKEND_PORT" FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
     FIL_ICE_SERVERS="[{\"urls\":[\"stun:$SERVER_IP:$STUN_PORT\"]}]" python3 "$CLI_DIR/../backend/app.py" \
