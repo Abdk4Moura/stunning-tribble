@@ -64,9 +64,15 @@ setup_topology() {
   route_default "$CA" 10.221.1.1 || return 1; route_default "$CB" 10.221.2.1 || return 1
   route_default "$RA" 10.220.1.1 || return 1; route_default "$RB" 10.220.2.1 || return 1
   ip -n "$WAN" route add 10.220.1.2/32 dev wa || return 1; ip -n "$WAN" route add 10.220.2.2/32 dev wb || return 1
+  if [[ -n "${NO_NAT:-}" ]]; then
+    ip -n "$WAN" route add 10.221.1.0/24 via 10.220.1.2 || return 1
+    ip -n "$WAN" route add 10.221.2.0/24 via 10.220.2.2 || return 1
+  fi
   for r in "$RA" "$RB"; do
     ip netns exec "$r" iptables -A FORWARD -j ACCEPT || return 1
-    ip netns exec "$r" iptables -t nat -A POSTROUTING -o "${r##*-}-wan" -j MASQUERADE || return 1
+    if [[ -z "${NO_NAT:-}" ]]; then
+      ip netns exec "$r" iptables -t nat -A POSTROUTING -o "${r##*-}-wan" -j MASQUERADE || return 1
+    fi
   done
 }
 
@@ -122,6 +128,13 @@ pair_and_transfer() {
     sleep .25
   done
   kill "$pair_pid" 2>/dev/null || true; wait "$pair_pid" 2>/dev/null || true
+  if [[ -n "${NO_NAT:-}" ]]; then
+    local control_out
+    control_out=$(find "$out" -type f -name payload.bin | head -1)
+    [ -n "$control_out" ] && cmp -s "$payload" "$control_out" || die "positive control payload was not byte-exact"
+    printf 'nat-cone-gate: PASS: no-NAT positive control, direct route, byte-exact payload\n'
+    return 0
+  fi
   [ -s "$cfg_a/devices.json" ] || die "pairing produced no sender device store"
   [ -s "$cfg_b/devices.json" ] || die "pairing produced no receiver device store"
   rm -f "$WORK/pair-a.log" "$WORK/pair-b.log"
