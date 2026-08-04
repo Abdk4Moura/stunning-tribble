@@ -11044,7 +11044,11 @@ async fn send_cmd(
         // rung-1: a direct attempt that timed out without an authenticated QUIC
         // connection falls back to the WebRTC establish (unchanged path).
         for (pid, info, (n, sec)) in conn.expired_direct() {
-            conn.establish_as(info, None).await?;
+            conn.establish_as(info, None)
+                .await
+                .with_context(|| {
+                    format!("direct fallback establish failed for peer {pid} on send path")
+                })?;
             if let Some(l) = conn.link_mut(&pid) {
                 l.expected_secret = Some((n, sec));
             }
@@ -13574,7 +13578,11 @@ async fn recv_cmd(
         reap_warm_bootstraps(&mut pending_bootstrap);
         // rung-1: direct attempt timed out → fall back to WebRTC (unchanged).
         for (pid, info, (n, sec)) in conn.expired_direct() {
-            conn.maybe_adopt(&info, true).await?;
+            conn.maybe_adopt(&info, true)
+                .await
+                .with_context(|| {
+                    format!("direct fallback establish failed for peer {pid} on receive path")
+                })?;
             if let Some(l) = conn.link_mut(&pid) {
                 l.expected_secret = Some((n, sec));
             }
