@@ -15,9 +15,13 @@ the GitHub release notes.
 
   **The affected platforms differ by version. Read the row that applies to you.**
 
+  **Every released version is affected.** The pattern is present in `cli-v0.1.0`,
+  the first tag this project ever cut, so there is no unaffected release to
+  upgrade sideways to. What changes across versions is which platforms:
+
   | versions | affected platforms |
   |---|---|
-  | 0.5.0 through **0.7.1** | **all platforms**, including Linux and macOS |
+  | **every release through 0.7.1** (0.1.0 onward, stable and beta alike) | **all platforms**, including Linux and macOS |
   | **0.7.2** through 0.7.6 | **Windows only** |
 
   Through 0.7.1 the receiver opened the `.part` path with a bare
