@@ -119,6 +119,8 @@ pair_and_transfer() {
   ip netns exec "$WAN" env FILAMENT_CONFIG_DIR="$cfg_b" FILAMENT_STUN="$SERVER_IP:$STUN_PORT" timeout 90 \
     "$BIN" -v recv "$code" -y --remember boxA --dir "$out" --server "$server" >"$WORK/pair-b.log" 2>&1 || die "pairing failed"
   kill "$pair_pid" 2>/dev/null || true; wait "$pair_pid" 2>/dev/null || true
+  [ -s "$cfg_a/devices.json" ] || die "pairing produced no sender device store"
+  [ -s "$cfg_b/devices.json" ] || die "pairing produced no receiver device store"
   rm -f "$WORK/pair-a.log" "$WORK/pair-b.log"
   ip netns exec "$CB" env FILAMENT_CONFIG_DIR="$cfg_b" FILAMENT_DIRECT_NO_PUBLIC=1 \
     FILAMENT_HOLEPUNCH=1 FILAMENT_STUN="$SERVER_IP:$STUN_PORT" timeout 90 \
