@@ -77,6 +77,9 @@ setup_topology() {
 }
 
 start_service() {
+  if [[ -n "${CAPTURE:-}" ]] && command -v tcpdump >/dev/null; then
+    ip netns exec "$WAN" tcpdump -ni any -w "$WORK/wan.pcap" udp >/dev/null 2>&1 & PIDS+=("$!")
+  fi
   ip netns exec "$WAN" env PORT="$BACKEND_PORT" FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
     FIL_ICE_SERVERS="[{\"urls\":[\"stun:$SERVER_IP:$STUN_PORT\"]}]" python3 "$CLI_DIR/../backend/app.py" \
     >"$WORK/backend.log" 2>&1 & PIDS+=("$!")
