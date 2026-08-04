@@ -13581,7 +13581,7 @@ async fn recv_cmd(
             conn.maybe_adopt(&info, true)
                 .await
                 .with_context(|| {
-                    format!("direct fallback establish failed for peer {pid} on receive path")
+                    format!("direct fallback adoption failed for peer {pid} on receive path")
                 })?;
             if let Some(l) = conn.link_mut(&pid) {
                 l.expected_secret = Some((n, sec));
