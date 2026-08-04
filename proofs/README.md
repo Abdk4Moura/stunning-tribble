@@ -138,6 +138,22 @@ The model sweeps transient windows of 0.5, 1, 2, 3, and 5+ rungs against both
 It reports their divergence band and requires the separating measurement to
 instrument the ICE condition and conntrack state directly, never file arrival.
 
+The retention precondition is a code question before it is a network question:
+
+| State a preserve-state rung would hold | Current ceiling |
+|---|---|
+| WebRTC peer, ICE/DTLS sockets, NAT mapping and conntrack state | No application-level lifetime ceiling; unbounded for this design |
+| QUIC transport file descriptor and UDP port | Bounded count per link and configured worker count, but no bounded retention lifetime |
+| `direct_pending` expiry | Bounded by its existing expiry timer |
+| `buffered_offers` / `deferred_left` entries | Per-peer maps, but no independent global retention bound |
+| Active link slot | One active entry per peer; lifetime still follows the held transport |
+
+If retention cannot be bounded, the sweep says preserve-state is unsafe and
+fail-fast wins by default, making condition instrumentation unnecessary. If it
+can be bounded, the candidate fixes diverge across the full 0.5-5 rung range,
+so condition instrumentation remains worth taking. This is an inventory only;
+it does not implement state preservation.
+
 Gate 0 also reads `MAX_ATTEMPTS` from `cli/src/main.rs` and `WATCHDOG_SECS` from
 `cli/src/net.rs`; a source change fails the model until its calibration is
 explicitly redone.
