@@ -133,6 +133,11 @@ state destruction, but whether its ICE condition was transient remains
 unmeasured; #38's later roster recovery is external and is not credited to the
 ladder.
 
+The model sweeps transient windows of 0.5, 1, 2, 3, and 5+ rungs against both
+ fail-fast and preserve-state candidates, with retention boundedness explicit.
+It reports their divergence band and requires the separating measurement to
+instrument the ICE condition and conntrack state directly, never file arrival.
+
 Gate 0 also reads `MAX_ATTEMPTS` from `cli/src/main.rs` and `WATCHDOG_SECS` from
 `cli/src/net.rs`; a source change fails the model until its calibration is
 explicitly redone.
