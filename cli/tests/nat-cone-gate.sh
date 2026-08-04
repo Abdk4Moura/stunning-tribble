@@ -89,6 +89,10 @@ start_service() {
     for router in "$RA" "$RB"; do
       ip netns exec "$router" iptables -S >"$WORK/iptables-$router.txt"
       ip netns exec "$router" iptables -t nat -S >"$WORK/iptables-nat-$router.txt"
+      ip netns exec "$router" sysctl -a 2>/dev/null | grep -E '(^|\.)rp_filter|ip_forward' >"$WORK/sysctl-$router.txt"
+      if command -v conntrack >/dev/null; then
+        (while sleep 1; do ip netns exec "$router" conntrack -L -p udp 2>/dev/null; done) >"$WORK/conntrack-$router.log" 2>&1 & PIDS+=("$!")
+      fi
     done
   fi
   ip netns exec "$WAN" env PORT="$BACKEND_PORT" FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
