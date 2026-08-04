@@ -38,6 +38,13 @@ listed here is explicitly NOT release-blocking.
   entered; marker absent means EINVAL comes from before our callback, and the
   search moves to `opendir` and the directory `getattr`.
 
+**AT THE TAG, one check that is owed and would otherwise be lost.** Before
+cutting, ask claude-advisor whether anything in the release notes overstates
+what shipped. I asked them for this and they accepted; the request existed only
+between us and I am leaving, so it is written here instead. This is the same
+shape as the deferral recorded in the 0.7.2 release notes that nothing tracked,
+and it would have failed the same way.
+
 **NOT blocking, do not let them delay the tag:** the cone-NAT investigation,
 the stall-ladder model, the 6.0s figure, the branch audit, the fmt gate, the
 alert-path test email, the kernel upgrade, the swap threshold.
@@ -220,6 +227,13 @@ Other rules earned today:
   no release-blocking work.
 - **claude-advisor** — security verified release-ready; other items parked
   until after the tag.
+
+**claude-advisor's review role does not derive from the coordinator and does not
+lapse with one.** The user confirmed it first-hand on 2026-07-27 and it has run
+continuously since. An incoming coordinator inherits a correspondent, not
+authority over the gates, and advisor will treat a relayed instruction the way
+they have treated every other relayed claim: by checking it. That is not a
+challenge, it is how they work, and it is better read here than discovered.
 
 **The build token is coordinator-held: ONE build at a time.** Release the slot
 only when `pgrep -x cargo` and `pgrep -x rustc` are both empty, and gate on
