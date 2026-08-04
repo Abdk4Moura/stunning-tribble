@@ -48,14 +48,14 @@ the GitHub release notes.
   the download-style directories where untrusted content lands.
 
   Demonstrated rather than inferred: with the fix removed, the helper returns
-  `Ok(File)` whose resolved handle path is the outside directory, and the
-  regression tests that assert the refusal go red.
-
-  When that control was run it produced two reds. It now produces one:
-  `win_safe_open_part_refuses_symlink` was deleted along with `safe_open_part`,
-  which had zero production callers. The remaining red is
-  `win_safe_resume_part_refuses_symlink`. Anyone repeating the control on this
-  release should expect one, and the difference is a deletion, not a regression.
+  `Ok(File)` whose resolved handle path is the outside directory, and one
+  regression test that asserts the refusal goes red
+  (`win_safe_resume_part_refuses_symlink`). Two did at the time of the finding;
+  the second, `win_safe_open_part_refuses_symlink`, was removed along with the
+  dead `safe_open_part` helper it exercised, so the difference is a deletion and
+  not a regression. Both numbers are recorded because two independent reds were
+  stronger evidence that the control discriminated than one is, and that was
+  true when the finding was made.
 
 ## [0.7.6] - 2026-07-31
 
