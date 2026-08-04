@@ -915,6 +915,7 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
 
         let root_fd = std::fs::OpenOptions::new()
             .read(true)
@@ -934,16 +935,15 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
         how.mode = if (flags & (libc::O_CREAT | libc::O_TMPFILE)) != 0 { 0o644 } else { 0 };
         how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
 
-        let rel_str = rel_path.to_str().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 path")
-        })?;
         // openat2 takes a C string: the pathname must be NUL-terminated. Passing a
-        // bare &str's `.as_ptr()` makes the kernel read past the bytes into adjacent
-        // memory until a stray NUL, creating the file under a garbage-suffixed name
-        // (layout-dependent, so it corrupts transfers intermittently). CString adds
-        // the terminator (and rejects an interior NUL, which no real path contains).
-        let rel_c = std::ffi::CString::new(rel_str).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL byte")
+        // a bare `&str` would reject non-UTF-8 names before the syscall. CString
+        // preserves the native path bytes, adds the terminator, and rejects an
+        // interior NUL (the only invalid byte possible for a real path).
+        let rel_c = std::ffi::CString::new(rel_path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains an interior NUL byte",
+            )
         })?;
 
         let fd = unsafe {
@@ -980,6 +980,7 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
     #[cfg(not(target_os = "linux"))]
     {
         use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
 
         let mut current = std::fs::OpenOptions::new()
             .read(true)
@@ -992,8 +993,12 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
             match comp {
                 Component::Normal(name) => {
                     let is_last = i == components.len() - 1;
-                    let name_cstr = std::ffi::CString::new(name.to_str().unwrap_or(""))
-                        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 path component"))?;
+                    let name_cstr = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "path component contains an interior NUL byte",
+                        )
+                    })?;
 
                     let mut walk_flags = libc::O_CLOEXEC | libc::O_NOFOLLOW;
                     if is_last {
