@@ -4,6 +4,36 @@ All notable, user-facing changes to filament are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+## [Unreleased]
+
+### Security
+
+- **Windows: `.part` files are no longer opened through a symlink or directory
+  junction.** On Windows, every release through 0.7.6 opened the `.part` path with
+  a plain `OpenOptions::new().write(true).open(path)`, which follows a reparse
+  point. A junction or symlink planted at the `.part` path therefore redirected the
+  write outside the download directory, with the authority of the user running
+  filament. The three `#[cfg(unix)]` twins of these helpers have always fstat'd the
+  open file descriptor and refused non-regular files, so **unix builds were never
+  affected**; only the Windows arm was missing the check. Fixed by opening with
+  `FILE_FLAG_OPEN_REPARSE_POINT` so the link is not followed, then rejecting
+  reparse points and non-regular files via `GetFileInformationByHandle` on the open
+  handle (handle-based, so there is no TOCTOU window between the check and the use).
+
+  **Scope, stated plainly.** This is a local issue, not a remote one. An attacker
+  must already be able to write into the download directory in order to plant the
+  reparse point; a remote sender can influence the `.part` filename but cannot
+  create the link. It is not remote code execution. What it is, is a confused
+  deputy that converts write access to the download directory into write access
+  anywhere the running user can write, which matters most on shared machines and in
+  the download-style directories where untrusted content lands.
+
+  Affects all released versions through 0.7.6 (0.5.0 onward; the Windows half was
+  explicitly deferred in the 0.7.2 and 0.7.3 notes and the deferral was never
+  closed). Demonstrated rather than inferred: with the fix removed, the helper
+  returns `Ok(File)` whose resolved handle path is the outside directory, and the
+  two regression tests that assert the refusal go red.
+
 ## [0.7.6] - 2026-07-31
 
 `shell` defaults to a native PTY, and file transfers stop spuriously rejecting
