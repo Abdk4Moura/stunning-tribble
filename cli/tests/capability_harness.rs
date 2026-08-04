@@ -1687,7 +1687,7 @@ mod captured_child_tests {
 /// It is ignored because it reports an open defect, not because it is unreliable;
 /// ignored tests can decay exactly like the unreferenced gates found on 2026-08-03.
 #[test]
-#[ignore = "reports the open #31 recovery defect; enable with cargo test --features test-hooks -- --ignored after recovery is fixed"]
+#[ignore = "reports #31 ladder exhaustion after recovery attempts; enable with cargo test --features test-hooks -- --ignored after recovery is fixed"]
 fn freeze_stall_detector_classification() {
     let h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
