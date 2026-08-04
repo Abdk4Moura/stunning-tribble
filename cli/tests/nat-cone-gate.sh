@@ -90,6 +90,11 @@ start_service() {
   for _ in $(seq 1 40); do ip netns exec "$WAN" curl --noproxy '*' -fsS "http://$SERVER_IP:$BACKEND_PORT/api/health" >/dev/null 2>&1 && break; sleep .25; done
   ip netns exec "$WAN" curl --noproxy '*' -fsS "http://$SERVER_IP:$BACKEND_PORT/api/health" >/dev/null || return 1
   grep -q READY "$WORK/stun.log" || return 1
+  if [[ -n "${CAPTURE:-}" ]]; then
+    for client in "$CA" "$CB"; do
+      ip netns exec "$client" curl --noproxy '*' -fsS "http://$SERVER_IP:$BACKEND_PORT/api/config" >"$WORK/config-$client.json" || return 1
+    done
+  fi
 }
 
 prove_cone() {
