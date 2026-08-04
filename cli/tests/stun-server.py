@@ -22,7 +22,7 @@ def main():
         ip = struct.unpack("!I", socket.inet_aton(source[0]))[0]
         value = b"\x00\x01" + struct.pack("!H", source[1] ^ (COOKIE >> 16)) + struct.pack("!I", ip ^ COOKIE)
         attr = struct.pack("!HH", 0x0020, len(value)) + value
-        response = struct.pack("!HHII", 0x0101, len(attr), COOKIE, 0) + txid + attr
+        response = struct.pack("!HHI", 0x0101, len(attr), COOKIE) + txid + attr
         sock.sendto(response, source)
 
 
