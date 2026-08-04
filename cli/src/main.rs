@@ -17303,7 +17303,7 @@ mod tests {
     fn minted_pair_nameplate_round_trips_through_pairing_router() {
         for _ in 0..100 {
             let code = format!(
-                "{}-{}-{}",
+                "{}-{}",
                 crate::pake::words::mint_words(),
                 crate::pake::words::mint_pair_nameplate(),
             );
