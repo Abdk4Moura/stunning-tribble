@@ -114,7 +114,7 @@ pair_and_transfer() {
   ip netns exec "$WAN" env FILAMENT_CONFIG_DIR="$cfg_a" FILAMENT_DIRECT=0 FILAMENT_STUN="$SERVER_IP:$STUN_PORT" \
     "$BIN" -v pair --word "$word" --name boxB --server "$server" >"$WORK/pair-a.log" 2>&1 &
   local pair_pid=$!
-  for _ in $(seq 1 60); do code=$(grep -oiE "gigantic-element-[0-9]{3,5}" "$WORK/pair-a.log" | head -1 || true); [ -n "$code" ] && break; sleep .25; done
+  for _ in $(seq 1 60); do code=$(grep -oiE "gigantic-element-[0-9]{4,5}" "$WORK/pair-a.log" | head -1 || true); [ -n "$code" ] && break; sleep .25; done
   [ -n "$code" ] || die "pair code was not produced"
   ip netns exec "$WAN" env FILAMENT_CONFIG_DIR="$cfg_b" FILAMENT_DIRECT=0 FILAMENT_STUN="$SERVER_IP:$STUN_PORT" timeout 90 \
     "$BIN" -v pair "$code" --name boxA --server "$server" >"$WORK/pair-b.log" 2>&1 || die "pairing failed"
