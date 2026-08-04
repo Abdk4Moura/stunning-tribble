@@ -2848,7 +2848,6 @@ async fn up_cmd(
     // Shell without a dropped account is owner-equivalent at any uid. A dropped
     // account is only safer if it cannot read FILAMENT_CONFIG_DIR.
     if shell_policy.enables_l2() {
-        let can_use_user = platform::Paths::shell_argv(None, None, shell_user.as_deref()).1;
         let warning = match shell_user.as_deref() {
             Some(user) if can_use_user => {
                 format!("  note: shell PTYs run as {user}; verify this account cannot read FILAMENT_CONFIG_DIR or the drop is cosmetic")
