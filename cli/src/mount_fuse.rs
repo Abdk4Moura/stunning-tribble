@@ -682,6 +682,22 @@ mod tests {
     }
 
     #[test]
+    fn inodemap_non_utf8_names_do_not_collide() {
+        let mut map = InodeMap::new(true);
+        let a = PathBuf::from(std::ffi::OsString::from_vec(b"name-\xff".to_vec()));
+        let b = PathBuf::from(std::ffi::OsString::from_vec(b"name-\xfe".to_vec()));
+        assert_ne!(map.intern(a), map.intern(b));
+    }
+
+    #[test]
+    fn inodemap_non_utf8_name_round_trips() {
+        let mut map = InodeMap::new(true);
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"name-\xff".to_vec()));
+        let ino = map.intern(path.clone());
+        assert_eq!(map.intern(path), ino);
+    }
+
+    #[test]
     fn kind_to_fuse_fifo_when_supported() {
         let stat = FileStat { ino: 1, kind: None, mode: 0o010644, size: 0, blocks: 0, mtime: 0, nlink: 1, uid: 0, gid: 0, blksize: 512 };
         assert_eq!(kind_to_fuse(&stat, true), FileType::NamedPipe);
