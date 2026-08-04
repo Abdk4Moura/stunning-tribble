@@ -108,13 +108,16 @@ pair_and_transfer() {
   local server="http://$SERVER_IP:$BACKEND_PORT" word="gigantic-element" code=""
   local cfg_a="$WORK/cfg-a" cfg_b="$WORK/cfg-b" out="$WORK/out" payload="$WORK/payload.bin"
   mkdir -p "$cfg_a" "$cfg_b" "$out"; head -c 262144 /dev/urandom >"$payload"
-  ip netns exec "$CA" env FILAMENT_CONFIG_DIR="$cfg_a" FILAMENT_STUN="$SERVER_IP:$STUN_PORT" \
-    "$BIN" send "$payload" --word "$word" --remember boxB --server "$server" >"$WORK/pair-a.log" 2>&1 &
+  # Pair on the lab WAN before placing the already-known identities behind
+  # separate NATs. The gate measures NAT traversal for the known-device path;
+  # pairing itself is not the route under test.
+  ip netns exec "$WAN" env FILAMENT_CONFIG_DIR="$cfg_a" FILAMENT_STUN="$SERVER_IP:$STUN_PORT" \
+    "$BIN" -v send "$payload" --word "$word" --remember boxB --server "$server" >"$WORK/pair-a.log" 2>&1 &
   local pair_pid=$!
   for _ in $(seq 1 60); do code=$(grep -oiE "$word-[0-9]{3,5}" "$WORK/pair-a.log" | head -1 || true); [ -n "$code" ] && break; sleep .25; done
   [ -n "$code" ] || die "pair code was not produced"
-  ip netns exec "$CB" env FILAMENT_CONFIG_DIR="$cfg_b" FILAMENT_STUN="$SERVER_IP:$STUN_PORT" timeout 90 \
-    "$BIN" recv "$code" -y --remember boxA --dir "$out" --server "$server" >"$WORK/pair-b.log" 2>&1 || die "pairing failed"
+  ip netns exec "$WAN" env FILAMENT_CONFIG_DIR="$cfg_b" FILAMENT_STUN="$SERVER_IP:$STUN_PORT" timeout 90 \
+    "$BIN" -v recv "$code" -y --remember boxA --dir "$out" --server "$server" >"$WORK/pair-b.log" 2>&1 || die "pairing failed"
   kill "$pair_pid" 2>/dev/null || true; wait "$pair_pid" 2>/dev/null || true
   rm -f "$WORK/pair-a.log" "$WORK/pair-b.log"
   ip netns exec "$CB" env FILAMENT_CONFIG_DIR="$cfg_b" FILAMENT_DIRECT_NO_PUBLIC=1 \
