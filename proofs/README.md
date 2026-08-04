@@ -140,13 +140,20 @@ instrument the ICE condition and conntrack state directly, never file arrival.
 
 The retention precondition is a code question before it is a network question:
 
-| State a preserve-state rung would hold | Bound achievable? | Cost / open question |
+| State a preserve-state rung would hold | Bound status | Cost / open question |
 |---|---|---|
-| WebRTC peer, ICE/DTLS sockets, NAT mapping and conntrack state | Not established; no application-level lifetime ceiling today | Holding a peer/socket for one rung costs roughly 15 seconds of resources; conntrack belongs to the kernel/NAT and may not be holdable by the app at all |
-| QUIC transport file descriptor and UDP port | Count bounded per link and configured worker count; lifetime bound would be designable | One descriptor/port per retained transport for at most one rung, but the lifetime policy does not exist today |
-| `direct_pending` expiry | Yes; bounded by its existing expiry timer | Pending state already has an expiry path |
-| `buffered_offers` / `deferred_left` entries | Not independently bounded globally | Per-peer entries are small, but a global retention ceiling would need to be designed |
-| Active link slot | Count one per peer; lifetime bound follows the retained transport | No extra slot count, but it inherits the transport lifetime question |
+| WebRTC peer and ICE/DTLS sockets | BOUNDABLE | Holding a peer/socket for one rung costs roughly 15 seconds of resources; a lifetime policy does not exist today |
+| NAT mapping and conntrack state | NOT OURS TO BOUND | Host defaults are `nf_conntrack_udp_timeout=30s` and `nf_conntrack_udp_timeout_stream=120s`; the five-rung ladder is 75s. The #50 dumps showed `[UNREPLIED]` entries, which use the shorter timeout, so the kernel can expire the state before the ladder finishes. The app can send traffic but cannot set the entry's lifetime. |
+| QUIC transport file descriptor and UDP port | BOUNDABLE | One descriptor/port per retained transport for at most one rung; count is bounded per link and configured worker count, but the lifetime policy does not exist today |
+| `direct_pending` expiry | BOUNDED TODAY | Pending state already has an expiry path |
+| `buffered_offers` / `deferred_left` entries | BOUNDABLE | Per-peer entries are small, but a global retention ceiling would need to be designed |
+| Active link slot | BOUNDABLE | Count one per peer; lifetime still follows the retained transport |
+
+The host check also showed live UDP entries in both states: `[UNREPLIED]` and
+`[ASSURED]`. That matters because only the latter has the longer stream timeout;
+the relevant #50 entries were `[UNREPLIED]`. This is evidence that conntrack is
+not ours to bound for the ICE case, not evidence that every NAT flow expires in
+30 seconds.
 
 If retention cannot be bounded, naive preserve-state without an explicit
 lifetime bound is unsafe and fail-fast wins for that design. A bounded
