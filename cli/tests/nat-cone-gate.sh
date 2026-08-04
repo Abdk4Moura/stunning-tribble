@@ -2,6 +2,8 @@
 # Slice B: two Filament peers behind independently configured cone NATs.
 # Proves the NAT class first, then asserts hole-punched, byte-exact transfer.
 # To verify only the netns lab and prober, run: FILAMENT_BIN=/bin/true bash "$0"
+# Prediction for COTURN=1 before the controlled rerun: srflx candidates should
+# appear on both peers, followed by candidate pairs and a new pass/failure stage.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -88,10 +90,15 @@ start_service() {
   ip netns exec "$WAN" env PORT="$BACKEND_PORT" FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
     FIL_ICE_SERVERS="[{\"urls\":[\"stun:$SERVER_IP:$STUN_PORT\"]}]" python3 "$CLI_DIR/../backend/app.py" \
     >"$WORK/backend.log" 2>&1 & PIDS+=("$!")
-  ip netns exec "$WAN" python3 "$STUN" 0.0.0.0 "$STUN_PORT" >"$WORK/stun.log" 2>&1 & PIDS+=("$!")
+  if [[ -n "${COTURN:-}" ]] && command -v turnserver >/dev/null; then
+    ip netns exec "$WAN" turnserver -n --log-file "$WORK/coturn.log" --listening-ip "$SERVER_IP" \
+      --listening-port "$STUN_PORT" --no-cli --no-tls --no-dtls --realm=nat-gate >"$WORK/stun.log" 2>&1 & PIDS+=("$!")
+  else
+    ip netns exec "$WAN" python3 "$STUN" 0.0.0.0 "$STUN_PORT" >"$WORK/stun.log" 2>&1 & PIDS+=("$!")
+  fi
   for _ in $(seq 1 40); do ip netns exec "$WAN" curl --noproxy '*' -fsS "http://$SERVER_IP:$BACKEND_PORT/api/health" >/dev/null 2>&1 && break; sleep .25; done
   ip netns exec "$WAN" curl --noproxy '*' -fsS "http://$SERVER_IP:$BACKEND_PORT/api/health" >/dev/null || return 1
-  grep -q READY "$WORK/stun.log" || return 1
+  if [[ -z "${COTURN:-}" ]]; then grep -q READY "$WORK/stun.log" || return 1; fi
   if [[ -n "${CAPTURE:-}" ]]; then
     for client in "$CA" "$CB"; do
       ip netns exec "$client" curl --noproxy '*' -fsS "http://$SERVER_IP:$BACKEND_PORT/api/config" >"$WORK/config-$client.json" || return 1
