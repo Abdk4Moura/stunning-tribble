@@ -11,6 +11,19 @@ transferable part and the reason most of the rest happened.
 A release is wanted and is gated on finishing the tasks below. Everything not
 listed here is explicitly NOT release-blocking.
 
+> **NUMBERING WARNING, read before citing anything.** Numbers in this document
+> are GitHub PRs unless a line says otherwise. There is a separate internal
+> task tracker whose numbers OVERLAP and do not correspond. GitHub issue #64 is
+> a winget-schema ticket, not the mount bug, and an earlier draft of a registry
+> entry nearly cited it as such. The three real issues opened today are:
+>
+> - **#135** mount: non-UTF-8 filenames are not enumerable through the mount
+> - **#134** nat-cone-gate: the emulation drops peer checks, so the gate is not
+>   a product signal
+> - **#133** ack-loss-repro: assign an actionable verdict
+>
+> Cite those, never a task number.
+
 **BLOCKING, one item:**
 
 - **mount gate 3, non-UTF-8 filenames through the mount.** Two server-side
