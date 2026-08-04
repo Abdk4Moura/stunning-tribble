@@ -12,6 +12,8 @@ outcomes before the model prints any recommendation.
 """
 from dataclasses import dataclass
 from itertools import combinations, product
+import os
+import re
 
 
 MAX_ATTEMPTS = 5
@@ -24,6 +26,30 @@ FAILURE_STATE = {
     "ice-connect": "ice",
     "roster-re-adoption": "roster",
 }
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def source_ladder_constants():
+    """Read the ladder bounds from the Rust tree this model claims to describe."""
+    main = open(os.path.join(ROOT, "cli", "src", "main.rs")).read()
+    net = open(os.path.join(ROOT, "cli", "src", "net.rs")).read()
+    attempts = re.search(r"const\s+MAX_ATTEMPTS:\s*u32\s*=\s*(\d+)", main)
+    watchdog = re.search(r"pub\s+const\s+WATCHDOG_SECS:\s*u64\s*=\s*(\d+)", net)
+    if not attempts or not watchdog:
+        raise SystemExit("LADDER COHERENCE FAILED: could not find MAX_ATTEMPTS or WATCHDOG_SECS")
+    return int(attempts.group(1)), int(watchdog.group(1))
+
+
+def coherence_guard():
+    source_attempts, source_watchdog = source_ladder_constants()
+    if (source_attempts, source_watchdog) != (MAX_ATTEMPTS, WATCHDOG_SECS):
+        raise SystemExit(
+            "LADDER COHERENCE FAILED: source changed to "
+            f"MAX_ATTEMPTS={source_attempts}, WATCHDOG_SECS={source_watchdog}; "
+            "recalibrate this model before changing its constants"
+        )
+    print(f"COHERENCE: source MAX_ATTEMPTS={source_attempts}, WATCHDOG_SECS={source_watchdog}")
 
 
 @dataclass(frozen=True)
@@ -102,6 +128,7 @@ def explore():
 
 
 def main():
+    coherence_guard()
     gate_0()
     for name, observation in CALIBRATIONS.items():
         outcomes = [
