@@ -2,6 +2,9 @@
 # Slice B: two Filament peers behind independently configured cone NATs.
 # Proves the NAT class first, then asserts hole-punched, byte-exact transfer.
 # To verify only the netns lab and prober, run: FILAMENT_BIN=/bin/true bash "$0"
+# IMPORTANT: this gate is not currently a product signal. Its failure is
+# located in the emulation at the receiving router inbound path. See
+# docs/testing-nat-cone-gate.md. Do not wire it into CI until that is fixed.
 # Prediction for COTURN=1 before the controlled rerun: srflx candidates should
 # appear on both peers, followed by candidate pairs and a new pass/failure stage.
 set -euo pipefail
