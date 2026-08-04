@@ -120,6 +120,23 @@ should be read as asserting A. The discriminator is whether the sender ever
 
 All three proofs are required CI gates (`.github/workflows/proof.yml`).
 
+## Companion: the stall-ladder model
+
+`stall_ladder_model.py` models the five-rung correction ladder with transience,
+failure type, and discarded recovery state as explicit inputs. Gate 0 first
+reproduces the observed #31, #50, and #38 outcomes: five attempts, 75 seconds,
+and no ladder recovery. It then shows the boundary: a transient condition can
+recover on a later rung only when the state that rung needs was retained. The
+calibrated incidents are persistent and discard that state, so the ladder is
+delay rather than recovery; #38's later roster recovery is external and is not
+credited to the ladder.
+
+Run it with:
+
+```
+python3 stall_ladder_model.py
+```
+
 ## The properties
 
 - **I1 glare-freedom** (safety, structural): of any pair the lexically-lesser
