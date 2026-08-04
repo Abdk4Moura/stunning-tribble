@@ -11,12 +11,13 @@ Run this file directly. Gate 0 first reproduces the observed #31, #50, and #38
 outcomes before the model prints any recommendation.
 """
 from dataclasses import dataclass
-from itertools import product
+from itertools import combinations, product
 
 
 MAX_ATTEMPTS = 5
 WATCHDOG_SECS = 15
 TRANSIENT, PERSISTENT = "transient", "persistent"
+UNDETERMINED = "undetermined"
 
 FAILURE_STATE = {
     "data-freeze": "transport",
@@ -54,20 +55,28 @@ def run_ladder(environment: Environment, attempts=MAX_ATTEMPTS) -> Result:
 
 
 CALIBRATIONS = {
-    "#31 data freeze": Environment(PERSISTENT, "data-freeze", frozenset({"transport"})),
-    "#50 NAT ICE": Environment(PERSISTENT, "ice-connect", frozenset({"ice", "conntrack"})),
-    "#38 roster re-adoption": Environment(PERSISTENT, "roster-re-adoption", frozenset({"roster"})),
+    # These observations establish the terminal shape, not transience. Both a
+    # persistent condition and a transient condition whose required state was
+    # discarded produce five failed rungs.
+    "#31 data freeze": Environment(UNDETERMINED, "data-freeze", frozenset({"transport"})),
+    # #50 directly observed new sockets, new mapped ports, and invalidated
+    # conntrack state on every drop. Whether ICE itself was transient remains
+    # unmeasured.
+    "#50 NAT ICE": Environment(UNDETERMINED, "ice-connect", frozenset({"ice", "conntrack"})),
+    "#38 roster re-adoption": Environment(UNDETERMINED, "roster-re-adoption", frozenset({"roster"})),
 }
 
 
 def gate_0():
     """Reproduce the observed terminal behavior before making recommendations."""
-    expected = {name: (False, MAX_ATTEMPTS, MAX_ATTEMPTS * WATCHDOG_SECS) for name in CALIBRATIONS}
+    expected = (False, MAX_ATTEMPTS, MAX_ATTEMPTS * WATCHDOG_SECS)
     failures = []
-    for name, environment in CALIBRATIONS.items():
-        result = run_ladder(environment)
-        if (result.recovered, result.attempts, result.elapsed_secs) != expected[name]:
-            failures.append(f"{name}: expected {expected[name]}, got {result}")
+    for name, observation in CALIBRATIONS.items():
+        for transience in (PERSISTENT, TRANSIENT):
+            environment = Environment(transience, observation.failure_type, observation.discarded_state)
+            result = run_ladder(environment)
+            if (result.recovered, result.attempts, result.elapsed_secs) != expected:
+                failures.append(f"{name} ({transience}): expected {expected}, got {result}")
     if failures:
         raise SystemExit("GATE 0 FAILED: model does not reproduce observations\n" + "\n".join(failures))
     print("GATE 0: PASS (#31, #50, #38 all exhaust 5 rungs without ladder recovery)")
@@ -76,10 +85,16 @@ def gate_0():
 def explore():
     """Show whether any modeled environment lets a later rung recover."""
     outcomes = []
+    all_states = sorted(set(FAILURE_STATE.values()))
+    discarded_states = [
+        frozenset(subset)
+        for size in range(len(all_states) + 1)
+        for subset in combinations(all_states, size)
+    ]
     for transience, failure_type, discarded in product(
         (PERSISTENT, TRANSIENT),
         sorted(FAILURE_STATE),
-        (frozenset(), frozenset(FAILURE_STATE.values())),
+        discarded_states,
     ):
         result = run_ladder(Environment(transience, failure_type, discarded))
         outcomes.append((transience, failure_type, bool(discarded), result))
@@ -88,17 +103,22 @@ def explore():
 
 def main():
     gate_0()
-    for name, environment in CALIBRATIONS.items():
-        result = run_ladder(environment)
+    for name, observation in CALIBRATIONS.items():
+        outcomes = [
+            run_ladder(Environment(transience, observation.failure_type, observation.discarded_state))
+            for transience in (PERSISTENT, TRANSIENT)
+        ]
         external = "; #38 later recovery is external roster adoption" if name == "#38 roster re-adoption" else ""
-        print(f"{name}: {result.attempts} attempts, {result.elapsed_secs}s, {result.terminal}{external}")
+        print(f"{name}: persistent={outcomes[0].terminal}, transient+discarded={outcomes[1].terminal}{external}")
 
     later_rung_successes = [
         row for row in explore() if row[3].recovered and row[3].attempts > 1
     ]
     print(f"TRANSIENT + RETAINED STATE: later-rung recoveries={len(later_rung_successes)}")
-    print("CALIBRATED REGIME: persistent failures with discarded recovery state")
-    print("RECOMMENDATION: do not raise MAX_ATTEMPTS or WATCHDOG_SECS; the observed ladder is delay, not recovery.")
+    print("OBSERVED FAILURES: indistinguishable between (a) persistent conditions and (b) transient conditions whose required state the teardown discarded.")
+    print("SEPARATING MEASUREMENT: measure whether the transient window exceeds one watchdog rung while preserving the candidate's ICE/conntrack state.")
+    print("#50 evidence: each drop destroyed ICE progress, sockets, mapped ports, and conntrack state; whether the underlying ICE condition was transient remains unmeasured.")
+    print("RECOMMENDATION: do not raise MAX_ATTEMPTS or WATCHDOG_SECS until transience is measured; persistent failure favors fail-fast, transient+discarded state favors preserving state.")
 
 
 if __name__ == "__main__":
