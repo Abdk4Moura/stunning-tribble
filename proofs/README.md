@@ -140,19 +140,19 @@ instrument the ICE condition and conntrack state directly, never file arrival.
 
 The retention precondition is a code question before it is a network question:
 
-| State a preserve-state rung would hold | Current ceiling |
-|---|---|
-| WebRTC peer, ICE/DTLS sockets, NAT mapping and conntrack state | No application-level lifetime ceiling; unbounded for this design |
-| QUIC transport file descriptor and UDP port | Bounded count per link and configured worker count, but no bounded retention lifetime |
-| `direct_pending` expiry | Bounded by its existing expiry timer |
-| `buffered_offers` / `deferred_left` entries | Per-peer maps, but no independent global retention bound |
-| Active link slot | One active entry per peer; lifetime still follows the held transport |
+| State a preserve-state rung would hold | Bound achievable? | Cost / open question |
+|---|---|---|
+| WebRTC peer, ICE/DTLS sockets, NAT mapping and conntrack state | Not established; no application-level lifetime ceiling today | Holding a peer/socket for one rung costs roughly 15 seconds of resources; conntrack belongs to the kernel/NAT and may not be holdable by the app at all |
+| QUIC transport file descriptor and UDP port | Count bounded per link and configured worker count; lifetime bound would be designable | One descriptor/port per retained transport for at most one rung, but the lifetime policy does not exist today |
+| `direct_pending` expiry | Yes; bounded by its existing expiry timer | Pending state already has an expiry path |
+| `buffered_offers` / `deferred_left` entries | Not independently bounded globally | Per-peer entries are small, but a global retention ceiling would need to be designed |
+| Active link slot | Count one per peer; lifetime bound follows the retained transport | No extra slot count, but it inherits the transport lifetime question |
 
-If retention cannot be bounded, the sweep says preserve-state is unsafe and
-fail-fast wins by default, making condition instrumentation unnecessary. If it
-can be bounded, the candidate fixes diverge across the full 0.5-5 rung range,
-so condition instrumentation remains worth taking. This is an inventory only;
-it does not implement state preservation.
+If retention cannot be bounded, naive preserve-state without an explicit
+lifetime bound is unsafe and fail-fast wins for that design. A bounded
+preserve-state variant remains live: the sweep says the candidates diverge
+across the full 0.5-5 rung range, so condition instrumentation remains worth
+taking. This is an inventory only; it does not implement state preservation.
 
 Gate 0 also reads `MAX_ATTEMPTS` from `cli/src/main.rs` and `WATCHDOG_SECS` from
 `cli/src/net.rs`; a source change fails the model until its calibration is

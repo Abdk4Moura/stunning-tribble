@@ -182,10 +182,10 @@ def main():
         suffix = "" if bounded else " (preserve-state unsafe)"
         print(f"CANDIDATES retention={retention}: divergent windows={divergent or 'none'}{suffix}")
     print("RETENTION PRECONDITION: bounded retention is required before the condition measurement is worth taking.")
-    print("RETENTION DECISION: if no bounded ceiling exists, preserve-state is unsafe and fail-fast wins by default; otherwise measure the condition directly.")
+    print("RETENTION DECISION: unbounded retention rules out preserve-state WITHOUT AN EXPLICIT LIFETIME BOUND; a bounded variant remains in the divergent set and still requires condition measurement.")
     print("SEPARATING MEASUREMENT: instrument the condition directly (when the ICE pair becomes usable again and when the conntrack entry reappears), not when the file arrives.")
     print("#50 evidence: each drop destroyed ICE progress, sockets, mapped ports, and conntrack state; whether the underlying ICE condition was transient remains unmeasured.")
-    print("RECOMMENDATION: bounded retention diverges for windows 0.5-5 rungs; unbounded retention makes preserve-state unsafe. Measure the condition directly before choosing.")
+    print("RECOMMENDATION: bounded retention diverges for windows 0.5-5 rungs; naive unbounded retention is unsafe. Measure the condition directly before choosing fail-fast versus bounded preserve-state.")
 
 
 if __name__ == "__main__":
