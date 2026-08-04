@@ -935,9 +935,11 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
         how.mode = if (flags & (libc::O_CREAT | libc::O_TMPFILE)) != 0 { 0o644 } else { 0 };
         how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
 
-        // openat2 takes a C string: the pathname must be NUL-terminated. Passing a
-        // a bare `&str` would reject non-UTF-8 names before the syscall. CString
-        // preserves the native path bytes, adds the terminator, and rejects an
+        // openat2 takes a C string: the pathname must be NUL-terminated. In 2026-07,
+        // a bare `.as_ptr()` made the kernel read past the bytes into adjacent memory
+        // until a stray NUL, creating a garbage-suffixed name and corrupting transfers
+        // intermittently. In 2026-08, routing through `&str` rejected non-UTF-8 names.
+        // CString preserves native path bytes, adds the terminator, and rejects an
         // interior NUL (the only invalid byte possible for a real path).
         let rel_c = std::ffi::CString::new(rel_path.as_os_str().as_bytes()).map_err(|_| {
             std::io::Error::new(
@@ -993,6 +995,8 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
             match comp {
                 Component::Normal(name) => {
                     let is_last = i == components.len() - 1;
+                    // Unlike the openat2 path, the old `to_str().unwrap_or("")` here
+                    // silently substituted an empty name instead of rejecting it.
                     let name_cstr = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
