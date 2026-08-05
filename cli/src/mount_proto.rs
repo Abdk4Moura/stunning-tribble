@@ -922,17 +922,25 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
             .custom_flags(libc::O_DIRECTORY)
             .open(root)?;
 
-        // RESOLVE_BENEATH = 0x02: refuse to escape the root via symlinks/..
-        // RESOLVE_NO_MAGICLINKS = 0x04: refuse magic links (/proc/self/fd, etc.)
-        const RESOLVE_BENEATH: u64 = 0x02;
-        const RESOLVE_NO_MAGICLINKS: u64 = 0x04;
+        // Values per include/uapi/linux/openat2.h:
+        //   RESOLVE_NO_XDEV 0x01, RESOLVE_NO_MAGICLINKS 0x02,
+        //   RESOLVE_NO_SYMLINKS 0x04, RESOLVE_BENEATH 0x08.
+        // The previous 0x02/0x04 were NO_MAGICLINKS and NO_SYMLINKS, so openat2
+        // was never actually scoped beneath the root.
+        const RESOLVE_BENEATH: u64 = 0x08;
+        const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 
         let mut how: libc::open_how = unsafe { std::mem::zeroed() };
         how.flags = (flags as u64) | libc::O_CLOEXEC as u64;
         // mode is meaningful ONLY with O_CREAT/O_TMPFILE; openat2 returns EINVAL if
-        // mode is non-zero without one of them. Set 0o644 for creates (matching the
-        // non-Linux fallback), 0 otherwise (e.g. the O_WRONLY resume open).
-        how.mode = if (flags & (libc::O_CREAT | libc::O_TMPFILE)) != 0 { 0o644 } else { 0 };
+        // mode is non-zero without one of them. libc::O_TMPFILE includes the
+        // O_DIRECTORY bit, so `flags & O_TMPFILE != 0` is true for every directory
+        // open; require the FULL O_TMPFILE bit set instead so a plain directory
+        // open keeps mode 0. Set 0o644 for creates (matching the non-Linux
+        // fallback), 0 otherwise (e.g. the O_WRONLY resume open).
+        let creating = (flags & libc::O_CREAT) != 0
+            || (flags & libc::O_TMPFILE) == libc::O_TMPFILE;
+        how.mode = if creating { 0o644 } else { 0 };
         how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
 
         // openat2 takes a C string: the pathname must be NUL-terminated. In 2026-07,
@@ -941,7 +949,14 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
         // intermittently. In 2026-08, routing through `&str` rejected non-UTF-8 names.
         // CString preserves native path bytes, adds the terminator, and rejects an
         // interior NUL (the only invalid byte possible for a real path).
-        let rel_c = std::ffi::CString::new(rel_path.as_os_str().as_bytes()).map_err(|_| {
+        // An empty rel path is the share root itself; openat2 rejects "" with
+        // ENOENT, so normalize it to "." (which resolves to the root fd).
+        let rel_os = if rel_path.as_os_str().as_bytes().is_empty() {
+            std::ffi::OsStr::new(".")
+        } else {
+            rel_path.as_os_str()
+        };
+        let rel_c = std::ffi::CString::new(rel_os.as_bytes()).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "path contains an interior NUL byte",
