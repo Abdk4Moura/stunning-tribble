@@ -741,7 +741,7 @@ fn do_open(root: &PathBuf, path: &str, flags: i32, open_files: &mut HashMap<u64,
         Ok(r) => r.to_path_buf(),
         Err(_) => return Err(MountError { code: EACCES, msg: "path not beneath root".into() }),
     };
-    let file = safe_open_beneath(root, &rel, flags)
+    let file = safe_open_beneath(root, &rel, flags, false)
         .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     let fh = *next_fh;
     *next_fh += 1;
@@ -765,7 +765,7 @@ fn do_create(root: &PathBuf, path: &str, mode: u32, flags: i32, open_files: &mut
     let create_flags = flags | libc::O_CREAT | libc::O_EXCL;
     #[cfg(not(unix))]
     let create_flags = flags;
-    let file = safe_open_beneath(root, &rel, create_flags)
+    let file = safe_open_beneath(root, &rel, create_flags, false)
         .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     #[cfg(unix)]
     {
@@ -907,8 +907,19 @@ fn open_file(path: &std::path::Path, flags: i32) -> std::io::Result<std::fs::Fil
 /// escape the root. On Linux, uses openat2 with RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS.
 /// On other Unix, uses a component-walk with O_NOFOLLOW. On non-Unix, falls back
 /// to canonicalize + starts_with (best-effort, no TOCTOU guarantee).
+/// Open a file beneath a root directory, refusing to follow symlinks that
+/// escape the root. On Linux, uses openat2 with RESOLVE_BENEATH. On other Unix,
+/// uses a component-walk with O_NOFOLLOW. On non-Unix, falls back to canonicalize
+/// + starts_with (best-effort, no TOCTOU guarantee).
+///
+/// `deny_symlinks` adds RESOLVE_NO_SYMLINKS on the Linux openat2 arm. The mount
+/// path passes false (a symlink beneath the share root is legitimate content);
+/// the .part writers pass true (the final component is a file being created and
+/// must never be a symlink, so an attacker who can write into the download
+/// directory cannot plant a symlink that redirects an incoming transfer within
+/// that directory).
 #[cfg(unix)]
-pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32) -> std::io::Result<std::fs::File> {
+pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32, deny_symlinks: bool) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     // On Linux 5.6+, use openat2 with RESOLVE_BENEATH for strictest enforcement.
@@ -929,6 +940,7 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
         // was never actually scoped beneath the root.
         const RESOLVE_BENEATH: u64 = 0x08;
         const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+        const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 
         let mut how: libc::open_how = unsafe { std::mem::zeroed() };
         how.flags = (flags as u64) | libc::O_CLOEXEC as u64;
@@ -941,7 +953,14 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
         let creating = (flags & libc::O_CREAT) != 0
             || (flags & libc::O_TMPFILE) == libc::O_TMPFILE;
         how.mode = if creating { 0o644 } else { 0 };
-        how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
+        // Mount path allows symlinks beneath the root (legitimate content);
+        // the .part writers add NO_SYMLINKS so the final component can never
+        // be a symlink planted inside the download directory.
+        let mut resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
+        if deny_symlinks {
+            resolve |= RESOLVE_NO_SYMLINKS;
+        }
+        how.resolve = resolve;
 
         // openat2 takes a C string: the pathname must be NUL-terminated. In 2026-07,
         // a bare `.as_ptr()` made the kernel read past the bytes into adjacent memory
@@ -1019,6 +1038,11 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
                         )
                     })?;
 
+                    // O_NOFOLLOW on every component: this arm always refuses
+                    // symlinks, regardless of `deny_symlinks`. That satisfies the
+                    // .part requirement outright and is stricter than Linux for the
+                    // mount path (a mount symlink resolves as content on Linux but
+                    // is refused here). Known, safe divergence; never the reverse.
                     let mut walk_flags = libc::O_CLOEXEC | libc::O_NOFOLLOW;
                     if is_last {
                         // Last component: OR in the caller's requested access mode
@@ -1059,9 +1083,18 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
 }
 
 #[cfg(not(unix))]
-pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32) -> std::io::Result<std::fs::File> {
+pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32, deny_symlinks: bool) -> std::io::Result<std::fs::File> {
     // Non-Unix fallback: canonicalize + starts_with (no TOCTOU guarantee)
     let full = root.join(rel_path);
+    // deny_symlinks callers (the .part writers) bypass this fallback on their
+    // native arms, but refuse a reparse point here too so the property holds
+    // even if the path is ever routed through this arm.
+    if deny_symlinks && std::fs::symlink_metadata(&full)?.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path is a symlink and symlinks are refused",
+        ));
+    }
     let canonical = full.canonicalize()?;
     let root_canonical = root.canonicalize()?;
     if !canonical.starts_with(&root_canonical) {
