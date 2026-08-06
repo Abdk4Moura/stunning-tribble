@@ -157,6 +157,13 @@ differently-shaped query.
 - **Caution that declines to look is not caution.** Deferring to a second reader
   *adds* a reading; declining to run a test *removes* one. The first is
   sometimes wrong because it is slow. The second is almost always wrong.
+- **Only the FIRST failing assertion in a test is ever observed.** Every
+  assertion after it is unmeasured in exactly the run that was supposed to
+  measure it. So order assertions by what you are trying to PROVE, not by the
+  order the code does things. Found by opencode-worker on #148: their first red
+  run panicked on the `Err` arm before the outside-state assertion could run,
+  so the arm that proves the mutation actually landed had never executed, in
+  red or green. The output looks identical either way.
 - **A claim with no mechanism survives on politeness.** See the build token,
   below.
 
@@ -173,7 +180,10 @@ differently-shaped query.
 | build token | **A claim with no enforcement.** Nothing in the repo, filesystem or daemon knows who holds it. Two agents held contradictory beliefs about it today; only one build ran, and only because the other asked first. Needs a lock file plus a wrapper that refuses to exec cargo without it. |
 | xats cursor skip | On re-register the daemon sets the new row's cursor to current max, silently skipping anything from the outage. `agents_identity_idx` is already unique on `(device, team, name)` — that is the key the cursor belongs on. The schema default is `0`, replay-everything, so skip-to-max is a deliberate override at one call site, not a missing feature. |
 | agent_id ledger | Interim, per-agent. `/root/.xats-agent-ids-chief-ux.txt`. Implemented, one live clean run, discriminating power MEASURED via a synthetic row plus a negative control showing the message is invisible to an agent knowing only its current id. Degrades every time a new agent joins, since none can retrofit it. |
+| #148, mount mutating ops | **Fixed on `design/mount-containment`, cannot merge.** Five handlers ran raw `std::fs` on a lexically-checked path, so a pre-existing symlink inside a share was followed and the write landed outside it. Now parent-dirfd + bare-name `*at`; `do_truncate` reuses `safe_open_beneath`, which is byte-for-byte untouched (verified by md5). Five tests shown RED on the outside-unchanged arms, then green. Write mounts only. |
+| #149, config-dir key clone | **Fixed on PR #150, cannot merge.** `FILAMENT_CONFIG_DIR` set to a fresh path, from a shell with cwd `$HOME`, silently cloned the production identity into it — `migrate_legacy()` used a **cwd-relative** legacy path that resolved to the live config. Now refuses under an override and pins legacy to `home_dir()`. Regression test shown RED with keys actually appearing in the override. |
 | kernel 6.8.0-136 | Not done. Owner asked for it before the release; deferred behind the release itself, then the outage. The reboot takes down signaling, every agent session, and any build. |
+| Claude Code reaping | **Fixed for chief-ux only.** `/root/xats-heartbeat-chief-ux.sh`, a detached pinger, closes the gap CLAUDE.md records as "fix pending". Five reaps in under an hour before it; none after. It re-reads the agent_id each cycle rather than capturing it, so it survives the id changing. Every other CC agent on the bus still has this problem. |
 | `is_err()` in the new symlink test | Weak assertion, the form rig-verifier themselves caught on #113. It discriminates today and was shown red. Assert the error kind if you touch it. |
 
 ---
