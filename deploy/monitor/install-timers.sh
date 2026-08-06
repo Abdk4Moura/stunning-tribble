@@ -141,7 +141,14 @@ verify() {
     # `list-timers` is shape-agnostic and shows both kinds. If you "improve"
     # this to a property query, you must branch on the timer's schedule type,
     # and you will reintroduce a false alarm that looks like a real finding.
-    if ! systemctl list-timers --all --no-pager 2>/dev/null | grep -q "$t"; then
+    #
+    # DO NOT use `grep -q` here. With `pipefail` set, an early-exiting grep
+    # SIGPIPEs the still-writing `systemctl` (exit 141), so a PRESENT timer can
+    # be reported as NOT SCHEDULED. Measured 2026-08-05: the `grep -q` form
+    # false-missed 23/80 runs; plain `grep -F` consuming all output missed
+    # 0/80. The two "dead timer, daemon-reload clears it" incidents recorded
+    # here were likely this flake, not dead timers.
+    if ! systemctl list-timers --all --no-pager 2>/dev/null | grep -F "$t" >/dev/null; then
       echo "install-timers: ENABLED BUT NOT SCHEDULED: $t"; bad=1; continue
     fi
     echo "install-timers: OK: $t enabled, active, scheduled"
