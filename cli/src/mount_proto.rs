@@ -1191,6 +1191,7 @@ fn open_parent_beneath(root: &std::path::Path, dir_rel: &std::path::Path) -> std
     {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
 
         let root_fd = std::fs::OpenOptions::new()
             .read(true)
@@ -1521,11 +1522,13 @@ mod tests {
         let victim = f.outside.join("victim.txt");
         std::fs::write(&victim, b"AAAA").unwrap();
         let res = call_mount(&f.share, MountOp::Unlink { path: f.enc("evil/victim.txt") }).await;
+        // Outside-state assertion first: in the RED run this is the arm that
+        // proves the pre-fix code actually reached outside the share.
+        assert!(victim.exists(), "outside victim must survive the refused unlink");
         assert!(
             matches!(res, MountResult::Err(_)),
             "unlink through escaping symlink must be refused: {res:?}"
         );
-        assert!(victim.exists(), "outside victim must survive the refused unlink");
         f.cleanup();
     }
 
@@ -1535,12 +1538,12 @@ mod tests {
         let f = EscapeFixture::new("mkdir");
         let res = call_mount(&f.share, MountOp::MkDir { path: f.enc("evil/newdir"), mode: 0o755 }).await;
         assert!(
-            matches!(res, MountResult::Err(_)),
-            "mkdir through escaping symlink must be refused: {res:?}"
-        );
-        assert!(
             !f.outside.join("newdir").exists(),
             "outside dir must NOT be created by the refused mkdir"
+        );
+        assert!(
+            matches!(res, MountResult::Err(_)),
+            "mkdir through escaping symlink must be refused: {res:?}"
         );
         f.cleanup();
     }
@@ -1552,11 +1555,11 @@ mod tests {
         let outside_dir = f.outside.join("emptydir");
         std::fs::create_dir(&outside_dir).unwrap();
         let res = call_mount(&f.share, MountOp::RmDir { path: f.enc("evil/emptydir") }).await;
+        assert!(outside_dir.exists(), "outside dir must survive the refused rmdir");
         assert!(
             matches!(res, MountResult::Err(_)),
             "rmdir through escaping symlink must be refused: {res:?}"
         );
-        assert!(outside_dir.exists(), "outside dir must survive the refused rmdir");
         f.cleanup();
     }
 
@@ -1570,14 +1573,14 @@ mod tests {
             from: f.enc("evil/a.txt"),
             to: f.enc("renamed.txt"),
         }).await;
-        assert!(
-            matches!(res, MountResult::Err(_)),
-            "rename out of the share must be refused: {res:?}"
-        );
         assert!(a.exists(), "outside source must survive the refused rename");
         assert!(
             !f.share.join("renamed.txt").exists(),
             "refused rename must not create the destination inside the share either"
+        );
+        assert!(
+            matches!(res, MountResult::Err(_)),
+            "rename out of the share must be refused: {res:?}"
         );
         f.cleanup();
     }
@@ -1589,14 +1592,14 @@ mod tests {
         let victim = f.outside.join("victim.txt");
         std::fs::write(&victim, b"AAAA").unwrap();
         let res = call_mount(&f.share, MountOp::Truncate { path: f.enc("evil/victim.txt"), size: 0 }).await;
-        assert!(
-            matches!(res, MountResult::Err(_)),
-            "truncate through escaping symlink must be refused: {res:?}"
-        );
         assert_eq!(
             std::fs::metadata(&victim).unwrap().len(),
             4,
             "outside victim length must stay 4 after the refused truncate"
+        );
+        assert!(
+            matches!(res, MountResult::Err(_)),
+            "truncate through escaping symlink must be refused: {res:?}"
         );
         f.cleanup();
     }
