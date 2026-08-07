@@ -840,6 +840,12 @@ fn do_unlink(root: &PathBuf, path: &str) -> Result<Value, MountError> {
 }
 
 fn do_mkdir(root: &PathBuf, path: &str, mode: u32) -> Result<Value, MountError> {
+    // Bound the mode at the protocol boundary: a mode is 12 significant bits
+    // (0o7777). libc::mode_t is u32 on Linux but u16 on Darwin, so an unmasked
+    // peer value would truncate differently per platform. Masking here makes
+    // "the same request means the same thing on every platform" (the property
+    // this whole change exists for) and lets the syscall boundary cast freely.
+    let mode = mode & 0o7777;
     let resolved = resolve(root, path)?;
     let rel = resolved
         .strip_prefix(root)
@@ -1330,14 +1336,18 @@ fn beneath_rmdir(parent: &std::path::Path, name: &std::path::Path) -> std::io::R
 #[cfg(unix)]
 fn beneath_mkdir(parent: &std::os::fd::OwnedFd, name: &std::ffi::CStr, mode: u32) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
-    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) } != 0 {
+    // mode_t is a platform alias (u32 on Linux, u16 on Darwin), so cast at the
+    // syscall boundary. The caller masks to 0o7777, so the narrowing never
+    // truncates a meaningful bit.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode as libc::mode_t) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // Apply the unmasked mode with fchmodat + AT_SYMLINK_NOFOLLOW, so a
-    // symlink swapped in for the entry cannot be chmodded instead. The
-    // freshly-created entry cannot be a symlink, so the nofollow flag never
-    // rejects a legitimate directory.
-    if unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+    // fchmodat is not subject to umask (mkdirat is), so applying the mode here
+    // gives the peer exactly what it asked for. AT_SYMLINK_NOFOLLOW means a
+    // symlink swapped in for the entry cannot be chmodded instead; the
+    // freshly-created entry cannot be a symlink, so it never rejects a
+    // legitimate directory.
+    if unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
