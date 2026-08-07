@@ -1237,6 +1237,7 @@ fn open_parent_beneath(root: &std::path::Path, dir_rel: &std::path::Path) -> std
     {
         use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
         use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
         use std::path::Component;
 
         let root_file = std::fs::OpenOptions::new()
