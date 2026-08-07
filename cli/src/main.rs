@@ -16971,8 +16971,21 @@ mod tests {
 
         // Must refuse: the .part path is a symlink even though its target stays
         // beneath the parent. BENEATH alone would follow it and open the victim.
+        // Assert the ERROR KIND, not merely is_err(). ELOOP is exactly what
+        // RESOLVE_NO_SYMLINKS / O_NOFOLLOW returns for a symlink, so an unrelated
+        // failure (missing fixture -> NotFound, permissions -> PermissionDenied,
+        // path typo -> InvalidInput) cannot satisfy this. safe_resume_part wraps
+        // the os error into a message error (raw_os_error() is None), and the
+        // FilesystemLoop variant is gated behind the unstable `io_error_more`
+        // feature on this toolchain, so compare its stable Debug name instead of
+        // naming the variant.
         let result = safe_resume_part(&part_path).await;
-        assert!(result.is_err(), "must refuse to resume through a same-dir symlink");
+        let err = result.expect_err("must refuse a same-dir .part symlink");
+        assert_eq!(
+            format!("{:?}", err.kind()),
+            "FilesystemLoop",
+            "must refuse a same-dir .part symlink with ELOOP, got: {err:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
