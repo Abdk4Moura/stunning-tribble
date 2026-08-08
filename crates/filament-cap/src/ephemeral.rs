@@ -315,6 +315,238 @@ impl AuthKey {
     }
 }
 
+/// Compact invitation token (v2 wire format, #186).
+///
+/// The 0.8.0 invitation token was hex-inside-JSON inside base64: ~530 bytes
+/// for ~116 bytes of real content, which rendered a QR too wide for a normal
+/// terminal. This is a self-contained binary replacement with a NEW signature
+/// domain: the owner's Ed25519 signature covers the token bytes before the
+/// trailing sig, so verification needs only the owner's public key. The owner
+/// is selected by an 8-byte fingerprint; the full issuer is supplied by the
+/// verifying daemon after the fingerprint matches. No tag, audience, or JSON.
+///
+/// Layout (bytes): version(1) | issuer_fp(8) | enroll_pub(32) | caps(1) |
+/// expires_min(4 LE) | max_offline_s(4 LE) | reuse(1) | ephemeral(1) |
+/// enroll_private_key(32) | owner_name_len(2 LE) | owner_name(N) | sig(64).
+/// `sig` covers everything before it.
+#[derive(Clone)]
+pub struct InvitationV2 {
+    pub issuer_fp: [u8; 8],
+    pub enroll_pub: [u8; 32],
+    pub caps: Vec<String>,
+    pub expires: u64,
+    pub max_offline: u64,
+    pub reuse: Reuse,
+    pub ephemeral: bool,
+    pub enroll_private_key: [u8; 32],
+    pub owner_name: String,
+    pub sig: [u8; 64],
+}
+
+const INV_CAP_TRANSFER: u8 = 1 << 0;
+const INV_CAP_MOUNT: u8 = 1 << 1;
+const INV_CAP_SHELL: u8 = 1 << 2;
+const INV_CAP_WRITE: u8 = 1 << 3;
+const INV_CAP_ALL_PORTS: u8 = 1 << 4;
+const INV_REUSE_REUSABLE: u8 = 255;
+
+fn inv_caps_to_bitmask(caps: &[String]) -> Result<u8> {
+    let mut mask = 0u8;
+    for c in caps {
+        mask |= match c.as_str() {
+            "transfer" => INV_CAP_TRANSFER,
+            "mount" => INV_CAP_MOUNT,
+            "shell" => INV_CAP_SHELL,
+            "write" => INV_CAP_WRITE,
+            "all-ports" => INV_CAP_ALL_PORTS,
+            other => bail!("cannot encode capability '{other}' in a v2 invitation"),
+        };
+    }
+    Ok(mask)
+}
+
+fn inv_caps_from_bitmask(mask: u8) -> Vec<String> {
+    let mut out = Vec::new();
+    if mask & INV_CAP_TRANSFER != 0 { out.push("transfer".into()); }
+    if mask & INV_CAP_MOUNT != 0 { out.push("mount".into()); }
+    if mask & INV_CAP_SHELL != 0 { out.push("shell".into()); }
+    if mask & INV_CAP_WRITE != 0 { out.push("write".into()); }
+    if mask & INV_CAP_ALL_PORTS != 0 { out.push("all-ports".into()); }
+    out
+}
+
+/// Deterministic 8-byte fingerprint of a public key; selects the owner.
+pub fn issuer_fingerprint(pubkey: &[u8; 32]) -> [u8; 8] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(pubkey);
+    let d = h.finalize();
+    let mut fp = [0u8; 8];
+    fp.copy_from_slice(&d[..8]);
+    fp
+}
+
+/// #186: the enrollment rendezvous channel is derived from an 8-byte issuer
+/// fingerprint, so a compact invitation (which carries only the fingerprint)
+/// can subscribe without the full owner key. The daemon derives the same
+/// channel from its own key. A channel is a rendezvous point, not an
+/// authorization; the enrollment response validates the signature.
+pub fn enroll_channel_fp(fp: &[u8; 8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"filament-enroll-v1");
+    h.update(fp);
+    hex::encode(h.finalize().as_slice())
+}
+
+fn inv_reuse_to_byte(r: &Reuse) -> u8 {
+    match r {
+        Reuse::Once => 0,
+        Reuse::N(n) => (*n as u8).min(250),
+        Reuse::Reusable => INV_REUSE_REUSABLE,
+    }
+}
+
+fn inv_reuse_from_byte(b: u8) -> Reuse {
+    match b {
+        0 => Reuse::Once,
+        255 => Reuse::Reusable,
+        n => Reuse::N(n as u32),
+    }
+}
+
+impl InvitationV2 {
+    /// Mint a compact invitation. `enroll_private_key` is the seed the joiner
+    /// must possess to claim it; `owner_uk` signs the compact prefix.
+    pub fn mint(
+        owner_uk: &Ed25519KeyPair,
+        enroll_private_key: [u8; 32],
+        caps: Vec<String>,
+        expires: u64,
+        max_offline: u64,
+        reuse: Reuse,
+        ephemeral: bool,
+        owner_name: String,
+    ) -> Result<Self> {
+        let caps = caps.iter().map(|c| super::capability::canonical_capability(c)).collect::<Result<Vec<_>>>()?;
+        let owner_pub: [u8; 32] = owner_uk.public_key().as_ref().try_into().map_err(|_| anyhow!("bad owner pub"))?;
+        let enroll_kp = Ed25519KeyPair::from_seed_unchecked(&enroll_private_key).map_err(|e| anyhow!("{e}"))?;
+        let enroll_pub: [u8; 32] = enroll_kp.public_key().as_ref().try_into().map_err(|_| anyhow!("bad enroll pub"))?;
+        let mut t = InvitationV2 {
+            issuer_fp: issuer_fingerprint(&owner_pub),
+            enroll_pub,
+            caps,
+            expires,
+            max_offline,
+            reuse,
+            ephemeral,
+            enroll_private_key,
+            owner_name,
+            sig: [0u8; 64],
+        };
+        let prefix = t.prefix_bytes();
+        let sig = owner_uk.sign(&prefix);
+        t.sig.copy_from_slice(sig.as_ref());
+        Ok(t)
+    }
+
+    /// The bytes the signature covers: everything before the trailing sig.
+    fn prefix_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.push(0x02);
+        b.extend_from_slice(&self.issuer_fp);
+        b.extend_from_slice(&self.enroll_pub);
+        let mask = inv_caps_to_bitmask(&self.caps).unwrap_or(0);
+        b.push(mask);
+        b.extend_from_slice(&(self.expires as u32).to_le_bytes());
+        b.extend_from_slice(&(self.max_offline as u32).to_le_bytes());
+        b.push(inv_reuse_to_byte(&self.reuse));
+        b.push(if self.ephemeral { 1 } else { 0 });
+        b.extend_from_slice(&self.enroll_private_key);
+        b.extend_from_slice(&(self.owner_name.len() as u16).to_le_bytes());
+        b.extend_from_slice(self.owner_name.as_bytes());
+        b
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = self.prefix_bytes();
+        b.extend_from_slice(&self.sig);
+        b
+    }
+
+    pub fn from_bytes(raw: &[u8]) -> Option<Self> {
+        if raw.len() < 86 + 64 {
+            return None;
+        }
+        if raw[0] != 0x02 {
+            return None;
+        }
+        let sig_off = raw.len() - 64;
+        let mut issuer_fp = [0u8; 8];
+        issuer_fp.copy_from_slice(&raw[1..9]);
+        let mut enroll_pub = [0u8; 32];
+        enroll_pub.copy_from_slice(&raw[9..41]);
+        let mask = raw[41];
+        let expires = u32::from_le_bytes(raw[42..46].try_into().ok()?) as u64;
+        let max_offline = u32::from_le_bytes(raw[46..50].try_into().ok()?) as u64;
+        let reuse = inv_reuse_from_byte(raw[50]);
+        let ephemeral = raw[51] == 1;
+        let mut enroll_private_key = [0u8; 32];
+        enroll_private_key.copy_from_slice(&raw[52..84]);
+        let name_len = u16::from_le_bytes(raw[84..86].try_into().ok()?) as usize;
+        if 86 + name_len > sig_off {
+            return None;
+        }
+        let owner_name = String::from_utf8(raw[86..86 + name_len].to_vec()).ok()?;
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&raw[sig_off..]);
+        Some(InvitationV2 {
+            issuer_fp,
+            enroll_pub,
+            caps: inv_caps_from_bitmask(mask),
+            expires,
+            max_offline,
+            reuse,
+            ephemeral,
+            enroll_private_key,
+            owner_name,
+            sig,
+        })
+    }
+
+    /// The fingerprint selects the owner; the signature binds. Verify both
+    /// against the given owner public key.
+    pub fn verify_against_owner(&self, owner_pub: &[u8; 32]) -> bool {
+        if self.issuer_fp != issuer_fingerprint(owner_pub) {
+            return false;
+        }
+        let prefix = self.prefix_bytes();
+        let pubkey = UnparsedPublicKey::new(&ED25519, owner_pub);
+        pubkey.verify(&prefix, &self.sig).is_ok()
+    }
+
+    /// Reconstruct a full AuthKey for the verifying owner (its own issuer),
+    /// for the daemon's principal registration. The signature is the compact
+    /// token's (a different domain than the legacy canonical); nothing re-verifies
+    /// it after enrollment, so this is for carrying the ceiling forward.
+    pub fn to_auth_key(&self, owner_pub: &[u8; 32]) -> AuthKey {
+        let kind_tag = if self.caps.iter().any(|c| c == "mount") { "join-device" } else { "join-person" };
+        AuthKey {
+            issuer: *owner_pub,
+            enroll_pub: self.enroll_pub,
+            caps: self.caps.clone(),
+            audience: Vec::new(),
+            expires: self.expires,
+            reuse: self.reuse.clone(),
+            ephemeral: self.ephemeral,
+            max_offline: self.max_offline,
+            tag: kind_tag.to_string(),
+            sig: self.sig,
+            version: 2,
+        }
+    }
+}
+
 impl serde::Serialize for Reuse {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
@@ -350,8 +582,17 @@ impl<'de> serde::Deserialize<'de> for Reuse {
 /// NONCE IS NOT ON THE WIRE. The verifier always knows the challenge it issued;
 /// keeping it on the wire enables replay attacks. The verifier passes its held
 /// nonce to verify() directly.
+pub enum EnrollmentPrincipal {
+    /// #186 compact-invitation join: the verifier checks the 8-byte owner
+    /// fingerprint + the compact signature, then reconstructs the full AuthKey
+    /// under its own issuer.
+    Compact(InvitationV2),
+    /// Legacy mint/enroll path (hidden): a full AuthKey with its own issuer.
+    Legacy(AuthKey),
+}
+
 pub struct EnrollmentPayload {
-    pub auth_key: AuthKey,
+    pub principal: EnrollmentPrincipal,
     pub device_pub: [u8; 32],
     /// Possession proof: sign(possession_msg(nonce, device_pub, verifier_pub))
     /// with enroll_priv (proves holder possesses auth key's private half).
@@ -376,7 +617,7 @@ impl EnrollmentPayload {
     /// Build payload: sign possession messages with both keys.
     /// verifier_pub binds this payload to a specific verifier.
     pub fn build(
-        auth_key: AuthKey,
+        principal: EnrollmentPrincipal,
         device_pub: [u8; 32],
         enroll_keypair: &Ed25519KeyPair,
         device_keypair: &Ed25519KeyPair,
@@ -391,7 +632,7 @@ impl EnrollmentPayload {
         let mut ds = [0u8; 64];
         ds.copy_from_slice(device_sig.as_ref());
         EnrollmentPayload {
-            auth_key,
+            principal,
             device_pub,
             enroll_possession_sig: es,
             device_possession_sig: ds,
@@ -408,14 +649,34 @@ impl EnrollmentPayload {
         verifier_nonce: &[u8; 32],
         verifier_pub: &[u8; 32],
     ) -> Result<([u8; 32], [u8; 32], AuthKey)> {
-        // 1. Verify auth key under trusted owner (audience + expiry + sig + issuer + mesh)
-        self.auth_key.verify_against_owner(owner_pub, verifier_pub)?;
+        // 1. Verify the principal under the trusted owner. Compact: the 8-byte
+        //    fingerprint selects the owner, the Ed25519 signature binds.
+        //    Legacy: the auth key's signature + issuer equality.
+        let enroll_pub = match &self.principal {
+            EnrollmentPrincipal::Compact(inv) => {
+                if !inv.verify_against_owner(owner_pub) {
+                    bail!("invitation signature or fingerprint invalid");
+                }
+                if now_secs() >= inv.expires {
+                    bail!("invitation expired");
+                }
+                inv.enroll_pub
+            }
+            EnrollmentPrincipal::Legacy(ak) => {
+                ak.verify_against_owner(owner_pub, verifier_pub)?;
+                ak.enroll_pub
+            }
+        };
+        let ak = match &self.principal {
+            EnrollmentPrincipal::Compact(inv) => inv.to_auth_key(owner_pub),
+            EnrollmentPrincipal::Legacy(ak) => ak.clone(),
+        };
 
         // 2. Build possession message from VERIFIER's held nonce, NOT payload bytes
         let msg = enrollment_possession_msg(verifier_nonce, &self.device_pub, verifier_pub);
 
         // 3. Verify enroll possession
-        let enroll_pkey = UnparsedPublicKey::new(&ED25519, &self.auth_key.enroll_pub);
+        let enroll_pkey = UnparsedPublicKey::new(&ED25519, &enroll_pub);
         enroll_pkey
             .verify(&msg, &self.enroll_possession_sig)
             .map_err(|_| anyhow!("enroll possession proof invalid"))?;
@@ -426,27 +687,42 @@ impl EnrollmentPayload {
             .verify(&msg, &self.device_possession_sig)
             .map_err(|_| anyhow!("device possession proof invalid"))?;
 
-        Ok((self.auth_key.enroll_pub, self.device_pub, self.auth_key.clone()))
+        Ok((enroll_pub, self.device_pub, ak))
     }
 
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "auth_key": self.auth_key.to_json(),
-            "device_pub": hex::encode(self.device_pub),
-            "enroll_possession_sig": hex::encode(self.enroll_possession_sig),
-            "device_possession_sig": hex::encode(self.device_possession_sig),
-        })
+        use base64::Engine;
+        match &self.principal {
+            EnrollmentPrincipal::Compact(inv) => serde_json::json!({
+                "inv_v2": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_bytes()),
+                "device_pub": hex::encode(self.device_pub),
+                "enroll_possession_sig": hex::encode(self.enroll_possession_sig),
+                "device_possession_sig": hex::encode(self.device_possession_sig),
+            }),
+            EnrollmentPrincipal::Legacy(ak) => serde_json::json!({
+                "auth_key": ak.to_json(),
+                "device_pub": hex::encode(self.device_pub),
+                "enroll_possession_sig": hex::encode(self.enroll_possession_sig),
+                "device_possession_sig": hex::encode(self.device_possession_sig),
+            }),
+        }
     }
 
     /// SAFE deserialization: uses try_into() (no panics on wrong-length hex).
     /// Nonce is NOT in the JSON — the verifier supplies its own.
     pub fn from_json(v: &serde_json::Value) -> Option<Self> {
-        let auth_key = AuthKey::from_json(v.get("auth_key")?)?;
+        use base64::Engine;
+        let principal = if let Some(b64) = v.get("inv_v2").and_then(|x| x.as_str()) {
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64).ok()?;
+            EnrollmentPrincipal::Compact(InvitationV2::from_bytes(&bytes)?)
+        } else {
+            EnrollmentPrincipal::Legacy(AuthKey::from_json(v.get("auth_key")?)?)
+        };
         let device_pub: [u8; 32] = hex::decode(v.get("device_pub")?.as_str()?).ok()?.try_into().ok()?;
         let enroll_possession_sig: [u8; 64] = hex::decode(v.get("enroll_possession_sig")?.as_str()?).ok()?.try_into().ok()?;
         let device_possession_sig: [u8; 64] = hex::decode(v.get("device_possession_sig")?.as_str()?).ok()?.try_into().ok()?;
         Some(EnrollmentPayload {
-            auth_key,
+            principal,
             device_pub,
             enroll_possession_sig,
             device_possession_sig,
@@ -737,11 +1013,11 @@ pub fn now_secs() -> u64 {
 /// public key. Both the `up` daemon and the enroller join this channel so they
 /// can rendezvous cross-network (same model as channel_of for pairing secrets).
 pub fn enroll_channel(owner_pub: &[u8; 32]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"filament-enroll-v1");
-    h.update(owner_pub);
-    hex::encode(h.finalize().as_slice())
+    // #186: the channel is derived from an 8-byte fingerprint of the owner key
+    // so a compact invitation (which carries only the fp) can subscribe
+    // without the full key. The daemon passes its full key here and derives
+    // the same channel.
+    enroll_channel_fp(&issuer_fingerprint(owner_pub))
 }
 
 // ---------------------------------------------------------------------------
@@ -782,7 +1058,7 @@ mod tests {
         rng.fill(&mut nonce2).unwrap();
 
         let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
-        let payload = EnrollmentPayload::build(ak, device_pub, &enroll_kp, &device_kp, nonce1, verifier_pub);
+        let payload = EnrollmentPayload::build(EnrollmentPrincipal::Legacy(ak), device_pub, &enroll_kp, &device_kp, nonce1, verifier_pub);
         let op = owner_pub(&owner);
 
         // Correct nonce passes
@@ -808,7 +1084,7 @@ mod tests {
         rng.fill(&mut nonce).unwrap();
 
         let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
-        let payload = EnrollmentPayload::build(ak, device_pub, &enroll_kp, &device_kp, nonce, verifier_a);
+        let payload = EnrollmentPayload::build(EnrollmentPrincipal::Legacy(ak), device_pub, &enroll_kp, &device_kp, nonce, verifier_a);
         let op = owner_pub(&owner);
 
         assert!(payload.verify(&op, &nonce, &verifier_a).is_ok());
@@ -1241,7 +1517,7 @@ mod tests {
         rng.fill(&mut nonce).unwrap();
 
         let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
-        let payload = EnrollmentPayload::build(ak, device_pub, &enroll_kp, &device_kp, nonce, verifier_pub);
+        let payload = EnrollmentPayload::build(EnrollmentPrincipal::Legacy(ak), device_pub, &enroll_kp, &device_kp, nonce, verifier_pub);
         let op = owner_pub(&owner);
         let (ep, dp, _ak) = payload.verify(&op, &nonce, &verifier_pub).unwrap();
         assert_eq!(ep, enroll_pub);
@@ -1262,7 +1538,7 @@ mod tests {
         rng.fill(&mut nonce).unwrap();
 
         let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
-        let payload = EnrollmentPayload::build(ak, device_pub, &wrong_kp, &device_kp, nonce, verifier_pub);
+        let payload = EnrollmentPayload::build(EnrollmentPrincipal::Legacy(ak), device_pub, &wrong_kp, &device_kp, nonce, verifier_pub);
         let op = owner_pub(&owner);
         assert!(payload.verify(&op, &nonce, &verifier_pub).is_err());
     }
@@ -1391,7 +1667,7 @@ mod tests {
         rng.fill(&mut nonce).unwrap();
 
         let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
-        let payload = EnrollmentPayload::build(ak, device_pub, &enroll_kp, &device_kp, nonce, verifier_pub);
+        let payload = EnrollmentPayload::build(EnrollmentPrincipal::Legacy(ak), device_pub, &enroll_kp, &device_kp, nonce, verifier_pub);
         let json = payload.to_json();
         let round = EnrollmentPayload::from_json(&json).unwrap();
         assert_eq!(payload.device_pub, round.device_pub);
