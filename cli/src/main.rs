@@ -1341,11 +1341,23 @@ pub(crate) fn display_name() -> String {
 /// The computed display name when nothing is configured (user@host). Kept
 /// separate so the settings readout can show the true default.
 pub(crate) fn default_display_name() -> String {
-    let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
-    let host = std::fs::read_to_string("/etc/hostname")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "cli".into());
-    format!("{user}@{host}")
+    // #183.1: USER and /etc/hostname are UNIX-only. On Windows the platform
+    // provides USERNAME and COMPUTERNAME and no /etc/hostname, so the unix
+    // read would offer every device the literal name "cli".
+    #[cfg(not(target_os = "windows"))]
+    {
+        let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+        let host = std::fs::read_to_string("/etc/hostname")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "cli".into());
+        format!("{user}@{host}")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
+        let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "cli".into());
+        format!("{user}@{host}")
+    }
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -3222,9 +3234,45 @@ async fn up_cmd(
         // first-run wizard must not demand UAC.
         if cfg!(windows) {
             host.install_user(&exe, &up_args)?;
+            // #182: HKCU Run only fires at logon. The user asked for the
+            // inbox NOW (the other platforms' service managers do `enable
+            // --now` / bootstrap). Start the receiver now, detached, and
+            // confirm it is live before printing.
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                const DETACHED_PROCESS: u32 = 0x00000008;
+                let mut child = std::process::Command::new(&exe)
+                    .arg("up")
+                    .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                let started = match child {
+                    Ok(_) => {
+                        // Give the receiver a moment to write its pidfile.
+                        let mut live = false;
+                        for _ in 0..40 {
+                            if daemon_alive().is_some() {
+                                live = true;
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(250));
+                        }
+                        live
+                    }
+                    Err(_) => false,
+                };
+                if started {
+                    ui::say(&format!("  {} receiving now, and at every logon", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                } else {
+                    ui::say(&format!("  {} autostart installed; starting the receiver now failed, run `filament up`",
+                        ui::paint(ui::Tone::Warn, "!")));
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
             ui::say(&format!("  {} installed as a user-level autostart", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-            ui::say(&format!("  {} run `filament up --install-system` for a machine-wide service that starts before logon",
-                ui::paint(ui::Tone::Dim, "note:")));
         } else {
             match host.install_system(&exe, &up_args) {
                 Ok(platform::InstallResult::System) => {
@@ -4779,8 +4827,19 @@ async fn join_cmd(
         bail!("this invitation has expired");
     }
     let owner_name = to.or_else(|| bundle["owner_name"].as_str().map(str::to_string));
-    let proposed_name = name.unwrap_or_else(l3::hostname);
+    let name_given = name.is_some();
+    let mut proposed_name = name.unwrap_or_else(l3::hostname);
     if caps.interactive {
+        // #183.3: join is the other first-run path; let the joined device name
+        // itself the way init does. The review below shows the chosen name,
+        // which is the name the owner sees in the device list.
+        if !name_given {
+            let answer = prompt_line(&format!("  name this device [{}]: ", proposed_name))?;
+            let trimmed = answer.trim();
+            if !trimmed.is_empty() {
+                proposed_name = trimmed.to_string();
+            }
+        }
         eprintln!();
         eprintln!("  {}", ui::paint(ui::Tone::Brand, "JOIN"));
         eprintln!("  as       {proposed_name}");
@@ -4789,7 +4848,9 @@ async fn join_cmd(
         eprintln!("  budget   {} (key allows up to {})",
             fmt_short_duration(auth_key.max_offline),
             fmt_short_duration(auth_key.max_offline));
-        eprintln!("  expires  {}", auth_key.expires);
+        // #183.2: a raw epoch on the one screen where a person decides whether
+        // to accept a grant is illegible; the mint side already formats it.
+        eprintln!("  expires  {}", format_approval_expiry(auth_key.expires));
         eprintln!("  proof    the ceiling and budget are persisted and reloaded before reconnect authorization");
         let confirmation = prompt_line("\n  Press Enter to join, or type cancel: ")?;
         if confirmation.eq_ignore_ascii_case("cancel") {
