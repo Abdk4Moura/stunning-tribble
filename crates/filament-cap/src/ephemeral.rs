@@ -332,12 +332,15 @@ impl AuthKey {
 #[derive(Clone)]
 pub struct InvitationV2 {
     pub issuer_fp: [u8; 8],
-    pub enroll_pub: [u8; 32],
     pub caps: Vec<String>,
     pub expires: u64,
     pub max_offline: u64,
     pub reuse: Reuse,
     pub ephemeral: bool,
+    /// The SECRET half of the enrollment keypair. The public half is derived
+    /// from it (Ed25519 seed -> key), so only the secret ships: one key in the
+    /// token, not the whole keypair. The signature covers the seed, so the
+    /// derived public key is bound by what the signature authenticates.
     pub enroll_private_key: [u8; 32],
     pub owner_name: String,
     pub sig: [u8; 64],
@@ -416,8 +419,20 @@ fn inv_reuse_from_byte(b: u8) -> Reuse {
 }
 
 impl InvitationV2 {
+    /// The public half of the enrollment keypair, derived from the seed that
+    /// ships in the token (Ed25519 seed -> key). The daemon verifies the
+    /// possession proof against this.
+    pub fn enroll_pub(&self) -> [u8; 32] {
+        let kp = Ed25519KeyPair::from_seed_unchecked(&self.enroll_private_key)
+            .expect("invitation seed is 32 bytes, a valid Ed25519 seed");
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(kp.public_key().as_ref());
+        pubkey
+    }
+
     /// Mint a compact invitation. `enroll_private_key` is the seed the joiner
-    /// must possess to claim it; `owner_uk` signs the compact prefix.
+    /// must possess to claim it (the public half is derived); `owner_uk` signs
+    /// the compact prefix.
     pub fn mint(
         owner_uk: &Ed25519KeyPair,
         enroll_private_key: [u8; 32],
@@ -430,11 +445,8 @@ impl InvitationV2 {
     ) -> Result<Self> {
         let caps = caps.iter().map(|c| super::capability::canonical_capability(c)).collect::<Result<Vec<_>>>()?;
         let owner_pub: [u8; 32] = owner_uk.public_key().as_ref().try_into().map_err(|_| anyhow!("bad owner pub"))?;
-        let enroll_kp = Ed25519KeyPair::from_seed_unchecked(&enroll_private_key).map_err(|e| anyhow!("{e}"))?;
-        let enroll_pub: [u8; 32] = enroll_kp.public_key().as_ref().try_into().map_err(|_| anyhow!("bad enroll pub"))?;
         let mut t = InvitationV2 {
             issuer_fp: issuer_fingerprint(&owner_pub),
-            enroll_pub,
             caps,
             expires,
             max_offline,
@@ -455,14 +467,13 @@ impl InvitationV2 {
         let mut b = Vec::new();
         b.push(0x02);
         b.extend_from_slice(&self.issuer_fp);
-        b.extend_from_slice(&self.enroll_pub);
+        b.extend_from_slice(&self.enroll_private_key);
         let mask = inv_caps_to_bitmask(&self.caps).unwrap_or(0);
         b.push(mask);
         b.extend_from_slice(&(self.expires as u32).to_le_bytes());
         b.extend_from_slice(&(self.max_offline as u32).to_le_bytes());
         b.push(inv_reuse_to_byte(&self.reuse));
         b.push(if self.ephemeral { 1 } else { 0 });
-        b.extend_from_slice(&self.enroll_private_key);
         b.extend_from_slice(&(self.owner_name.len() as u16).to_le_bytes());
         b.extend_from_slice(self.owner_name.as_bytes());
         b
@@ -475,7 +486,7 @@ impl InvitationV2 {
     }
 
     pub fn from_bytes(raw: &[u8]) -> Option<Self> {
-        if raw.len() < 86 + 64 {
+        if raw.len() < 54 + 64 {
             return None;
         }
         if raw[0] != 0x02 {
@@ -484,25 +495,22 @@ impl InvitationV2 {
         let sig_off = raw.len() - 64;
         let mut issuer_fp = [0u8; 8];
         issuer_fp.copy_from_slice(&raw[1..9]);
-        let mut enroll_pub = [0u8; 32];
-        enroll_pub.copy_from_slice(&raw[9..41]);
+        let mut enroll_private_key = [0u8; 32];
+        enroll_private_key.copy_from_slice(&raw[9..41]);
         let mask = raw[41];
         let expires = u32::from_le_bytes(raw[42..46].try_into().ok()?) as u64;
         let max_offline = u32::from_le_bytes(raw[46..50].try_into().ok()?) as u64;
         let reuse = inv_reuse_from_byte(raw[50]);
         let ephemeral = raw[51] == 1;
-        let mut enroll_private_key = [0u8; 32];
-        enroll_private_key.copy_from_slice(&raw[52..84]);
-        let name_len = u16::from_le_bytes(raw[84..86].try_into().ok()?) as usize;
-        if 86 + name_len > sig_off {
+        let name_len = u16::from_le_bytes(raw[52..54].try_into().ok()?) as usize;
+        if 54 + name_len > sig_off {
             return None;
         }
-        let owner_name = String::from_utf8(raw[86..86 + name_len].to_vec()).ok()?;
+        let owner_name = String::from_utf8(raw[54..54 + name_len].to_vec()).ok()?;
         let mut sig = [0u8; 64];
         sig.copy_from_slice(&raw[sig_off..]);
         Some(InvitationV2 {
             issuer_fp,
-            enroll_pub,
             caps: inv_caps_from_bitmask(mask),
             expires,
             max_offline,
@@ -533,7 +541,7 @@ impl InvitationV2 {
         let kind_tag = if self.caps.iter().any(|c| c == "mount") { "join-device" } else { "join-person" };
         AuthKey {
             issuer: *owner_pub,
-            enroll_pub: self.enroll_pub,
+            enroll_pub: self.enroll_pub(),
             caps: self.caps.clone(),
             audience: Vec::new(),
             expires: self.expires,
@@ -660,7 +668,7 @@ impl EnrollmentPayload {
                 if now_secs() >= inv.expires {
                     bail!("invitation expired");
                 }
-                inv.enroll_pub
+                inv.enroll_pub()
             }
             EnrollmentPrincipal::Legacy(ak) => {
                 ak.verify_against_owner(owner_pub, verifier_pub)?;

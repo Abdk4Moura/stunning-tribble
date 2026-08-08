@@ -4792,7 +4792,7 @@ async fn add_for_cmd(
     // #176: minting a bounded invitation is a local act (signing + printing);
     // the always-on receiver is only needed when someone CLAIMS it. Arm the
     // enrollment room best-effort; never block minting on the daemon.
-    let armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await.is_some();
+    let armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub()), inv.expires).await.is_some();
 
     if let Some(path) = out.as_deref() {
         write_owner_only_file(path, token.as_str())?;
