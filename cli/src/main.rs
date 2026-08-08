@@ -468,6 +468,7 @@ COMMANDS
     up                     serve: receive, mount, shell (run attached)
     up --install           the same, always-on (autostart at logon)
     down                   stop the daemon
+    reset                  wipe this machine's state (destructive)
   Devices
     devices                list your known devices
     requests               approve or deny access others asked for
@@ -12396,6 +12397,30 @@ async fn send_cmd(
         }
         paths.push(path);
     }
+    // #188: validate the first path NOW, before asking anything else. The old
+    // flow asked local-vs-code first and only then statted the file, so a typo
+    // at the prompt cost two questions and a raw syscall error. Validate and
+    // re-prompt once instead.
+    if !paths.iter().any(|p| p == "-") {
+        loop {
+            let first = paths.first().cloned().unwrap_or_default();
+            if first.is_empty() {
+                break;
+            }
+            match std::fs::metadata(&first) {
+                Ok(_) => break,
+                Err(_) if interactive_allowed() && paths.len() == 1 => {
+                    ui::say(&ui::paint(ui::Tone::Warn, &format!("  no such file or directory: '{first}'")));
+                    let again = prompt_line("  What do you want to send? ")?;
+                    if again.is_empty() {
+                        bail!("cancelled");
+                    }
+                    paths[0] = again;
+                }
+                Err(e) => bail!("cannot send '{first}': {e}"),
+            }
+        }
+    }
     // INTERACTIVE GATE: `send <files>` with no --code/--word/--to and not piping
     // from stdin. First offer to pick a PAIRED DEVICE (arrow-key list); the last
     // item / Esc drops to the code path: Enter = local network, typed words mint a
@@ -12425,19 +12450,21 @@ async fn send_cmd(
             }
         }
         if !chose_device {
+            // #189: the old local-vs-code question was unanswerable at ask time
+            // (you cannot know whether anyone is nearby until you have waited).
+            // The full escalation (watch local AND mint a code, whoever arrives
+            // first wins) needs the sender reachable in two rendezvous points,
+            // which is a transport change - flagged, not pushed through. The
+            // non-transport half ships here: there is no question, the sender
+            // mints a code immediately and shows it, so `send` is discoverable
+            // by `receive <code>` from anywhere and a nearby receiver appears in
+            // the room on its own.
             ui::say(&ui::paint(
                 ui::Tone::Dim,
-                "  press enter to send over the local network, or type words to create a shareable code",
+                "  minting a shareable code (a nearby device can also appear automatically)",
             ));
-            let auto_np = crate::pake::words::mint_nameplate();
-            match codeentry::run("  send · code  ", codeentry::Mode::Create, "", &auto_np)? {
-                codeentry::Outcome::Submitted(words) => {
-                    use_code = true;
-                    word = Some(words);
-                }
-                codeentry::Outcome::Empty => { /* fall through to local-network send */ }
-                codeentry::Outcome::Cancelled => return Err(cancelled()),
-            }
+            use_code = true;
+            word = Some(crate::pake::words::mint_words());
         }
     }
     // --name overrides the offered name, but only makes sense for a SINGLE
@@ -20016,6 +20043,54 @@ mod tests {
             "certRevoked": true,
         }])).unwrap()).unwrap();
         assert!(device_cert_revoked(&[0x42u8; 32]), "a revoked record must refuse the gate on reconnect");
+    }
+
+    #[test]
+    fn help_banner_agrees_with_clap_visibility() {
+        // 0.8.5 (rec 5): the help COMMANDS banner is a hand-written list and a
+        // second source of truth. This test is the enforcement: every clap-
+        // visible subcommand appears in the banner, and every leading verb in
+        // the banner's COMMANDS section is a clap-visible subcommand. A command
+        // hidden from clap must not appear as discoverable, and a visible one
+        // must be listed. (Deriving the banner from clap outright is awkward
+        // because it is a grouped static const; the agreement test is the
+        // accepted second best.)
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let visible: std::collections::HashSet<String> = cmd
+            .get_subcommands()
+            .filter(|sc| !sc.is_hide_set())
+            .map(|sc| sc.get_name().to_string())
+            .collect();
+        // Every visible subcommand is in the banner.
+        for name in &visible {
+            assert!(
+                EXAMPLES.contains(name.as_str()),
+                "visible command '{name}' must appear in the help banner"
+            );
+        }
+        // Every leading verb in the banner's COMMANDS section is visible.
+        let section = EXAMPLES.split("\nEXAMPLES").next().unwrap_or(EXAMPLES);
+        for line in section.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("COMMANDS") {
+                continue;
+            }
+            let first = trimmed.split_whitespace().next().unwrap_or("");
+            let verb = first.trim_end_matches(':');
+            // Group headings in the banner (Start/Share/Serve/Devices/Mesh) are
+            // not commands.
+            if matches!(verb, "Start" | "Share" | "Serve" | "Devices" | "Mesh") {
+                continue;
+            }
+            if verb.is_empty() || verb.starts_with("add") || verb.starts_with("up") {
+                continue; // `add --for`, `add <code>`, `up --install` all key off add/up
+            }
+            assert!(
+                visible.contains(verb),
+                "banner lists '{verb}' but clap hides it; a command that works must be discoverable or deliberately removed"
+            );
+        }
     }
 
     #[test]
