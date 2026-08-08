@@ -514,7 +514,7 @@ struct Cli {
     /// relay. Conflicts with --relay (which forces relay).
     #[arg(long, global = true, conflicts_with = "relay")]
     no_relay: bool,
-    /// Display name shown to peers (default: config file, then user@host)
+    /// Display name shown to peers (default: config file, then your platform username@hostname)
     #[arg(long, global = true)]
     name_as: Option<String>,
     /// Verbose output: -v shows resilience internals (stalls, repairs,
@@ -2750,8 +2750,7 @@ fn drop_dir(flag: Option<PathBuf>) -> PathBuf {
 /// The built-in drop directory when nothing is configured (~/Filament). Shared
 /// with the settings readout so it shows the true default.
 pub(crate) fn default_drop_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join("Filament")
+    platform::Paths::home_dir().join("Filament")
 }
 
 /// The read-only SHARE ROOT a same-owner fleet device may mount without an
@@ -2771,8 +2770,7 @@ pub(crate) fn default_drop_dir() -> PathBuf {
 /// out of the share root at open time (see the beneath-root hardening).
 pub(crate) fn fleet_share_root() -> PathBuf {
     config_get("share").map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join("filament-share")
+        platform::Paths::home_dir().join("filament-share")
     })
 }
 

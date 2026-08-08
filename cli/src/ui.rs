@@ -546,7 +546,14 @@ pub fn qr(url: &str) -> String {
     if !caps().unicode {
         return String::new();
     }
-    let Ok(code) = qrcode::QrCode::new(url.as_bytes()) else {
+    // #184/QR: EcLevel::L (7% correction) instead of the default M: the
+    // invitation tokens are long, and at M the QR overflowed a normal
+    // terminal. L is still scannable and roughly halves the module count for
+    // the longest tokens; every scan path in the product verifies after.
+    let Ok(code) = qrcode::QrCode::with_error_correction_level(
+        url.as_bytes(),
+        qrcode::EcLevel::L,
+    ) else {
         return String::new();
     };
     let w = code.width();
