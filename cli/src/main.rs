@@ -461,9 +461,13 @@ COMMANDS
     receive [code]         receive from a code or your nearby network
     shell <device>         open a shell on a device (native PTY; --ssh for real ssh)
     reach <device>         check if a device is reachable (direct/relay + rtt)
-    reach <device>:<port>  tunnel to a peer's port   (--socks for a local proxy)
+    forward <device>:<port>  tunnel to a peer's port   (--socks for a local proxy)
     expose <port>          publish a local port on your mesh address
     mount <device>:<dir>   mount a remote folder over the mesh
+  Serve
+    up                     serve: receive, mount, shell (run attached)
+    up --install           the same, always-on (autostart at logon)
+    down                   stop the daemon
   Devices
     devices                list your known devices
     requests               approve or deny access others asked for
@@ -479,10 +483,10 @@ EXAMPLES
   filament send big.iso --to laptop  send to a remembered device, no code
   filament add                       mint a code; the other device runs `filament add <code>`
   filament add --for person          bounded invitation; the other device runs `filament join`
-  filament receive --background     always-on inbox (drop target)
+  filament up --install              always-on receiver (the daemon, autostart)
   filament shell laptop              open a shell on a known device
   filament reach laptop              check if a device is reachable
-  filament reach laptop:5432         tunnel to a peer's localhost port
+  filament forward laptop:5432       tunnel to a peer's localhost port
 
   The other end never needs anything installed: https://filament.autumated.com
   Run `filament <command> --help` for details.";
@@ -856,11 +860,24 @@ enum Cmd {
     /// Local TCP listener; each connection becomes one stream to the peer's
     /// localhost:<rport>.
     Forward {
-        /// Local port to listen on (127.0.0.1)
-        lport: u16,
-        peer: String,
-        /// Remote port on the peer's localhost
-        rport: u16,
+        /// `<device>:<port>` to tunnel to (e.g. laptop:5432); the local port is
+        /// the same as the remote one unless --lport says otherwise.
+        target: String,
+        /// Override the local listen port.
+        #[arg(long)]
+        lport: Option<u16>,
+        /// Run a local SOCKS5 proxy for mesh access from any app.
+        #[arg(long)]
+        socks: bool,
+        /// SOCKS5 proxy port (default: 1080)
+        #[arg(long, default_value_t = 1080)]
+        port: u16,
+        /// Proxy bind address (default: 127.0.0.1)
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// HTTP CONNECT proxy port (0 = disabled)
+        #[arg(long, default_value_t = 0)]
+        http_port: u16,
     },
     /// Publish a local port on this device's mesh address (peers reach it at
     /// <this-device>.mesh:<port>), like a Tailscale-served port.
@@ -886,30 +903,19 @@ enum Cmd {
         #[arg(long)]
         off: bool,
     },
-    /// Reach a peer: check reachability, tunnel to a port, or run a mesh proxy.
+    /// Reach a peer: check whether it is reachable, and how (direct/relay + rtt).
     ///
-    /// `<dev>`: reachability probe (is the device reachable, and how: direct/relay + rtt).
-    /// `<dev>:<port>`: tunnels to the peer's localhost:<port> (the `reach` mental model).
-    /// `--socks`: runs a local SOCKS5 proxy for mesh access from any app.
+    /// To TUNNEL to a peer's port, use `filament forward <device>:<port>`.
     #[command(next_help_heading = "Mesh")]
     Reach {
-        /// Device to probe (e.g. laptop) or device:port to tunnel (e.g. laptop:5432)
-        dev_port: Option<String>,
-        /// Run a local SOCKS5 proxy instead
-        #[arg(long)]
-        socks: bool,
-        /// Machine-readable JSON output (for the bare `<device>` reachability probe)
+        /// Device to probe (omit for the environment preflight).
+        dev: Option<String>,
+        /// Machine-readable JSON output
         #[arg(long)]
         json: bool,
-        /// SOCKS5 proxy port (default: 1080)
-        #[arg(long, default_value_t = 1080)]
-        port: u16,
-        /// Proxy bind address (default: 127.0.0.1)
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: String,
-        /// HTTP CONNECT proxy port (0 = disabled)
-        #[arg(long, default_value_t = 0)]
-        http_port: u16,
+        /// Moved to `forward --socks`. Kept hidden so the old form teaches.
+        #[arg(long, hide = true)]
+        socks: bool,
     },
     /// Diagnose connect health: where SSH/L2 establishment is slow or stalls.
     ///
@@ -3527,7 +3533,7 @@ async fn init_experience(
 ) -> Result<()> {
     let store = crate::platform::PlatformKeyStore;
     if caps.json && background {
-        bail!("init --json cannot install a service without mixing service output; run `filament receive --background` separately");
+        bail!("init --json cannot install a service without mixing service output; run `filament up --install` separately");
     }
     if let Some(existing) = identity::UserKey::load(&store)? {
         bail!("this device already has identity {}; see `filament id`", existing.fingerprint());
@@ -3605,7 +3611,7 @@ async fn init_experience(
     if start_background {
         ui::say(&format!("  {} available in the background", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
     } else {
-        ui::say(&ui::paint(ui::Tone::Dim, "  Stay available: filament receive --background"));
+        ui::say(&ui::paint(ui::Tone::Dim, "  Stay available: filament up --install"));
     }
     Ok(())
 }
@@ -3679,6 +3685,8 @@ fn tour_cmd() -> Result<()> {
         act("filament shell <device>", "open an authorized terminal");
     }
     act("filament receive", "receive once");
+    act("filament up", "serve: receive, mount, shell");
+    act("filament up --install", "the same, always-on");
     ui::say(&ui::paint_when(color, ui::Tone::Dim, "  more:  filament --help  /  filament devices  /  filament id"));
     Ok(())
 }
@@ -4725,10 +4733,24 @@ async fn add_for_cmd(
         for_ = codeentry::pick("WHO IS JOINING", &choices)?
             .map(|index| if index == 0 { "device".to_string() } else { "person".to_string() });
     }
-    let kind = for_.ok_or_else(|| anyhow!("non-interactive add --for requires device|person"))?;
-    if kind != "device" && kind != "person" {
-        bail!("invitation kind must be device or person");
-    }
+    // #187: `--for` reads like a name. A bare word that is not the literal
+    // device/person is a DEVICE NAME: select device-kind and pre-fill the
+    // invitation so the owner can name the invitee up front. The literals
+    // keep working for scripts.
+    let (kind, _invitee_name) = match for_.as_deref() {
+        None => {
+            let k = if caps.interactive {
+                let choices = vec!["A device I control".to_string(), "Another person".to_string()];
+                codeentry::pick("WHO IS JOINING", &choices)?
+                    .map(|index| if index == 0 { "device".to_string() } else { "person".to_string() })
+            } else {
+                None
+            };
+            (k.ok_or_else(|| anyhow!("non-interactive add --for requires device|person or a device name"))?, None)
+        }
+        Some("device") | Some("person") => (for_.unwrap(), None),
+        Some(name) => ("device".to_string(), Some(name.to_string())),
+    };
     let mut ceiling = if allow.is_empty() {
         if kind == "device" {
             vec!["transfer".to_string(), "mount".to_string()]
@@ -4818,7 +4840,7 @@ async fn add_for_cmd(
     if !armed {
         ui::say(&ui::paint(
             ui::Tone::Warn,
-            "  note: the always-on receiver is not running, so this invitation cannot be claimed yet.\n  start `filament receive --background`, then the other device can join.",
+            "  note: the always-on receiver is not running, so this invitation cannot be claimed yet.\n  start `filament up --install`, then the other device can join.",
         ));
     }
     Ok(())
@@ -10909,13 +10931,15 @@ async fn main() -> Result<()> {
                     argv.insert(1, "receive".into());
                 }
                 BareTarget::Forward { lport, peer, rport } => {
-                    // `filament device:port` -> `filament forward lport peer rport`.
+                    // `filament device:port` -> `filament forward device:port`.
                     // The local and remote ports are the same number.
                     argv.remove(1);
                     argv.insert(1, "forward".into());
-                    argv.insert(2, lport);
-                    argv.insert(3, peer);
-                    argv.insert(4, rport);
+                    argv.insert(2, format!("{peer}:{rport}"));
+                    if lport != rport {
+                        argv.insert(3, "--lport".into());
+                        argv.insert(4, lport);
+                    }
                 }
                 BareTarget::Reach(dev_port) => {
                     // `filament device.mesh` or `filament device.mesh:port` ->
@@ -11014,6 +11038,7 @@ async fn main() -> Result<()> {
                 ("Receive something", "receive"),
                 ("Mount remote files", "mount"),
                 ("Connect another device", "add"),
+                ("Serve in the background", "up --install"),
                 ("See every device", "devices"),
                 ("View my identity", "id"),
             ]
@@ -11126,10 +11151,10 @@ async fn main() -> Result<()> {
         Cmd::Receive { code, dir, yes, room, to, keep_open, remember, output, background } => {
             let dir = drop_dir(dir);
             if background {
-                if code.is_some() || room.is_some() || to.is_some() || keep_open || remember.is_some() || output.is_some() {
-                    bail!("receive --background configures your standing inbox; code, room, sender, and output options are one-shot only");
-                }
-                up_cmd(&server, true, false, Some(dir), relay, false, None, None, None, false, false, false).await
+                // 0.8.5: receive --background was a second name for `up --install`
+                // (the same call), created because `up` was hidden. `up` is now
+                // visible, so the alias is gone. Teach, do not silently route.
+                bail!("`receive --background` was renamed: the always-on receiver is the daemon. Run `up --install` instead");
             } else {
                 recv_cmd(&server, code, dir, yes, room, to, keep_open, relay, remember, false, output, ShellPolicy::Granted, None, false).await
             }
@@ -11510,26 +11535,31 @@ async fn main() -> Result<()> {
                 l2::pty_cmd(&server, &peer, relay, args).await
             }
         },
-        Cmd::Reach { dev_port, socks, json, port, bind, http_port } => {
-            let json = json || ui_caps.json;
+        Cmd::Reach { dev, json, socks } => {
             if socks {
-                l2::proxy_cmd(&server, &bind, port, http_port, relay).await
-            } else if let Some(dp) = dev_port {
-                let parts: Vec<&str> = dp.splitn(2, ':').collect();
-                if parts.len() == 2 {
-                    // `<device>:<port>`: localhost tunnel (the "reach my device's port" mental model)
-                    let peer = parts[0].to_string();
-                    let rport: u16 = parts[1].parse().map_err(|_| anyhow!("invalid port in '{}'", dp))?;
-                    l2::netcat_cmd(&server, &peer, rport, relay).await
-                } else {
-                    // Bare `<device>`: reachability probe (warm-link check, cold fallback)
-                    crate::ping::ping_cmd(&server, &dp, 1, json, relay).await
-                }
-            } else {
-                bail!("reach requires <device> or <device>:<port> or --socks. Run `filament reach --help` for usage.");
+                bail!("`reach --socks` moved to `forward --socks`: reach now probes only. Run `filament forward <device>:<port> --socks`");
+            }
+            let json = json || ui_caps.json;
+            match dev {
+                Some(d) => crate::ping::ping_cmd(&server, &d, 1, json, relay).await,
+                None => bail!("reach needs a device to probe: `filament reach <device>`. To tunnel a port use `filament forward <device>:<port>`."),
             }
         },
-        Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
+        Cmd::Forward { target, lport, socks, port, bind, http_port } => {
+            if socks {
+                l2::proxy_cmd(&server, &bind, port, http_port, relay).await
+            } else {
+                let (peer, rport) = match target.split_once(':') {
+                    Some((p, r)) => (
+                        p.to_string(),
+                        r.parse().map_err(|_| anyhow!("invalid port in '{target}'; expected <device>:<port>"))?,
+                    ),
+                    None => bail!("forward needs <device>:<port>, e.g. `filament forward laptop:5432`"),
+                };
+                let lport = lport.unwrap_or(rport);
+                l2::forward_cmd(&server, lport, &peer, rport, relay).await
+            }
+        },
         Cmd::Expose { port, to, peer, list, off } => {
             if off {
                 if let Some(p) = port {
