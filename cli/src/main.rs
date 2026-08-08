@@ -3504,7 +3504,7 @@ fn confirm_recovery_phrase(words: &[&str], phrase: &str) -> Result<()> {
         if qr.eq_ignore_ascii_case("qr") {
             eprintln!();
             eprintln!("  Anyone who captures this QR can become you.");
-            eprintln!("{}", ui::qr(&format!("filament-recovery:v1:{phrase}")));
+            eprintln!("{}", ui::qr_or_text(&format!("filament-recovery:v1:{phrase}"), 2));
             let _ = prompt_line("  Press Enter after saving it somewhere you control: ")?;
         }
         let fourth = prompt_line("  Word 4:  ")?;
@@ -4818,7 +4818,7 @@ async fn add_for_cmd(
         eprintln!("  expires  {ttl_text}");
         eprintln!();
         eprintln!("  Whoever captures this can join until it is used or expires.");
-        eprintln!("{}", ui::qr(token.as_str()));
+        eprintln!("{}", ui::qr_or_text(token.as_str(), 8));
         eprintln!("{}", token.as_str());
         eprintln!("  keep this window open until the other device claims it");
         let result = prompt_line("\n  Press Enter after the other device has captured it: ");
@@ -6686,7 +6686,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 ui::say("");
                 if interactive_allowed() {
                     ui::say(&ui::paint(ui::Tone::Dim, "  scan this in Filament, or enter the code below it"));
-                    ui::say(&ui::qr(&full));
+                    ui::say(&ui::qr_or_text(&full, 6));
                 }
                 ui::say(&ui::paint(ui::Tone::Dim, "  on the other device: type it into the web app, or `filament add <code>`"));
                 ui::say(&ui::paint(ui::Tone::Dim, "  keep this window open until the other device claims it"));
