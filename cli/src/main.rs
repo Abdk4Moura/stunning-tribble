@@ -20374,16 +20374,38 @@ mod tests {
     }
 
     #[test]
-    fn invitation_envelope_roundtrips_without_argv_parsing() {
+    fn invitation_v2_roundtrips_without_argv_parsing() {
+        // The v2 token is a compact binary envelope: it must round-trip through
+        // the mint and the claim-side parser, and a secret passed as a bare
+        // positional argument must be rejected (never parsed as an invitation).
         use base64::Engine;
-        let bundle = json!({"auth_key": {"issuer": "test"}, "enroll_private_key": "secret"});
+        use crate::ephemeral::{InvitationV2, Reuse};
+        use ring::signature::KeyPair;
+        let rng = ring::rand::SystemRandom::new();
+        let mut seed = [0u8; 32];
+        ring::rand::SecureRandom::fill(&rng, &mut seed).unwrap();
+        let owner_seed = [7u8; 32];
+        let owner = ring::signature::Ed25519KeyPair::from_seed_unchecked(&owner_seed).unwrap();
+        let inv = InvitationV2::mint(
+            &owner,
+            seed,
+            vec!["transfer".to_string()],
+            1_800_000_000,
+            86400,
+            Reuse::Once,
+            false,
+            "alice".into(),
+        )
+        .unwrap();
         let token = format!(
-            "filament-invite:v1:{}",
+            "filament-invite:v2:{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(serde_json::to_vec(&bundle).unwrap())
+                .encode(inv.to_token())
         );
-        assert_eq!(parse_invitation(&token).unwrap(), bundle);
-        assert!(parse_invitation("secret-as-a-positional-argument").is_err());
+        let parsed = parse_invitation_v2(&token).expect("a well-formed v2 token must parse");
+        assert_eq!(parsed.caps, inv.caps, "caps round-trip");
+        assert_eq!(parsed.enroll_pub, inv.enroll_pub, "derived pub round-trips");
+        assert!(parse_invitation_v2("secret-as-a-positional-argument").is_err());
     }
 
     #[test]
