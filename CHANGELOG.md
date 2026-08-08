@@ -10,8 +10,8 @@ the GitHub release notes.
 
 - **The command surface changed twice in one week, and we are telling you why.**
   0.8.0 shipped three verbs for connecting a device: `add`, `invite`, and
-  `join`. The person who designed them could not work out which to use on his
-  own machine, in front of the QR code his own command had printed. Three
+  `join`. The person who designed them could not work out which to use,
+  standing in front of the QR code the command had just printed. Three
   verbs with illegible boundaries are a worse product than one verb with a
   clear split, and we would rather break the surface once more before anyone
   depends on it than defend a confusing shape for a year.
