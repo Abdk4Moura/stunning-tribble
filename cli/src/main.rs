@@ -702,7 +702,6 @@ enum Cmd {
         json: bool,
     },
     /// Always-on receiver: trusted known devices only, invisible to strangers
-    #[command(hide = true)]
     Up {
         /// Install + start a systemd user service instead of running attached
         #[arg(long)]
@@ -758,7 +757,6 @@ enum Cmd {
         no_proxy_fallback: bool,
     },
     /// Show whether the daemon runs and what it received recently
-    #[command(hide = true)]
     Status {
         /// Machine-readable JSON (for scripts): {running, pid, devices, exposed, recent}.
         #[arg(long)]
@@ -766,9 +764,7 @@ enum Cmd {
     },
     // ── Advanced ────────────────────────────────────────────────────
     /// Stop the daemon
-    #[command(hide = true)]
     Down,
-    /// Show or change settings (no args = show all).
     ///
     /// No args prints all settings with their value, scope, and where each came
     /// from (env > peer > config > default). Strictly imperative: `set` only
@@ -813,7 +809,7 @@ enum Cmd {
     },
     // ── Mesh ────────────────────────────────────────────────────────
     /// Show this machine's overlay address, or a device's info
-    #[command(hide = true, next_help_heading = "Mesh")]
+    #[command(next_help_heading = "Mesh")]
     Addr {
         /// Device name to show info for (omit for this machine's address).
         device: Option<String>,
@@ -859,11 +855,9 @@ enum Cmd {
     ///
     /// Local TCP listener; each connection becomes one stream to the peer's
     /// localhost:<rport>.
-    #[command(hide = true)]
     Forward {
         /// Local port to listen on (127.0.0.1)
         lport: u16,
-        /// Known device (petname) to tunnel through
         peer: String,
         /// Remote port on the peer's localhost
         rport: u16,
@@ -876,12 +870,10 @@ enum Cmd {
     /// (`filament set tun-addr auto`). Persists across restarts.
     ///
     /// Use `filament expose <port> --off` to stop exposing a port.
-    #[command(hide = true)]
     Expose {
         /// Port to publish on the overlay. Omit together with --list or --off.
         port: Option<u16>,
         /// Local target: host:port, a bare port (127.0.0.1:PORT), or a bare host
-        /// (HOST:<port>). Default: 127.0.0.1:<port>.
         #[arg(long, value_name = "HOST:PORT")]
         to: Option<String>,
         /// Restrict to these paired devices (petnames, comma-separated). Default: any.
@@ -899,7 +891,7 @@ enum Cmd {
     /// `<dev>`: reachability probe (is the device reachable, and how: direct/relay + rtt).
     /// `<dev>:<port>`: tunnels to the peer's localhost:<port> (the `reach` mental model).
     /// `--socks`: runs a local SOCKS5 proxy for mesh access from any app.
-    #[command(hide = true)]
+    #[command(next_help_heading = "Mesh")]
     Reach {
         /// Device to probe (e.g. laptop) or device:port to tunnel (e.g. laptop:5432)
         dev_port: Option<String>,
@@ -923,14 +915,12 @@ enum Cmd {
     ///
     /// With a device: run an "establish then drop" probe and print the per-phase
     /// ladder + verdict. Without a device: environment preflight.
-    #[command(hide = true)]
     Doctor {
         /// Known device (petname) to probe; omit for environment preflight
         device: Option<String>,
         /// Repeat the probe until interrupted-ish (a bounded default count)
         #[arg(long)]
         watch: bool,
-        /// Run the probe N times and print a distribution summary
         #[arg(long)]
         repeat: Option<u32>,
         /// Machine-readable JSON output (for scripting)
@@ -940,7 +930,6 @@ enum Cmd {
     /// Grant a known device a capability (deny-by-default). `shell` permits
     /// seamless `filament ssh` into THIS machine, a separate consent from
     /// file transfer; pairing alone never yields a shell.
-    #[command(hide = true)]
     Grant {
         /// Known device (petname), or omit with --tag
         device: String,
@@ -951,7 +940,6 @@ enum Cmd {
         tag: Option<String>,
     },
     /// Revoke a capability or a fleet certificate from a known device.
-    #[command(hide = true)]
     Revoke {
         /// Known device (petname)
         device: String,
@@ -1045,7 +1033,6 @@ enum Cmd {
         args: Vec<String>,
     },
     /// List, approve, or deny pending consent requests from peers.
-    #[command(hide = true)]
     Requests {
         #[command(subcommand)]
         action: Option<RequestsAction>,
@@ -1098,7 +1085,6 @@ enum Cmd {
     ///
     /// Pass the global `-y`/`--yes` to skip the confirmation prompt (required
     /// from a non-TTY / scripts).
-    #[command(hide = true)]
     Reset,
 }
 
