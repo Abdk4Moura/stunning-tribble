@@ -325,10 +325,18 @@ impl AuthKey {
 /// is selected by an 8-byte fingerprint; the full issuer is supplied by the
 /// verifying daemon after the fingerprint matches. No tag, audience, or JSON.
 ///
-/// Layout (bytes): version(1) | issuer_fp(8) | enroll_pub(32) | caps(1) |
-/// expires_min(4 LE) | max_offline_s(4 LE) | reuse(1) | ephemeral(1) |
-/// enroll_private_key(32) | owner_name_len(2 LE) | owner_name(N) | sig(64).
-/// `sig` covers everything before it.
+/// TWO WIRE ARTIFACTS, ONE STRUCT (the verifier must never learn the seed):
+/// - TOKEN (owner -> joiner, off-band): fields + SEED(32) + sig. The joiner
+///   derives the public key from the seed, verifies the sig over
+///   (fields + pub), then proves possession by signing with the seed.
+/// - PAYLOAD (joiner -> daemon): fields + PUB(32) + sig, NO seed. The daemon
+///   verifies the sig over (fields + pub) and learns only the public key.
+///
+/// Shared field region: version(1) | issuer_fp(8) | caps(1) | expires_min(4 LE)
+/// | max_offline_s(4 LE) | reuse(1) | ephemeral(1) | owner_name_len(2 LE) |
+/// owner_name(N) | key(32) | sig(64). `sig` covers the signed prefix, which is
+/// the field region with the PUBLIC key where `key` sits (the seed is never in
+/// the signed domain, so the payload needs no seed to verify).
 #[derive(Clone)]
 pub struct InvitationV2 {
     pub issuer_fp: [u8; 8],
@@ -337,10 +345,12 @@ pub struct InvitationV2 {
     pub max_offline: u64,
     pub reuse: Reuse,
     pub ephemeral: bool,
-    /// The SECRET half of the enrollment keypair. The public half is derived
-    /// from it (Ed25519 seed -> key), so only the secret ships: one key in the
-    /// token, not the whole keypair. The signature covers the seed, so the
-    /// derived public key is bound by what the signature authenticates.
+    /// The PUBLIC half. Always present, always in the signed domain: derived
+    /// from the seed at mint and at token parse; parsed directly from the
+    /// payload on the verifier side.
+    pub enroll_pub: [u8; 32],
+    /// The SEED. Present in the TOKEN only; NEVER serialized into the payload,
+    /// so the verifier cannot replay possession. Zeroed on drop.
     pub enroll_private_key: [u8; 32],
     pub owner_name: String,
     pub sig: [u8; 64],
@@ -418,21 +428,26 @@ fn inv_reuse_from_byte(b: u8) -> Reuse {
     }
 }
 
-impl InvitationV2 {
-    /// The public half of the enrollment keypair, derived from the seed that
-    /// ships in the token (Ed25519 seed -> key). The daemon verifies the
-    /// possession proof against this.
-    pub fn enroll_pub(&self) -> [u8; 32] {
-        let kp = Ed25519KeyPair::from_seed_unchecked(&self.enroll_private_key)
-            .expect("invitation seed is 32 bytes, a valid Ed25519 seed");
-        let mut pubkey = [0u8; 32];
-        pubkey.copy_from_slice(kp.public_key().as_ref());
-        pubkey
-    }
+/// Derive an Ed25519 public key from a seed.
+fn pubkey_from_seed(seed: &[u8; 32]) -> [u8; 32] {
+    let kp = Ed25519KeyPair::from_seed_unchecked(seed)
+        .expect("32-byte seed is always a valid Ed25519 seed");
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(kp.public_key().as_ref());
+    pubkey
+}
 
-    /// Mint a compact invitation. `enroll_private_key` is the seed the joiner
-    /// must possess to claim it (the public half is derived); `owner_uk` signs
-    /// the compact prefix.
+/// Fixed field region (everything before the variable owner name): version,
+/// issuer fp, caps, expiry, budget, reuse, ephemeral, name length.
+fn inv_field_fixed_len() -> usize {
+    1 + 8 + 1 + 4 + 4 + 1 + 1 + 2
+}
+
+impl InvitationV2 {
+    /// Mint a compact invitation. `enroll_private_key` is the SEED the joiner
+    /// must possess; the public half is derived from it and is what the
+    /// signature binds and the verifier learns. `owner_uk` signs the signed
+    /// prefix (fields + derived public key).
     pub fn mint(
         owner_uk: &Ed25519KeyPair,
         enroll_private_key: [u8; 32],
@@ -445,6 +460,7 @@ impl InvitationV2 {
     ) -> Result<Self> {
         let caps = caps.iter().map(|c| super::capability::canonical_capability(c)).collect::<Result<Vec<_>>>()?;
         let owner_pub: [u8; 32] = owner_uk.public_key().as_ref().try_into().map_err(|_| anyhow!("bad owner pub"))?;
+        let enroll_pub = pubkey_from_seed(&enroll_private_key);
         let mut t = InvitationV2 {
             issuer_fp: issuer_fingerprint(&owner_pub),
             caps,
@@ -452,22 +468,24 @@ impl InvitationV2 {
             max_offline,
             reuse,
             ephemeral,
+            enroll_pub,
             enroll_private_key,
             owner_name,
             sig: [0u8; 64],
         };
-        let prefix = t.prefix_bytes();
+        let prefix = t.signed_prefix();
         let sig = owner_uk.sign(&prefix);
         t.sig.copy_from_slice(sig.as_ref());
         Ok(t)
     }
 
-    /// The bytes the signature covers: everything before the trailing sig.
-    fn prefix_bytes(&self) -> Vec<u8> {
+    /// The bytes the signature covers: fields + the PUBLIC key. The seed is
+    /// NOT in the signed domain, so a payload carrying only the public half can
+    /// be verified without ever seeing the seed.
+    fn signed_prefix(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.push(0x02);
         b.extend_from_slice(&self.issuer_fp);
-        b.extend_from_slice(&self.enroll_private_key);
         let mask = inv_caps_to_bitmask(&self.caps).unwrap_or(0);
         b.push(mask);
         b.extend_from_slice(&(self.expires as u32).to_le_bytes());
@@ -476,50 +494,110 @@ impl InvitationV2 {
         b.push(if self.ephemeral { 1 } else { 0 });
         b.extend_from_slice(&(self.owner_name.len() as u16).to_le_bytes());
         b.extend_from_slice(self.owner_name.as_bytes());
+        b.extend_from_slice(&self.enroll_pub);
         b
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut b = self.prefix_bytes();
+    /// The TOKEN: the artifact handed to the joiner. Fields + SEED + sig.
+    /// The joiner derives the public key from the seed and verifies the sig.
+    pub fn to_token(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.push(0x02);
+        b.extend_from_slice(&self.issuer_fp);
+        let mask = inv_caps_to_bitmask(&self.caps).unwrap_or(0);
+        b.push(mask);
+        b.extend_from_slice(&(self.expires as u32).to_le_bytes());
+        b.extend_from_slice(&(self.max_offline as u32).to_le_bytes());
+        b.push(inv_reuse_to_byte(&self.reuse));
+        b.push(if self.ephemeral { 1 } else { 0 });
+        b.extend_from_slice(&(self.owner_name.len() as u16).to_le_bytes());
+        b.extend_from_slice(self.owner_name.as_bytes());
+        b.extend_from_slice(&self.enroll_private_key);
         b.extend_from_slice(&self.sig);
         b
     }
 
-    pub fn from_bytes(raw: &[u8]) -> Option<Self> {
-        if raw.len() < 54 + 64 {
+    /// The PAYLOAD: what the joiner sends to the verifier. Fields + PUB + sig.
+    /// No seed crosses the wire; the verifier learns only the public key.
+    pub fn to_payload(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.push(0x02);
+        b.extend_from_slice(&self.issuer_fp);
+        let mask = inv_caps_to_bitmask(&self.caps).unwrap_or(0);
+        b.push(mask);
+        b.extend_from_slice(&(self.expires as u32).to_le_bytes());
+        b.extend_from_slice(&(self.max_offline as u32).to_le_bytes());
+        b.push(inv_reuse_to_byte(&self.reuse));
+        b.push(if self.ephemeral { 1 } else { 0 });
+        b.extend_from_slice(&(self.owner_name.len() as u16).to_le_bytes());
+        b.extend_from_slice(self.owner_name.as_bytes());
+        b.extend_from_slice(&self.enroll_pub);
+        b.extend_from_slice(&self.sig);
+        b
+    }
+
+    /// Parse a TOKEN (fields + seed + sig). Derives the public key from the
+    /// seed and verifies the signature; returns None on any failure.
+    pub fn from_token(raw: &[u8]) -> Option<Self> {
+        let fixed = inv_field_fixed_len();
+        if raw.len() < fixed + 32 + 64 {
             return None;
         }
         if raw[0] != 0x02 {
             return None;
         }
-        let sig_off = raw.len() - 64;
-        let mut issuer_fp = [0u8; 8];
-        issuer_fp.copy_from_slice(&raw[1..9]);
-        let mut enroll_private_key = [0u8; 32];
-        enroll_private_key.copy_from_slice(&raw[9..41]);
-        let mask = raw[41];
-        let expires = u32::from_le_bytes(raw[42..46].try_into().ok()?) as u64;
-        let max_offline = u32::from_le_bytes(raw[46..50].try_into().ok()?) as u64;
-        let reuse = inv_reuse_from_byte(raw[50]);
-        let ephemeral = raw[51] == 1;
-        let name_len = u16::from_le_bytes(raw[52..54].try_into().ok()?) as usize;
-        if 54 + name_len > sig_off {
+        let name_len = u16::from_le_bytes(raw[fixed - 2..fixed].try_into().ok()?) as usize;
+        let key_off = fixed + name_len;
+        if key_off + 32 + 64 != raw.len() {
             return None;
         }
-        let owner_name = String::from_utf8(raw[54..54 + name_len].to_vec()).ok()?;
+        let mut enroll_private_key = [0u8; 32];
+        enroll_private_key.copy_from_slice(&raw[key_off..key_off + 32]);
         let mut sig = [0u8; 64];
-        sig.copy_from_slice(&raw[sig_off..]);
-        Some(InvitationV2 {
-            issuer_fp,
-            caps: inv_caps_from_bitmask(mask),
-            expires,
-            max_offline,
-            reuse,
-            ephemeral,
+        sig.copy_from_slice(&raw[key_off + 32..]);
+        let t = InvitationV2 {
+            issuer_fp: raw[1..9].try_into().ok()?,
+            caps: inv_caps_from_bitmask(raw[9]),
+            expires: u32::from_le_bytes(raw[10..14].try_into().ok()?) as u64,
+            max_offline: u32::from_le_bytes(raw[14..18].try_into().ok()?) as u64,
+            reuse: inv_reuse_from_byte(raw[18]),
+            ephemeral: raw[19] == 1,
+            enroll_pub: pubkey_from_seed(&enroll_private_key),
             enroll_private_key,
-            owner_name,
+            owner_name: String::from_utf8(raw[fixed..key_off].to_vec()).ok()?,
             sig,
-        })
+        };
+        Some(t)
+    }
+
+    /// Parse a PAYLOAD (fields + pub + sig). The verifier learns only the
+    /// public key; no seed is present. Verifies the signature.
+    pub fn from_payload(raw: &[u8]) -> Option<Self> {
+        let fixed = inv_field_fixed_len();
+        if raw.len() < fixed + 32 + 64 {
+            return None;
+        }
+        if raw[0] != 0x02 {
+            return None;
+        }
+        let name_len = u16::from_le_bytes(raw[fixed - 2..fixed].try_into().ok()?) as usize;
+        let key_off = fixed + name_len;
+        if key_off + 32 + 64 != raw.len() {
+            return None;
+        }
+        let t = InvitationV2 {
+            issuer_fp: raw[1..9].try_into().ok()?,
+            caps: inv_caps_from_bitmask(raw[9]),
+            expires: u32::from_le_bytes(raw[10..14].try_into().ok()?) as u64,
+            max_offline: u32::from_le_bytes(raw[14..18].try_into().ok()?) as u64,
+            reuse: inv_reuse_from_byte(raw[18]),
+            ephemeral: raw[19] == 1,
+            enroll_pub: raw[key_off..key_off + 32].try_into().ok()?,
+            enroll_private_key: [0u8; 32],
+            owner_name: String::from_utf8(raw[fixed..key_off].to_vec()).ok()?,
+            sig: raw[key_off + 32..].try_into().ok()?,
+        };
+        Some(t)
     }
 
     /// The fingerprint selects the owner; the signature binds. Verify both
@@ -528,7 +606,7 @@ impl InvitationV2 {
         if self.issuer_fp != issuer_fingerprint(owner_pub) {
             return false;
         }
-        let prefix = self.prefix_bytes();
+        let prefix = self.signed_prefix();
         let pubkey = UnparsedPublicKey::new(&ED25519, owner_pub);
         pubkey.verify(&prefix, &self.sig).is_ok()
     }
@@ -541,7 +619,7 @@ impl InvitationV2 {
         let kind_tag = if self.caps.iter().any(|c| c == "mount") { "join-device" } else { "join-person" };
         AuthKey {
             issuer: *owner_pub,
-            enroll_pub: self.enroll_pub(),
+            enroll_pub: self.enroll_pub,
             caps: self.caps.clone(),
             audience: Vec::new(),
             expires: self.expires,
@@ -668,7 +746,7 @@ impl EnrollmentPayload {
                 if now_secs() >= inv.expires {
                     bail!("invitation expired");
                 }
-                inv.enroll_pub()
+                inv.enroll_pub
             }
             EnrollmentPrincipal::Legacy(ak) => {
                 ak.verify_against_owner(owner_pub, verifier_pub)?;
@@ -702,7 +780,7 @@ impl EnrollmentPayload {
         use base64::Engine;
         match &self.principal {
             EnrollmentPrincipal::Compact(inv) => serde_json::json!({
-                "inv_v2": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_bytes()),
+                "inv_v2": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_payload()),
                 "device_pub": hex::encode(self.device_pub),
                 "enroll_possession_sig": hex::encode(self.enroll_possession_sig),
                 "device_possession_sig": hex::encode(self.device_possession_sig),
@@ -722,7 +800,7 @@ impl EnrollmentPayload {
         use base64::Engine;
         let principal = if let Some(b64) = v.get("inv_v2").and_then(|x| x.as_str()) {
             let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64).ok()?;
-            EnrollmentPrincipal::Compact(InvitationV2::from_bytes(&bytes)?)
+            EnrollmentPrincipal::Compact(InvitationV2::from_payload(&bytes)?)
         } else {
             EnrollmentPrincipal::Legacy(AuthKey::from_json(v.get("auth_key")?)?)
         };
@@ -1047,6 +1125,126 @@ mod tests {
 
     fn owner_pub(owner: &Ed25519KeyPair) -> [u8; 32] {
         owner.public_key().as_ref().try_into().unwrap()
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    fn mint_v2(owner: &Ed25519KeyPair) -> InvitationV2 {
+        let rng = SystemRandom::new();
+        let mut seed = [0u8; 32];
+        rng.fill(&mut seed).unwrap();
+        InvitationV2::mint(
+            owner,
+            seed,
+            vec!["transfer".into(), "mount".into()],
+            1_800_000_000,
+            30 * 24 * 3600,
+            Reuse::Once,
+            false,
+            "alice".into(),
+        )
+        .unwrap()
+    }
+
+    // ── #186 invitation v2: two-artifact property ───────────────────────
+    // The token (owner -> joiner) carries the possession seed; the payload
+    // (joiner -> verifier) carries only the public half. The verifier must
+    // never learn anything replayable.
+
+    #[test]
+    fn v2_payload_does_not_contain_the_seed() {
+        let owner = gen_keypair();
+        let inv = mint_v2(&owner);
+        let payload = inv.to_payload();
+        let token = inv.to_token();
+        // An intercepted payload reveals nothing replayable: the seed that
+        // proves possession must not appear anywhere in it.
+        assert!(
+            !find_subslice(&payload, &inv.enroll_private_key),
+            "payload must not contain the possession seed"
+        );
+        // And the token (which the joiner legitimately holds) does carry it.
+        assert!(
+            find_subslice(&token, &inv.enroll_private_key),
+            "token carries the seed for the joiner"
+        );
+    }
+
+    #[test]
+    fn v2_payload_cannot_be_replayed_by_an_interceptor() {
+        let owner = gen_keypair();
+        let inv = mint_v2(&owner);
+        let payload = inv.to_payload();
+        let parsed = InvitationV2::from_payload(&payload).unwrap();
+        // The verifier learns only the public key. A possession proof signed
+        // with ANY seed other than the joiner's fails verification against it,
+        // so an interceptor of the payload (or the verifier itself) cannot
+        // impersonate the joiner.
+        let rng = SystemRandom::new();
+        let mut forge_seed = [0u8; 32];
+        rng.fill(&mut forge_seed).unwrap();
+        while forge_seed == inv.enroll_private_key {
+            rng.fill(&mut forge_seed).unwrap();
+        }
+        let forge_kp = Ed25519KeyPair::from_seed_unchecked(&forge_seed).unwrap();
+        let challenge = b"possession-challenge";
+        let forge_sig = forge_kp.sign(challenge);
+        let verifier = UnparsedPublicKey::new(&ED25519, &parsed.enroll_pub);
+        assert!(
+            verifier.verify(challenge, forge_sig.as_ref()).is_err(),
+            "a forged possession proof must fail against the payload's public key"
+        );
+    }
+
+    #[test]
+    fn v2_token_roundtrips_to_a_verifiable_payload() {
+        let owner = gen_keypair();
+        let inv = mint_v2(&owner);
+        let token = inv.to_token();
+        let parsed = InvitationV2::from_token(&token).unwrap();
+        // The joiner derives the public half from the seed; it must match the
+        // minted value.
+        assert_eq!(parsed.enroll_pub, inv.enroll_pub, "derived pub matches minted pub");
+        assert_eq!(parsed.caps, inv.caps);
+        assert_eq!(parsed.issuer_fp, inv.issuer_fp);
+        let payload = parsed.to_payload();
+        let wire = InvitationV2::from_payload(&payload).unwrap();
+        // The daemon verifies the owner signature over (fields + pub) and
+        // learns only the pub.
+        assert!(
+            wire.verify_against_owner(&owner_pub(&owner)),
+            "daemon verifies the owner signature"
+        );
+        assert_eq!(wire.enroll_pub, inv.enroll_pub);
+    }
+
+    #[test]
+    fn v2_tampered_payload_fails_owner_verification() {
+        let owner = gen_keypair();
+        let inv = mint_v2(&owner);
+        // Flip a byte in the signed field region (expiry), not the sig.
+        let mut payload = inv.to_payload();
+        let flip = payload.len() - 64 - 32 - 4;
+        payload[flip] ^= 0x01;
+        let wire = InvitationV2::from_payload(&payload).unwrap();
+        assert!(
+            !wire.verify_against_owner(&owner_pub(&owner)),
+            "a tampered payload must fail the owner signature"
+        );
+        // Tampering the signature itself also fails.
+        let mut payload2 = inv.to_payload();
+        let last = payload2.len() - 1;
+        payload2[last] ^= 0x01;
+        let wire2 = InvitationV2::from_payload(&payload2).unwrap();
+        assert!(
+            !wire2.verify_against_owner(&owner_pub(&owner)),
+            "a tampered signature must fail the owner signature"
+        );
     }
 
     // ── Finding 1: Replay ──────────────────────────────────────────────

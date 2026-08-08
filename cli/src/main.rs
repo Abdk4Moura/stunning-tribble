@@ -4787,12 +4787,12 @@ async fn add_for_cmd(
     enroll_seed.fill(0);
     let token = Zeroizing::new(format!(
         "filament-invite:v2:{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_bytes())
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_token())
     ));
     // #176: minting a bounded invitation is a local act (signing + printing);
     // the always-on receiver is only needed when someone CLAIMS it. Arm the
     // enrollment room best-effort; never block minting on the daemon.
-    let armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub()), inv.expires).await.is_some();
+    let armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await.is_some();
 
     if let Some(path) = out.as_deref() {
         write_owner_only_file(path, token.as_str())?;
@@ -4852,7 +4852,7 @@ fn parse_invitation_v2(raw: &str) -> Result<crate::ephemeral::InvitationV2> {
     let bytes = Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|_| anyhow!("invitation is not valid base64url"))?);
-    crate::ephemeral::InvitationV2::from_bytes(bytes.as_slice())
+    crate::ephemeral::InvitationV2::from_token(bytes.as_slice())
         .ok_or_else(|| anyhow!("invitation payload is not a valid v2 invitation"))
 }
 
@@ -5076,7 +5076,7 @@ async fn enroll_cmd(
 
                 let _ = t.send_control(&json!({
                     "type": "identity-auth-key-enroll-request",
-                    "auth_key_v2": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_bytes()),
+                    "auth_key_v2": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_payload()),
                     "device_pub": hex::encode(device_pub),
                 })).await;
                 if !json_output {
@@ -5620,7 +5620,7 @@ async fn respond_to_auth_key_enroll_request(
                 let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
                 return;
             };
-            match crate::ephemeral::InvitationV2::from_bytes(&bytes) {
+            match crate::ephemeral::InvitationV2::from_payload(&bytes) {
                 Some(inv) => crate::ephemeral::EnrollmentPrincipal::Compact(inv),
                 None => {
                     let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
