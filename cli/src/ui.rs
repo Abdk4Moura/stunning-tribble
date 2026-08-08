@@ -546,13 +546,15 @@ pub fn qr(url: &str) -> String {
     if !caps().unicode {
         return String::new();
     }
-    // #184/QR: EcLevel::L (7% correction) instead of the default M: the
-    // invitation tokens are long, and at M the QR overflowed a normal
-    // terminal. L is still scannable and roughly halves the module count for
-    // the longest tokens; every scan path in the product verifies after.
+    // #184/QR: EcLevel::M (15% correction) instead of the default-adjacent
+    // choice. The v2 invitation token (#186) is ~227 chars, so the QR fits an
+    // 80-wide terminal at M with headroom, and M recovers more of a code
+    // someone photographs off a glossy screen at an angle than L did. (L was
+    // only introduced to buy columns for the 780-char v1 token; the reason is
+    // gone, so L must not persist by inheritance.)
     let Ok(code) = qrcode::QrCode::with_error_correction_level(
         url.as_bytes(),
-        qrcode::EcLevel::L,
+        qrcode::EcLevel::M,
     ) else {
         return String::new();
     };
