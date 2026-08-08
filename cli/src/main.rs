@@ -11542,6 +11542,9 @@ async fn main() -> Result<()> {
             }
             let json = json || ui_caps.json;
             match dev {
+                Some(d) if d.contains(':') => bail!(
+                    "`reach <device>:<port>` moved to `forward <device>:<port>`: reach probes only, forward tunnels. Run `filament forward {d}`"
+                ),
                 Some(d) => crate::ping::ping_cmd(&server, &d, 1, json, relay).await,
                 None => bail!("reach needs a device to probe: `filament reach <device>`. To tunnel a port use `filament forward <device>:<port>`."),
             }
