@@ -655,9 +655,10 @@ enum Cmd {
         #[arg(long)]
         word: Option<String>,
         /// Mint a bounded invitation FOR a device you control or for another
-        /// person (the other side claims it with `join`). Omit to mint a
-        /// pairing code instead (the other side claims it with `add <code>`).
-        #[arg(long, value_parser = ["device", "person"])]
+        /// person (the other side claims it with `join`). Omit the value on a
+        /// terminal to be asked; omit the flag to mint a pairing code instead
+        /// (the other side claims it with `add <code>`).
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
         for_: Option<String>,
         /// Maximum capabilities for the bounded invitation. Defaults to
         /// transfer+mount for a device, transfer for a person.
@@ -4607,12 +4608,15 @@ async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
 
 async fn add_for_cmd(
     caps: &UiCapability,
-    mut for_: Option<String>,
+    for_: Option<String>,
     allow: Vec<String>,
     expires: Option<String>,
     out: Option<PathBuf>,
 ) -> Result<()> {
     use base64::Engine;
+    // `--for` with no value (Some("")) means "ask me on a terminal"; the
+    // one-shot path requires an explicit device|person value.
+    let mut for_ = for_.filter(|v| !v.is_empty());
     if for_.is_none() && caps.interactive {
         let choices = vec!["A device I control".to_string(), "Another person".to_string()];
         for_ = codeentry::pick("WHO IS JOINING", &choices)?
