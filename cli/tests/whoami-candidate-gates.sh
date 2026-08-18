@@ -270,11 +270,16 @@ run_arm() {
       "$BIN" ${ARM_FLAGS:-} --server "$PROXY" up --dir "$WORK/Bdrop" >"$WORK/$label-bravo.log" 2>&1 &
   local bp=$!; FIX_PIDS+=("$bp")
   sleep 18
+  # Stop the wire capture BEFORE the `reach` client runs: reach is a fresh
+  # process WITHOUT the arm's fault knobs (it would, e.g., dial the lie address
+  # under FILAMENT_DIRECT_TEST_BLOCK and pollute the count). The wire must
+  # show the two daemons' behavior and nothing else.
+  kill "$tp" 2>/dev/null
+  sleep 1
   env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$PROXY" reach alpha --json \
       >"$WORK/$label-reach.json" 2>"$WORK/$label-reach.err"
   kill "$ap" "$bp" 2>/dev/null
   sleep 2
-  kill "$tp" 2>/dev/null
   sleep 1
 }
 
