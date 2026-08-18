@@ -460,6 +460,23 @@ struct PubIpEntry {
 
 static PUBIP_CACHE: std::sync::OnceLock<Mutex<Option<PubIpEntry>>> = std::sync::OnceLock::new();
 
+/// Our public IP as OBSERVED by an authenticated peer (#237): the peer saw us
+/// connect from this address, so it is the only source NOT chosen by the party
+/// under suspicion (the signaling server). It SUPERSEDES the `/api/whoami`
+/// assertion (the `PUBIP_CACHE` above, including the `warm_public_ip` pre-warm
+/// at daemon start): once a peer has seen us, the server's guess is ignored.
+/// Empty until a peer has actually connected to us.
+static PEER_OBSERVED_IP: std::sync::OnceLock<Mutex<Option<IpAddr>>> = std::sync::OnceLock::new();
+
+/// The address an authenticated peer observed us connecting from, if any.
+pub async fn observed_public_ip() -> Option<IpAddr> {
+    *PEER_OBSERVED_IP.get_or_init(|| Mutex::new(None)).lock().await
+}
+
+async fn record_observed_ip(ip: IpAddr) {
+    *PEER_OBSERVED_IP.get_or_init(|| Mutex::new(None)).lock().await = Some(ip);
+}
+
 /// Pure freshness test, split out so the TTL/server-match logic is unit-testable
 /// without a clock or the network. A cached IP is reusable only for the SAME
 /// server and only while younger than the TTL.
@@ -553,20 +570,58 @@ pub async fn gather_candidates(server: &str, port: u16) -> Vec<String> {
         let lo: IpAddr = "127.0.0.1".parse().unwrap();
         return vec![cand_str(lo, port)];
     }
-    let ips = filter_local_ips(local_ips(), peer);
+    let all_local = local_ips();
+    let ips = filter_local_ips(all_local.clone(), peer);
     let mut cands: Vec<String> = ips.into_iter().map(|ip| cand_str(ip, port)).collect();
-    if cands.is_empty() && !local_ips().is_empty() {
+    if cands.is_empty() && !all_local.is_empty() {
         crate::ui::debug("iface filter removed ALL host candidates; connectivity may fail");
     }
     if !suppress_public() {
-        if let Some(pip) = public_ip(server).await {
+        // #237: the peer-observed address (an authenticated peer saw us connect
+        // from it) SUPERSEDES the server's whoami assertion, including the
+        // warm pre-warm cache. whoami is only a bootstrap hint for FIRST
+        // contact, before any peer has observed us; a wrong answer there costs
+        // one slow connection instead of a standing downgrade.
+        let observed = observed_public_ip().await;
+        let pip = match observed {
+            Some(ip) => Some(ip),
+            None => public_ip(server).await,
+        };
+        if let Some(pip) = pip {
             let s = cand_str(pip, port);
             if !cands.contains(&s) {
+                if observed.is_none() && !all_local.contains(&pip) {
+                    // Gate C (#237): diagnostic detail, demoted to -v. The
+                    // HEADLINE is the fallback attribution in `expired_direct`
+                    // (the moment of the symptom), not this forecast.
+                    crate::ui::debug(&format!(
+                        "public candidate {s} is server-asserted (bootstrap hint) and unverified; the relay fallback will name it if it never answers"
+                    ));
+                }
                 cands.push(s);
             }
         }
     }
     cands
+}
+
+/// The server-asserted (whoami) public candidate this process would advertise
+/// right now, or `None` when a peer-observed address supersedes it, whoami is
+/// suppressed, or the whoami address turns out to be a local one. Recomputed
+/// with the SAME predicate `gather_candidates` uses, so the relay-fallback
+/// attribution and the advertised candidate set cannot diverge: this is `Some`
+/// exactly when a server-chosen address is in the set and no peer has yet
+/// observed our real address.
+pub async fn server_asserted_public(server: &str, port: u16) -> Option<String> {
+    if suppress_public() || observed_public_ip().await.is_some() {
+        return None;
+    }
+    let pip = public_ip(server).await?;
+    let s = cand_str(pip, port);
+    if local_ips().contains(&pip) {
+        return None;
+    }
+    Some(s)
 }
 
 // =============================================================== TLS configs ==
@@ -1651,8 +1706,53 @@ pub async fn race_connect_labeled(
         tkey: [u8; 32],
         is_dialer: bool,
     ) -> Result<(quinn::Connection, SendStream, RecvStream, bool)> {
-        let (s, r) = authenticate(&conn, &tkey, is_dialer).await?;
+        let (mut s, mut r) = authenticate(&conn, &tkey, is_dialer).await?;
+        // #237: after auth, exchange the peer-observed address. The acceptor
+        // tells the dialer the source address it saw the dialer connect from;
+        // the dialer records it and supersedes the server's whoami assertion.
+        exchange_observed_address(&conn, is_dialer, &mut s, &mut r).await?;
         Ok((conn, s, r, is_dialer))
+    }
+
+    /// Post-auth observed-address exchange (see `auth_conn`). The acceptor
+    /// writes the dialer's source address (as the acceptor sees it); the dialer
+    /// reads it and records it as its peer-observed public address. Framed as a
+    /// 2-byte BE length + ASCII IP, read exactly by the dialer before the stream
+    /// is handed to `DirectTransport`, so the transport's own framing stays
+    /// aligned. Auth failures already dropped the connection, so both sides are
+    /// authenticated here; a malformed frame just means no observation recorded.
+    async fn exchange_observed_address(
+        conn: &quinn::Connection,
+        is_dialer: bool,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+    ) -> Result<()> {
+        if is_dialer {
+            let mut lenb = [0u8; 2];
+            recv.read_exact(&mut lenb).await.context("read observed-address length")?;
+            let len = u16::from_be_bytes(lenb) as usize;
+            if len > 64 {
+                anyhow::bail!("observed-address frame too long ({len})");
+            }
+            let mut buf = vec![0u8; len];
+            recv.read_exact(&mut buf).await.context("read observed-address")?;
+            if let Ok(s) = std::str::from_utf8(&buf) {
+                if let Ok(ip) = s.trim().parse::<IpAddr>() {
+                    record_observed_ip(ip).await;
+                    crate::ui::trace(&format!("filament: peer observed us from {ip}; supersedes whoami"));
+                }
+            }
+        } else {
+            let ip = conn.remote_address().ip();
+            let b = ip.to_string();
+            let bytes = b.as_bytes();
+            if bytes.len() > u16::MAX as usize {
+                anyhow::bail!("observed-address too long");
+            }
+            send.write_all(&(bytes.len() as u16).to_be_bytes()).await.context("write observed-address length")?;
+            send.write_all(bytes).await.context("write observed-address")?;
+        }
+        Ok(())
     }
 
     let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<(quinn::Connection, SendStream, RecvStream, bool)>> + Send>>> = Vec::new();
@@ -1834,5 +1934,27 @@ mod tests {
         assert!(!preferred_connection(true, true));
         assert!(!preferred_connection(false, false));
         assert!(preferred_connection(false, true));
+    }
+
+    /// #237 regression: once a peer has observed our address, `gather_candidates`
+    /// advertises THAT and does not consult the `/api/whoami` cache (which
+    /// `warm_public_ip` pre-warms at daemon start with a server assertion). The
+    /// server is unreachable here, so if whoami WERE consulted it would return
+    /// None and no public candidate would exist; the observed address being
+    /// present proves whoami was bypassed.
+    #[test]
+    fn peer_observed_address_supersedes_whoami() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            record_observed_ip("192.0.2.55".parse().unwrap()).await;
+            let cands = gather_candidates("http://127.0.0.1:1", 4242).await;
+            assert!(
+                cands.iter().any(|c| c.starts_with("192.0.2.55:4242")),
+                "the peer-observed address must be advertised and whoami bypassed, got: {cands:?}"
+            );
+        });
     }
 }

@@ -8426,6 +8426,12 @@ struct DirectPending {
     /// rung-2: our advertised srflx (logged at offer time; kept for diagnostics).
     #[allow(dead_code)]
     my_srflx: Option<std::net::SocketAddr>,
+    /// #237: the server-asserted (whoami) public candidate advertised in this
+    /// attempt's transport-offer, when one was adopted (None when a peer had
+    /// already observed our address, whoami was suppressed, or the address was
+    /// local). Carried to the fallback decision so `expired_direct` can NAME the
+    /// candidate that never answered instead of narrating an unattributed fallback.
+    server_public: Option<String>,
     /// P5 (GAP-6): this is a relay->direct UPGRADE probe, a direct dial run
     /// ALONGSIDE a live relay link (not the cold establishment path). When the
     /// race wins, `on_transport_offer` posts `Ev::DirectUpgradeReady` (verify-
@@ -9233,7 +9239,7 @@ impl Conn {
         // QUIC on if rung-1's host-candidate race fails. STUN failure is graceful:
         // no srflx is advertised and rung-2 simply won't fire for this peer.
 
-        let (cands, srflx) = if is_local {
+        let (cands, srflx, server_public) = if is_local {
             // For local peers, ensure we have a listener and return TCP candidate.
             if self.local_port.is_none() {
                 let (listener, port) = crate::local::listen_local().await.unwrap();
@@ -9241,7 +9247,7 @@ impl Conn {
                 self.local_port = Some(port);
             }
             let cands = vec![format!("{{\"type\":\"tcp-localhost\",\"port\":{}}}", self.local_port.unwrap())];
-            (cands, None)
+            (cands, None, None)
         } else {
             let srflx_fut = async {
                 if holepunch::holepunch_enabled() {
@@ -9250,7 +9256,13 @@ impl Conn {
                     None
                 }
             };
-            tokio::join!(direct::gather_candidates(&self.server, port), srflx_fut)
+            let (cands, srflx) =
+                tokio::join!(direct::gather_candidates(&self.server, port), srflx_fut);
+            // #237: capture which candidate was adopted on the server's say-so
+            // alone, to name it at the fallback decision. Reuses the warm whoami
+            // cache filled a line above by gather_candidates (no extra round trip).
+            let server_public = direct::server_asserted_public(&self.server, port).await;
+            (cands, srflx, server_public)
         };
 
         let (punch_sock, my_srflx) = match srflx {
@@ -9322,6 +9334,7 @@ impl Conn {
                 endpoint: ep,
                 punch_sock,
                 my_srflx,
+                server_public,
                 probe,
             },
         );
@@ -9685,11 +9698,24 @@ impl Conn {
                     .get(&pid)
                     .cloned()
                     .unwrap_or_else(|| json!({ "id": pid, "name": p.secret.0 }));
-                // DEBUG, resilience internal (direct→WebRTC fallback).
-                ui::debug(&format!(
-                    "filament: DIRECT-FALLBACK for {}, no authenticated QUIC in budget, using WebRTC",
-                    p.secret.0
-                ));
+                // Gate C (#237): the fallback is now ATTRIBUTED. The decision to
+                // use the relay knows which server-asserted public candidate was
+                // adopted and never answered; name it here (default verbosity) so
+                // the positive run says WHY, and the common case (a working
+                // direct path) stays silent. The `server_public` candidate is
+                // None exactly when no server-chosen address was in the set.
+                match p.server_public.as_ref() {
+                    Some(sp) => crate::ui::say(&format!(
+                        "falling back to relay: the public address from the server ({sp}) never answered"
+                    )),
+                    None => {
+                        // DEBUG, resilience internal (direct→WebRTC fallback).
+                        ui::debug(&format!(
+                            "filament: DIRECT-FALLBACK for {}, no authenticated QUIC in budget, using WebRTC",
+                            p.secret.0
+                        ))
+                    }
+                }
                 fell_back.push((pid, info, p.secret));
             }
         }
