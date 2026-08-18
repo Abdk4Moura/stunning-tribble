@@ -1394,6 +1394,31 @@ impl Peer {
         self.pc.connection_state() == RTCPeerConnectionState::Connected
     }
 
+    /// #246: a peer connection is "live" while its ICE/DTLS agent is still
+    /// working toward or past Connected. `is_connected` is the serving-state
+    /// test (the data path is up); this is the PROGRESS test. Only Failed and
+    /// Closed are terminal: New/Connecting/Connected are in-flight, and
+    /// Disconnected is recovering (webrtc-rs drives it back via `restart_ice`).
+    /// A link that merely has not CONNECTED yet is not a link that is safe to
+    /// drop.
+    ///
+    /// That every live state is BOUNDED is what keeps this a wait instead of
+    /// a hang: New/Connecting are bounded by the C3 establishment watchdog
+    /// (`WATCHDOG_SECS`, 15s, sent Ev::Stuck when the pc is not Connected),
+    /// and Disconnected is bounded by `on_pc_state`'s grace timer (6s normally,
+    /// the away-window plus 15s for an announced leave, sent Ev::GraceExpired).
+    /// Both are generation-keyed, so the bound survives even when the peer's
+    /// re-dial is suppressed (the generation does not advance). A re-dial
+    /// suppressed by `has_live_transport` therefore does not spare a dying
+    /// link; it defers the decision to the timer the link's own generation
+    /// armed.
+    pub fn is_live(&self) -> bool {
+        !matches!(
+            self.pc.connection_state(),
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+        )
+    }
+
     /// C4: nudge ICE recovery after a transient 'disconnected' (impolite side
     /// only, mirroring the browser).
     pub async fn restart_ice(&self) {

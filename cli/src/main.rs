@@ -8703,16 +8703,24 @@ impl Conn {
         Ok(self.is_active(&peer_id))
     }
 
-    /// A link is "live" if its primary transport or any worker is still alive.
-    /// Restored: the pending-only guard made it briefly dead, but promotion
-    /// intent needs it back. Every caller EXCEPT a deliberate promotion must
-    /// leave a live link alone, which is what warm-hold depends on.
+    /// A link is "live" if its primary transport or any worker is still alive,
+    /// or its WebRTC peer is still making progress (#246). Restored: the
+    /// pending-only guard made it briefly dead, but promotion intent needs it
+    /// back. Every caller EXCEPT a deliberate promotion must leave a live link
+    /// alone, which is what warm-hold depends on.
     fn has_live_transport(&self, pid: &str) -> bool {
         self.links.get(pid)
             .map(|l| {
+                // #246: a link mid-establish (peer present, ICE still working
+                // toward Connected) is making progress even before any
+                // transport/worker exists. Counting it as live is what lets a
+                // Normal re-dial yield to the in-flight establish instead of
+                // arming a fresh direct attempt whose 5s fallback timer then
+                // tears that establish down at the moment it is about to win.
+                let peer_live = l.peer.as_ref().map(|p| p.is_live()).unwrap_or(false);
                 let primary_ok = l.transport.as_ref().map(|t| !t.is_dead()).unwrap_or(false);
                 let workers_ok = l.workers.iter().any(|w| !w.is_dead());
-                primary_ok || workers_ok
+                peer_live || primary_ok || workers_ok
             })
             .unwrap_or(false)
     }
@@ -9164,8 +9172,20 @@ impl Conn {
         }
         // A probe expects a relay link to be present (it's the one we'd upgrade
         // AWAY from); only the cold path bails when a link already exists.
+        // #246: a link without a transport and without workers is NOT
+        // necessarily dead. A WebRTC link that just finished `establish` has
+        // exactly that shape: peer present, ICE gathering, presence
+        // Connecting. Judging it dead here is what destroyed the in-flight
+        // ICE agent about a second into the relay fallback, on every 5s direct
+        // retry, forever. A link is dead only when BOTH nothing is serving AND
+        // its peer has reached a terminal state (Failed/Closed) or is absent.
         let link_dead = self.links.get(pid)
-            .map(|l| l.transport.as_ref().map(|t| t.is_dead()).unwrap_or(true) && l.workers.iter().all(|w| w.is_dead()))
+            .map(|l| {
+                let peer_live = l.peer.as_ref().map(|p| p.is_live()).unwrap_or(false);
+                !peer_live
+                    && l.transport.as_ref().map(|t| t.is_dead()).unwrap_or(true)
+                    && l.workers.iter().all(|w| w.is_dead())
+            })
             .unwrap_or(false);
         if link_dead {
             // The link is already dead, so destroying it loses nothing. Its
@@ -9200,6 +9220,17 @@ impl Conn {
         }
         // A live link is a REASON TO STOP for everyone except a deliberate
         // promotion. Promotion is the one caller that intends to replace it.
+        // #246: `has_live_transport` now counts a mid-establish WebRTC peer as
+        // live, so a Normal re-dial YIELDS to an establish that is still
+        // making progress instead of arming a fresh direct attempt whose own
+        // 5s fallback timer would then re-enter `establish` at the same cursor
+        // and swap the still-establishing link. That is the livelock relocated
+        // rather than removed, which is why both gates are needed. Promote
+        // bypasses on purpose (it is the one caller that intends to displace a
+        // live link, and its teardown is the designed Option A), and Probe
+        // bypasses on purpose (it dials ALONGSIDE the serving relay link and
+        // never touches `links`, so it cannot disturb an establish it did not
+        // create).
         if intent == DirectIntent::Normal && self.has_live_transport(pid) {
             return; // already linked via a live transport
         }
