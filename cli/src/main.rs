@@ -8432,10 +8432,12 @@ struct DirectPending {
     /// address). This is the candidate OUR race actually dialed, so it is the one
     /// the relay-fallback attribution may honestly name as "never answered".
     peer_server_public: Option<String>,
-    /// #237: set true the instant the race actually dials a peer candidate
-    /// (never for a knob that skips the dials or before the offer/race exist).
-    /// The attribution says "dialed and never answered" only when this is true.
-    dialed: Arc<AtomicBool>,
+    /// #237: set true at the dial site exactly when the race dialed THE PEER'S
+    /// CLAIMED server-asserted address (see `dials_claimed`), never for a dial
+    /// of any other candidate and never for a knob that skips the dials. The
+    /// attribution says "dialed and never answered" only when this is true, so
+    /// the sentence is bound to the address it names.
+    server_public_dialed: Arc<AtomicBool>,
     /// P5 (GAP-6): this is a relay->direct UPGRADE probe, a direct dial run
     /// ALONGSIDE a live relay link (not the cold establishment path). When the
     /// race wins, `on_transport_offer` posts `Ev::DirectUpgradeReady` (verify-
@@ -9286,7 +9288,17 @@ impl Conn {
         // The peer dials it; if it never answers, the peer's fallback can name
         // exactly this address instead of claiming a cause it never dialed.
         if let Some(s) = server_public {
-            offer["server_public"] = json!(s);
+            // Test-only (gate C-negative/mismatch): advertise a server_public
+            // label that is NOT the dialed candidate, modelling a peer (or
+            // adversarially-mislabeled offer) whose claimed address is not in
+            // its addrs. The peer that dials THIS offer's addrs must NOT name
+            // this label on fallback - it never dialed 8.8.8.8:53.
+            let tag = if std::env::var("FILAMENT_DIRECT_SERVER_PUBLIC_MISMATCH").map(|v| v == "1").unwrap_or(false) {
+                "8.8.8.8:53".to_string()
+            } else {
+                s
+            };
+            offer["server_public"] = json!(tag);
         }
         // P5 (GAP-6): tag a probe offer so the PEER races it as an upgrade probe
         // too, its winning side then posts Ev::DirectUpgradeReady (verify-before-
@@ -9348,10 +9360,10 @@ impl Conn {
                 my_srflx,
                 // #237: the peer's server-asserted candidate arrives with its transport-offer
                 // (on_transport_offer fills it); at insert time no offer has
-                // arrived yet. The dialed gate starts false and flips only when
-                // the race truly dials.
+                // arrived yet. The per-address dial gate starts false and flips
+                // only when the race dials exactly the claimed address.
                 peer_server_public: None,
-                dialed: Arc::new(AtomicBool::new(false)),
+                server_public_dialed: Arc::new(AtomicBool::new(false)),
                 probe,
             },
         );
@@ -9409,10 +9421,15 @@ impl Conn {
         }
         let Some(ep) = p.endpoint.take() else { return };
         // #237: record what the peer advertised on the server's say-so, BEFORE the
-        // race consumes the endpoint.
+        // race consumes the endpoint. The claim is WIRE DATA and untrusted:
+        // it only becomes a fact when the race dials that exact address (the
+        // dial site sets server_public_dialed, nothing else can).
         let peer_name = p.secret.0.clone();
+        // An unparseable claim can never be dialed (there is no such address);
+        // passing None keeps it silent, which is the safe direction.
+        let peer_claimed = peer_server_public.as_deref().and_then(|s| s.parse::<std::net::SocketAddr>().ok());
+        let server_public_dialed = p.server_public_dialed.clone();
         p.peer_server_public = peer_server_public;
-        let dialed = p.dialed.clone();
         // #237 (mixed-fleet): a peer running an older build (no `proto` >= 2 in
         // its offer) gets a clear sentence instead of a hang or a mismatch. The
         // observed-address exchange is skipped on BOTH sides (the race below is
@@ -9481,7 +9498,7 @@ impl Conn {
             // derived inside the race from both endpoint identity tuples, so the
             // connector and offer-receiver cannot drift via caller literals.
             if let Some(t) =
-                direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), my_uid.clone(), peer_uid.clone(), my_id.clone(), tx.clone(), exchange, dialed.clone()).await
+                direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), my_uid.clone(), peer_uid.clone(), my_id.clone(), tx.clone(), exchange, peer_claimed, server_public_dialed.clone()).await
             {
                 let _ = tx.send(mk(pid_s, t, "direct-quic"));
                 return;
@@ -9504,7 +9521,11 @@ impl Conn {
                         my_id.clone(),
                         tx.clone(),
                         exchange,
-                        dialed.clone(),
+                        // The punched race dials ONLY the srflx, never the
+                        // claimed server-asserted address, so it cannot set the
+                        // flag that would let the fallback name that address.
+                        None,
+                        server_public_dialed.clone(),
                     )
                     .await
                     {
@@ -9744,18 +9765,17 @@ impl Conn {
                     .unwrap_or_else(|| json!({ "id": pid, "name": p.secret.0 }));
                 // Gate C (#237): the fallback is now ATTRIBUTED - and only when the
                 // attribution is TRUE. The decision to use the relay names the
-                // peer's server-asserted public candidate only when (a) the peer
-                // actually advertised one (so there is something to name) AND
-                // (b) our race truly DIALED it (so "never answered" is a fact,
-                // not a guess). Absent (a) there is no server-chosen address to
-                // blame; absent (b) the budget went elsewhere - the peer never
-                // offered, the race was skipped, a knob short-circuited the
-                // dials - and "never answered" would blame a candidate we never
-                // reached. Both are handled by staying silent at default
-                // verbosity: the infinite negative run stays quiet, and a
-                // fallback with an unrelated cause never names a cause it has
-                // not established.
-                let attributed = p.peer_server_public.as_ref().filter(|_| p.dialed.load(Ordering::Relaxed));
+                // peer's claimed server-asserted public candidate only when the
+                // race actually DIALED THAT EXACT ADDRESS (the dial site set
+                // server_public_dialed; nothing else can). The claim is wire
+                // data and untrusted: absent a dial of the named address,
+                // "never answered" would blame a sentence rather than a fact -
+                // whether the claim was never in the candidate set, never
+                // parsed, or the budget went to other dials. All of those stay
+                // silent at default verbosity: the infinite negative run stays
+                // quiet, and a fallback with an unrelated cause - or a lying
+                // label - never names a cause it has not established.
+                let attributed = p.peer_server_public.as_ref().filter(|_| p.server_public_dialed.load(Ordering::Relaxed));
                 match attributed {
                     Some(sp) => crate::ui::say(&format!(
                         "falling back to relay: the public address from the server ({sp}) never answered"

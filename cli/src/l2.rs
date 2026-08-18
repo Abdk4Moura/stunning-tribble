@@ -1493,9 +1493,10 @@ async fn bring_up_to_known(
                         // advertise proto 2), so both ends skip or both run.
                         let peer_proto = data["proto"].as_u64().unwrap_or(1).clamp(1, 255) as u8;
                         let exchange = peer_proto >= 2;
-                        // The L2 initiator has no fallback to attribute, so dial
-                        // tracking is unused here (held so the shared race keeps
-                        // a single signature).
+                        // The L2 initiator has no fallback to attribute, and
+                        // does not track the peer's claimed server-asserted
+                        // address (dial-tracking is unused here, held so the
+                        // shared race keeps a single signature).
                         let l2_dialed = Arc::new(AtomicBool::new(false));
                         // DEBUG, resilience/direct internal (racing a direct path).
                         crate::ui::debug(&format!(
@@ -1521,7 +1522,7 @@ async fn bring_up_to_known(
                             if let Some(t) = crate::direct::race_connect_labeled(
                                 ep, peer_cands, &secret, pid.clone(), my_uid_for_race,
                                 peer_uid_for_race, my_id_for_race, tx.clone(), "direct-quic",
-                                exchange, l2_dialed,
+                                exchange, None, l2_dialed,
                             )
                             .await
                             {

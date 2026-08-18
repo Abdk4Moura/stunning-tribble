@@ -56,7 +56,7 @@
 #       bootstrap HINT for FIRST contact, when no peer has observed us yet.
 #   C   THE NON-NEGOTIABLE (regression that flips): at the moment the code
 #       decides to use the relay, the fallback NAMES the server-asserted address
-#       that was dialed and never answered. Three sub-assertions:
+#       that was dialed and never answered. Four sub-assertions:
 #         C-silence    the negative runs (where no fallback happens) print
 #                      nothing about it - a warning that fires when nothing is
 #                      wrong trains users to ignore the channel that later
@@ -79,7 +79,19 @@
 #                      dialed anything (zero packets on the wire), so it has not
 #                      established that the server-asserted address failed. An
 #                      attribution that fires on presence alone blames a cause it
-#                      never dialed - the message is only printed when dialed=true.
+#                      never dialed - the message is only printed when the named
+#                      address itself was dialed.
+#         C-mismatch   the tighter negative: a dial DID happen, but NOT to the
+#                      claimed server-asserted address, so the fallback must
+#                      still print NOTHING. FILAMENT_DIRECT_SERVER_PUBLIC_MISMATCH
+#                      makes the offer tag a server_public label ("8.8.8.8:53")
+#                      that is not in its own addrs - the exact lying-label shape
+#                      a bad or buggy peer can produce. The peer races the LAN/
+#                      published address (real packets, dial fails), falls back,
+#                      and must not name the label it never dialed. This is the
+#                      arm chief-ux's round-3 review called for: the claim is
+#                      wire data and the sentence must be bound to the dialed
+#                      address, not to the claim.
 #
 # WHAT THE SHELL LAYER DOES NOT COVER, AND WHY (read before trusting green).
 # Peer-observed supersession - once a peer has seen us, the next connection
@@ -394,6 +406,34 @@ if [ "$NEG_ATTRIB" = "0" ] && [ "$NEG_FB" -gt 0 ] && [ "$PN" = "0" ]; then
   ok "gateC-negative: an unrelated-cause fallback with the server-asserted candidate present says NOTHING about it (dial never happened)"
 else
   bad "gateC-negative: attribution=$NEG_ATTRIB fallback=$NEG_FB packets=$PN - the attribution is NOT tied to an actual dial"
+fi
+ARM_EXTRA=""
+ARM_FLAGS=""
+
+# C-mismatch (the tighter negative): a dial DID happen, but not to the claimed
+# server-asserted address. FILAMENT_DIRECT_SERVER_PUBLIC_MISMATCH makes both
+# daemons advertise addrs=[203.0.113.7:port] (only_public) yet label
+# server_public="8.8.8.8:53" - the lying-label shape a bad peer can produce.
+# The races DIAL 203.0.113.7 for real (packets on the wire), fail for real, and
+# fall back; because the claimed address was never one of the dialed candidates,
+# the fallback must print ZERO attributions. Run with -v so the fallback itself
+# is evidenced. This arm FAILS on the round-2 code (which set the flag for any
+# dial) and passes only when the flag is bound to the named address.
+ARM_EXTRA="FILAMENT_DIRECT_ONLY_PUBLIC=1 FILAMENT_DIRECT_SERVER_PUBLIC_MISMATCH=1"
+ARM_FLAGS="-v"
+run_arm "$LIE_IP" mismatch
+PM=$(pkts_of mismatch)
+MIS_ATTRIB=$(cat "$WORK/mismatch-alpha.log" "$WORK/mismatch-bravo.log" 2>/dev/null \
+            | sed "s|$WORK||g" \
+            | grep -c "falling back to relay" || true)
+MIS_FB=$(cat "$WORK/mismatch-alpha.log" "$WORK/mismatch-bravo.log" 2>/dev/null \
+         | sed "s|$WORK||g" \
+         | grep -c "DIRECT-FALLBACK" || true)
+echo "## mismatch arm: fallback-evidence=${MIS_FB}x attribution=${MIS_ATTRIB}x packets-to-$LIE_IP=$PM (dial real, named addr NOT dialed)"
+if [ "$MIS_ATTRIB" = "0" ] && [ "$MIS_FB" -gt 0 ] && [ "$PM" -gt 0 ]; then
+  ok "gateC-mismatch: a real dial that never touched the claimed address prints NO attribution about it"
+else
+  bad "gateC-mismatch: attribution=$MIS_ATTRIB fallback=$MIS_FB packets=$PM - the attribution is bound to the CLAIM, not to the dialed address"
 fi
 ARM_EXTRA=""
 ARM_FLAGS=""

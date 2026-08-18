@@ -574,6 +574,20 @@ fn loopback_only() -> bool {
     false
 }
 
+/// True exactly when the dial-ahead for candidate `cand` is a dial OF the
+/// peer's claimed server-asserted address. The peer's claim comes off the
+/// wire untrusted, so this is the ONLY thing that may let the fallback name
+/// it: the name and the dialed address must be the SAME socket. A claim that
+/// does not parse, or a candidate that does not parse, or two addresses that
+/// merely look alike, all yield false - the attribution may only state a fact
+/// it established by dialing.
+fn dials_claimed(claimed: Option<SocketAddr>, cand: &str) -> bool {
+    match (claimed, cand.parse::<SocketAddr>()) {
+        (Some(c), Ok(a)) => c == a,
+        _ => false,
+    }
+}
+
 /// Gather all advertisable candidates for our bound endpoint port, and return
 /// (cands, adopted_server_public) where the second element is exactly the
 /// server-asserted (`whoami`) candidate that was ADOPTED into the set - computed
@@ -1678,9 +1692,10 @@ pub async fn race_connect(
     my_id: String,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     exchange: bool,
-    dialed: Arc<AtomicBool>,
+    peer_claimed: Option<SocketAddr>,
+    server_public_dialed: Arc<AtomicBool>,
 ) -> Option<Arc<dyn Transport>> {
-    race_connect_labeled(endpoint, peer_cands, secret, peer_id, my_uid, peer_uid, my_id, tx, "direct-quic", exchange, dialed).await
+    race_connect_labeled(endpoint, peer_cands, secret, peer_id, my_uid, peer_uid, my_id, tx, "direct-quic", exchange, peer_claimed, server_public_dialed).await
 }
 
 /// Same race, but with the route label parameterized so rung-2 (hole-punch) can
@@ -1693,11 +1708,12 @@ pub async fn race_connect(
 /// hang, no misalignment), it is never read without the peer having agreed to
 /// write it.
 ///
-/// `dialed` is set true as soon as the race has actually dialed at least one
-/// peer candidate (after every early return, so a knob that skips the dials
-/// leaves it false). The relay fallback reads it to say "dialed and never
-/// answered" only when a dial genuinely happened, never when we never got to
-/// the candidate.
+/// `peer_claimed` is the peer's wire-carried `server_public` claim, parsed. It
+/// is UNTRUSTED: it only becomes a fact when the dial loop below actually
+/// dials that address. `server_public_dialed` is set true exactly then and
+/// nowhere else, so the relay fallback can say "dialed and never answered"
+/// only about an address it dialed - never about a label that merely appeared
+/// on the wire.
 pub async fn race_connect_labeled(
     endpoint: Endpoint,
     peer_cands: Vec<String>,
@@ -1709,7 +1725,8 @@ pub async fn race_connect_labeled(
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     route: &str,
     exchange: bool,
-    dialed: Arc<AtomicBool>,
+    peer_claimed: Option<SocketAddr>,
+    server_public_dialed: Arc<AtomicBool>,
 ) -> Option<Arc<dyn Transport>> {
     let answerer = match answerer_for(&my_uid, &peer_uid, &my_id, &peer_id) {
         Ok(value) => value,
@@ -1721,8 +1738,8 @@ pub async fn race_connect_labeled(
     // The test-block knob only simulates a blocked rung-1 (direct-quic) path so
     // the WebRTC fallback gate can assert. It must NOT short-circuit rung-2, a
     // hole-punch race carries a distinct label. It returns BEFORE any dial, so
-    // `dialed` stays false and the fallback attribution stays silent - the
-    // gate's negative control for "we never got to the candidate".
+    // `server_public_dialed` stays false and the fallback attribution stays
+    // silent - the gate's negative control for "we never got to the candidate".
     if route == "direct-quic" && test_block() {
         // Fallback gate: pretend the direct path is unreachable. Drop the
         // endpoint and let the budget expire so WebRTC takes over.
@@ -1840,10 +1857,15 @@ pub async fn race_connect_labeled(
     // Dialer side: one future per candidate, auth as dialer.
     for cand in peer_cands {
         let Ok(addr) = cand.parse::<SocketAddr>() else { continue };
-        // The fallback attribution ("X never answered") is only honest when a
-        // dial to X actually happened. Mark that here, at the moment a dial
-        // future exists; every early return above left this false.
-        dialed.store(true, std::sync::atomic::Ordering::Relaxed);
+        // #237: the fallback attribution ("X never answered") is only honest
+        // when the PEER CLAIMED server-asserted address, and only THAT address,
+        // was actually dialed. Mark the flag at the candidate that equals the
+        // claim (after a successful parse), so a claim that was never in the
+        // dial set - or that does not even parse - can never be named by the
+        // fallback. The fact and the sentence are tied to the same address.
+        if dials_claimed(peer_claimed, &cand) {
+            server_public_dialed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let ep = endpoint.clone();
         let tkey = tkey;
         futs.push(Box::pin(async move {
@@ -2007,6 +2029,34 @@ mod tests {
         assert!(preferred_connection(false, true));
     }
 
+    /// #237 regression: once a peer has observed our address, `gather_candidates`
+    /// advertises THAT and does not consult the `/api/whoami` cache (which
+    /// `warm_public_ip` pre-warms at daemon start with a server assertion). The
+    /// server is unreachable here, so if whoami WERE consulted it would return
+    /// None and no public candidate would exist; the observed address being
+    /// present proves whoami was bypassed. The carried `adopted_server_public`
+    /// must be None (a peer-observed address is NOT server-asserted), so the
+    /// relay fallback would not name anything for a connection adopted this way.
+    /// #237: the fallback may name a peer's claimed server-asserted address only
+    /// when that EXACT address was dialed. `dials_claimed` is the two-value
+    /// comparison at the dial site: parse-normalized equality (so a merely
+    /// cosmetic difference in the label cannot defeat the claim), and false for
+    /// everything that does not prove a dial of the claim - a claim that does
+    /// not parse surfaces as `None` and can never match, a candidate that does
+    /// not parse is skipped by the dial loop, and an address that merely looks
+    /// close is not the dialed one.
+    #[test]
+    fn claimed_means_dialed_exactly() {
+        let claimed = Some("8.8.8.8:53".parse::<SocketAddr>().unwrap());
+        assert!(dials_claimed(claimed, "8.8.8.8:53"));
+        assert!(dials_claimed(claimed, "8.8.8.8:0053"), "cosmetic port formatting must match");
+        assert!(!dials_claimed(claimed, "8.8.8.9:53"), "a look-alike address is not the dialed one");
+        assert!(!dials_claimed(None, "8.8.8.8:53"), "an absent/unparseable claim is never a dialed claim");
+        assert!(
+            !dials_claimed(claimed, "8.8.8.8:notaport"),
+            "an unparseable candidate is skipped by the dial loop, never a dial of the claim"
+        );
+    }
     /// #237 regression: once a peer has observed our address, `gather_candidates`
     /// advertises THAT and does not consult the `/api/whoami` cache (which
     /// `warm_public_ip` pre-warms at daemon start with a server assertion). The
