@@ -56,14 +56,30 @@
 #       bootstrap HINT for FIRST contact, when no peer has observed us yet.
 #   C   THE NON-NEGOTIABLE (regression that flips): at the moment the code
 #       decides to use the relay, the fallback NAMES the server-asserted address
-#       that never answered. Two sub-assertions:
-#         C-silence   the negative runs (where no fallback happens) print
-#                     nothing about it - a warning that fires when nothing is
-#                     wrong trains users to ignore the channel that later
-#                     carries the real message.
-#         C-attribution  a run whose direct path cannot win (FILAMENT_DIRECT_
-#                     TEST_BLOCK forces it) falls back to the relay and names
-#                     the server-chosen address as the cause.
+#       that was dialed and never answered. Three sub-assertions:
+#         C-silence    the negative runs (where no fallback happens) print
+#                      nothing about it - a warning that fires when nothing is
+#                      wrong trains users to ignore the channel that later
+#                      carries the real message.
+#         C-attribution  a run whose direct path cannot win DIALS the server-
+#                      asserted address for REAL and falls back, naming exactly
+#                      that address. The dial is real: FILAMENT_DIRECT_ONLY_PUBLIC
+#                      strips the candidate set down to the adopted whoami address
+#                      (published by the injector as TEST-NET, which can never
+#                      answer), and the wire observable proves packets actually
+#                      went there - this is NOT a simulated stand-in. The old
+#                      FILAMENT_DIRECT_TEST_BLOCK substitute is retired from this
+#                      role (it skips the dial, so its "never answered" was false
+#                      in its own world); it now serves the negative control below.
+#         C-negative   a fallback that happens for an UNRELATED reason with a
+#                      server-asserted candidate PRESENT prints NO attribution.
+#                      The test-block arm runs with -v so the fallback itself is
+#                      evidenced ("DIRECT-FALLBACK" is a debug line), yet
+#                      "falling back to relay" must be absent: the race never
+#                      dialed anything (zero packets on the wire), so it has not
+#                      established that the server-asserted address failed. An
+#                      attribution that fires on presence alone blames a cause it
+#                      never dialed - the message is only printed when dialed=true.
 #
 # WHAT THE SHELL LAYER DOES NOT COVER, AND WHY (read before trusting green).
 # Peer-observed supersession - once a peer has seen us, the next connection
@@ -73,12 +89,21 @@
 # SAME processes can re-gather for a second connection. A wrong whoami is
 # therefore re-fetched on every reach and the wire observable cannot distinguish
 # "the observed address superseded the lie" from "the link was warm". The
-# superseSSION property is carried by the direct.rs unit test
+# supersession property is carried by the direct.rs unit test
 # `peer_observed_address_supersedes_whoami`, which produces a gather after
 # recording an observed address and asserts the server's answer is not in the
 # candidate set. Do not read this suite's greenness as coverage it never had:
 # the unit test owns the second-connection property, this fixture owns the
 # premise (gate B) and the attribution (gate C).
+#
+# Mixed-fleet negotiation (new peer offering `proto >= 2` meets an older build
+# that does not) is ALSO not asserted here: a real old-binary arm would need the
+# previous wire format shipped into the fixture. The negotiated skip is
+# symmetric by construction (each side computes one boolean from the OTHER side's
+# offer), so a mixed pair skips the observed-address frame on BOTH sides and the
+# new side prints a clear "older build" sentence instead of hanging or
+# misaligning the stream. That property is asserted by review of the single
+# decision site, not by this run.
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -317,23 +342,58 @@ else
 fi
 ARM_EXTRA=""
 
-# C-attribution: a run whose direct path cannot win. FILAMENT_DIRECT_TEST_BLOCK
-# simulates an unreachable direct path - the fixture is same-host, so the public
-# candidate and the loopback candidate share a wire and the direct path cannot be
-# made to fail for the public address alone; the knob is the honest stand-in. The
-# direct attempt burns its budget, `expired_direct` decides to use the relay, and
-# that decision must NAME the address the server asserted.
-ARM_EXTRA="FILAMENT_DIRECT_TEST_BLOCK=1"
-run_arm "$LIE_IP" blocked
-ATTRIB=$(cat "$WORK/blocked-alpha.log" "$WORK/blocked-bravo.log" 2>/dev/null \
+# C-attribution (POSITIVE, a REAL dial): FILAMENT_DIRECT_ONLY_PUBLIC strips every
+# candidate but the server-asserted one, which the injector publishes as
+# TEST-NET (203.0.113.7) - routable-looking, never answerable. Both sides'
+# races therefore DIAL 203.0.113.7 for real (UDP leaves the box, tcpdump proves
+# it) and fail for real; the fallback names exactly the address that was dialed
+# and never answered. This is the moment-of-symptom causal statement chief-ux
+# asked for: one reach, a candidate that cannot work, and an assertion on the
+# fallback line.
+ARM_EXTRA="FILAMENT_DIRECT_ONLY_PUBLIC=1"
+run_arm "$LIE_IP" attrib
+PA=$(pkts_of attrib)
+ATTRIB=$(cat "$WORK/attrib-alpha.log" "$WORK/attrib-bravo.log" 2>/dev/null \
          | sed "s|$WORK||g" \
          | grep -i "falling back to relay" | head -3)
-echo "## the fallback attribution in the blocked arm:"
+echo "## attrib arm: packets-to-$LIE_IP=$PA (the dial was REAL)"
+echo "## the fallback attribution:"
 if [ -n "$ATTRIB" ]; then echo "$ATTRIB" | sed 's/^/    /'; else echo "    (none)"; fi
-if echo "$ATTRIB" | grep -q "$LIE_IP"; then
-  ok "gateC: the relay fallback names the server-asserted address ($LIE_IP)"
+if [ "$PA" -gt 0 ]; then
+  if echo "$ATTRIB" | grep -q "$LIE_IP"; then
+    ok "gateC-attribution: a REAL dial to the server-asserted address ($PA pkts) fell back and named $LIE_IP as the cause"
+  else
+    bad "gateC-attribution: the candidate was dialed ($PA pkts) and the fallback happened, but it does not name the server-asserted address - silent at the moment of the symptom"
+  fi
 else
-  bad "gateC: the relay fallback does not name the server-asserted address - silent at the moment of the symptom"
+  bad "gateC-attribution: the attrib arm sent ZERO packets to $LIE_IP - the dial was not real and the assertion proves nothing"
+fi
+ARM_EXTRA=""
+
+# C-negative (the asymmetric control): a fallback that happens for an UNRELATED
+# reason with a server-asserted candidate PRESENT must print NO attribution.
+# FILAMENT_DIRECT_TEST_BLOCK short-circuits the race BEFORE it dials anything
+# (the daemons still adopt and advertise the server-asserted address and still
+# fall back when the budget dies). Run with -v so the fallback itself is
+# evidenced ("DIRECT-FALLBACK" is a debug line) - yet, because not a single dial
+# happened, the code has not established that the server-asserted address
+# failed, and pinning "never answered" on it would be a lie. The gate proves
+# the message is conditioned on the DIAL, not on the candidate's presence.
+ARM_EXTRA="FILAMENT_DIRECT_TEST_BLOCK=1"
+ARM_FLAGS="-v"
+run_arm "$LIE_IP" testblocked
+PN=$(pkts_of testblocked)
+NEG_ATTRIB=$(cat "$WORK/testblocked-alpha.log" "$WORK/testblocked-bravo.log" 2>/dev/null \
+            | sed "s|$WORK||g" \
+            | grep -c "falling back to relay" || true)
+NEG_FB=$(cat "$WORK/testblocked-alpha.log" "$WORK/testblocked-bravo.log" 2>/dev/null \
+         | sed "s|$WORK||g" \
+         | grep -c "DIRECT-FALLBACK" || true)
+echo "## testblocked arm: fallback-evidence=${NEG_FB}x attribution=${NEG_ATTRIB}x packets-to-$LIE_IP=$PN"
+if [ "$NEG_ATTRIB" = "0" ] && [ "$NEG_FB" -gt 0 ] && [ "$PN" = "0" ]; then
+  ok "gateC-negative: an unrelated-cause fallback with the server-asserted candidate present says NOTHING about it (dial never happened)"
+else
+  bad "gateC-negative: attribution=$NEG_ATTRIB fallback=$NEG_FB packets=$PN - the attribution is NOT tied to an actual dial"
 fi
 ARM_EXTRA=""
 ARM_FLAGS=""

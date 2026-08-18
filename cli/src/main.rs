@@ -8290,7 +8290,7 @@ struct Conn {
     /// was created (peer's re-dial after a mid-transfer death). Same class as Bug
     /// 1 (pre-PAKE offers): buffered here and replayed once `start_direct` creates
     /// the pending. pid → (candidates, srflx).
-    buffered_offers: HashMap<String, (Vec<String>, Option<String>)>,
+    buffered_offers: HashMap<String, (Vec<String>, Option<String>, Option<String>, u8)>,
     /// RESILIENCE bookkeeping (stall/relay/warm/upgrade); see ResilienceState.
     resil: ResilienceState,
     /// Is the rung-1 direct-QUIC path allowed for THIS session? Normally this is
@@ -8426,12 +8426,16 @@ struct DirectPending {
     /// rung-2: our advertised srflx (logged at offer time; kept for diagnostics).
     #[allow(dead_code)]
     my_srflx: Option<std::net::SocketAddr>,
-    /// #237: the server-asserted (whoami) public candidate advertised in this
-    /// attempt's transport-offer, when one was adopted (None when a peer had
-    /// already observed our address, whoami was suppressed, or the address was
-    /// local). Carried to the fallback decision so `expired_direct` can NAME the
-    /// candidate that never answered instead of narrating an unattributed fallback.
-    server_public: Option<String>,
+    /// #237: the server-asserted (whoami) public candidate the PEER advertised in
+    /// its transport-offer, when the peer adopted one (None when the peer had
+    /// already observed OUR address, suppressed whoami, or was answered a local
+    /// address). This is the candidate OUR race actually dialed, so it is the one
+    /// the relay-fallback attribution may honestly name as "never answered".
+    peer_server_public: Option<String>,
+    /// #237: set true the instant the race actually dials a peer candidate
+    /// (never for a knob that skips the dials or before the offer/race exist).
+    /// The attribution says "dialed and never answered" only when this is true.
+    dialed: Arc<AtomicBool>,
     /// P5 (GAP-6): this is a relay->direct UPGRADE probe, a direct dial run
     /// ALONGSIDE a live relay link (not the cold establishment path). When the
     /// race wins, `on_transport_offer` posts `Ev::DirectUpgradeReady` (verify-
@@ -9239,7 +9243,13 @@ impl Conn {
         // QUIC on if rung-1's host-candidate race fails. STUN failure is graceful:
         // no srflx is advertised and rung-2 simply won't fire for this peer.
 
-        let (cands, srflx, server_public) = if is_local {
+        // #237: gather_candidates is the ONE computation of both the candidate
+        // set and the server-asserted address adopted into it (Some exactly
+        // when a server-chosen address was pushed and no peer had observed us
+        // yet). The offer carries that value to the peer so the PEER's race can
+        // dial it and, if it never answers, name it at ITS fallback decision.
+        // No second copy of the rule exists to desynchronize.
+        let (cands, server_public, srflx) = if is_local {
             // For local peers, ensure we have a listener and return TCP candidate.
             if self.local_port.is_none() {
                 let (listener, port) = crate::local::listen_local().await.unwrap();
@@ -9256,13 +9266,9 @@ impl Conn {
                     None
                 }
             };
-            let (cands, srflx) =
+            let ((cands, server_public), srflx) =
                 tokio::join!(direct::gather_candidates(&self.server, port), srflx_fut);
-            // #237: capture which candidate was adopted on the server's say-so
-            // alone, to name it at the fallback decision. Reuses the warm whoami
-            // cache filled a line above by gather_candidates (no extra round trip).
-            let server_public = direct::server_asserted_public(&self.server, port).await;
-            (cands, srflx, server_public)
+            (cands, server_public, srflx)
         };
 
         let (punch_sock, my_srflx) = match srflx {
@@ -9272,9 +9278,15 @@ impl Conn {
 
         // transport-offer rides the OPAQUE signaling relay (same channel as ICE
         // signals); the server cannot read or forge it without failing the MAC.
-        let mut offer = json!({ "type": "transport-offer", "v": 1, "addrs": cands });
+        let mut offer = json!({ "type": "transport-offer", "v": 1, "proto": 2, "addrs": cands });
         if let Some(s) = my_srflx {
             offer["srflx"] = json!(s.to_string());
+        }
+        // #237: the candidate this offer adopts on the server's say-so alone.
+        // The peer dials it; if it never answers, the peer's fallback can name
+        // exactly this address instead of claiming a cause it never dialed.
+        if let Some(s) = server_public {
+            offer["server_public"] = json!(s);
         }
         // P5 (GAP-6): tag a probe offer so the PEER races it as an upgrade probe
         // too, its winning side then posts Ev::DirectUpgradeReady (verify-before-
@@ -9334,7 +9346,12 @@ impl Conn {
                 endpoint: ep,
                 punch_sock,
                 my_srflx,
-                server_public,
+                // #237: the peer's server-asserted candidate arrives with its transport-offer
+                // (on_transport_offer fills it); at insert time no offer has
+                // arrived yet. The dialed gate starts false and flips only when
+                // the race truly dials.
+                peer_server_public: None,
+                dialed: Arc::new(AtomicBool::new(false)),
                 probe,
             },
         );
@@ -9346,9 +9363,9 @@ impl Conn {
         }
         // Bug 2: replay any transport-offers that were buffered while we had
         // no DirectPending (the sender re-dialed after a mid-transfer death).
-        if let Some((cands, srflx)) = self.buffered_offers.remove(pid) {
+        if let Some((cands, srflx, server_public, proto)) = self.buffered_offers.remove(pid) {
             ui::debug(&format!("replaying buffered transport-offer from {pid}"));
-            self.on_transport_offer(pid, cands, srflx);
+            self.on_transport_offer(pid, cands, srflx, server_public, proto);
         }
     }
 
@@ -9381,12 +9398,32 @@ impl Conn {
     /// and haven't started the race yet, consume the endpoint and spawn the
     /// simultaneous-open + auth race; the winner posts Ev::DirectReady (or, for an
     /// upgrade probe, Ev::DirectUpgradeReady, verify-before-upgrade).
-    fn on_transport_offer(&mut self, pid: &str, peer_cands: Vec<String>, peer_srflx: Option<String>) {
+    /// `peer_server_public`/`peer_proto` come from the peer's transport-offer
+    /// (#237): the server-asserted candidate the peer adopted (which OUR race
+    /// will dial) and the protocol version that gates the observed-address
+    /// exchange.
+    fn on_transport_offer(&mut self, pid: &str, peer_cands: Vec<String>, peer_srflx: Option<String>, peer_server_public: Option<String>, peer_proto: u8) {
         let Some(p) = self.direct_pending.get_mut(pid) else { return };
         if p.racing {
             return;
         }
         let Some(ep) = p.endpoint.take() else { return };
+        // #237: record what the peer advertised on the server's say-so, BEFORE the
+        // race consumes the endpoint.
+        let peer_name = p.secret.0.clone();
+        p.peer_server_public = peer_server_public;
+        let dialed = p.dialed.clone();
+        // #237 (mixed-fleet): a peer running an older build (no `proto` >= 2 in
+        // its offer) gets a clear sentence instead of a hang or a mismatch. The
+        // observed-address exchange is skipped on BOTH sides (the race below is
+        // told `exchange=false`, so the stream stays byte-identical to the old
+        // protocol and the direct link still forms). A refusal without a
+        // sentence is just a support mystery; this is the sentence.
+        if peer_proto < 2 {
+            crate::ui::say(&format!(
+                "peer {peer_name} is running an older build without the direct address exchange; link still works, address supersession skipped"
+            ));
+        }
         p.racing = true;
         let secret = p.secret.1.clone();
         // P5 (GAP-6): is THIS the upgrade-probe pending? Then the winner posts
@@ -9400,6 +9437,11 @@ impl Conn {
             .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
         let tx = self.tx.clone();
         let pid_s = pid.to_string();
+        // #237: the observed-address exchange runs only when BOTH ends agreed
+        // (our build is proto 2, so the negotiator is the peer's advertised
+        // version). The peer computes the same boolean from OUR offer, so both
+        // sides skip or both sides run - never one of each.
+        let exchange = peer_proto >= 2;
         let peer_uid = self.roster.get(pid).and_then(|info| info["uid"].as_str()).map(str::to_owned);
         let Some(peer_uid) = peer_uid else {
             eprintln!("direct role election deferred for {pid}: no peer UID");
@@ -9439,7 +9481,7 @@ impl Conn {
             // derived inside the race from both endpoint identity tuples, so the
             // connector and offer-receiver cannot drift via caller literals.
             if let Some(t) =
-                direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), my_uid.clone(), peer_uid.clone(), my_id.clone(), tx.clone()).await
+                direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), my_uid.clone(), peer_uid.clone(), my_id.clone(), tx.clone(), exchange, dialed.clone()).await
             {
                 let _ = tx.send(mk(pid_s, t, "direct-quic"));
                 return;
@@ -9461,6 +9503,8 @@ impl Conn {
                         peer_uid.clone(),
                         my_id.clone(),
                         tx.clone(),
+                        exchange,
+                        dialed.clone(),
                     )
                     .await
                     {
@@ -9698,13 +9742,21 @@ impl Conn {
                     .get(&pid)
                     .cloned()
                     .unwrap_or_else(|| json!({ "id": pid, "name": p.secret.0 }));
-                // Gate C (#237): the fallback is now ATTRIBUTED. The decision to
-                // use the relay knows which server-asserted public candidate was
-                // adopted and never answered; name it here (default verbosity) so
-                // the positive run says WHY, and the common case (a working
-                // direct path) stays silent. The `server_public` candidate is
-                // None exactly when no server-chosen address was in the set.
-                match p.server_public.as_ref() {
+                // Gate C (#237): the fallback is now ATTRIBUTED - and only when the
+                // attribution is TRUE. The decision to use the relay names the
+                // peer's server-asserted public candidate only when (a) the peer
+                // actually advertised one (so there is something to name) AND
+                // (b) our race truly DIALED it (so "never answered" is a fact,
+                // not a guess). Absent (a) there is no server-chosen address to
+                // blame; absent (b) the budget went elsewhere - the peer never
+                // offered, the race was skipped, a knob short-circuited the
+                // dials - and "never answered" would blame a candidate we never
+                // reached. Both are handled by staying silent at default
+                // verbosity: the infinite negative run stays quiet, and a
+                // fallback with an unrelated cause never names a cause it has
+                // not established.
+                let attributed = p.peer_server_public.as_ref().filter(|_| p.dialed.load(Ordering::Relaxed));
+                match attributed {
                     Some(sp) => crate::ui::say(&format!(
                         "falling back to relay: the public address from the server ({sp}) never answered"
                     )),
@@ -13887,6 +13939,12 @@ async fn send_cmd(
                         .unwrap_or_default();
                     // rung-2: optional server-reflexive candidate for hole-punch.
                     let srflx = data["srflx"].as_str().map(String::from);
+                    // #237: the candidate the peer adopted on the server's say-so
+                    // alone (the one OUR race will dial and may have to name),
+                    // and the peer's protocol version (gates the observed-address
+                    // exchange; an offer without `proto` is an older build).
+                    let peer_server_public = data["server_public"].as_str().map(String::from);
+                    let peer_proto = data["proto"].as_u64().unwrap_or(1).clamp(1, 255) as u8;
                     // P5 (GAP-6): a `probe:true` offer is a relay->direct UPGRADE
                     // probe from the other end. If we're serving this peer on relay
                     // and have no probe of our own yet, ARM one so the symmetric
@@ -13902,7 +13960,7 @@ async fn send_cmd(
                     // our DirectPending exists (our start_direct hasn't returned
                     // yet, or PeerLeft dropped the link before the repair).
                     if conn.direct_pending.contains_key(&from) {
-                        conn.on_transport_offer(&from, cands, srflx);
+                        conn.on_transport_offer(&from, cands, srflx, peer_server_public, peer_proto);
                     } else {
                         let known = crate::devices_load()
                             .into_iter()
@@ -13911,9 +13969,9 @@ async fn send_cmd(
                             conn.start_direct(&from, &name, &secret).await;
                         }
                         if conn.direct_pending.contains_key(&from) {
-                            conn.on_transport_offer(&from, cands, srflx);
+                            conn.on_transport_offer(&from, cands, srflx, peer_server_public, peer_proto);
                         } else {
-                            conn.buffered_offers.insert(from.clone(), (cands, srflx));
+                            conn.buffered_offers.insert(from.clone(), (cands, srflx, peer_server_public, peer_proto));
                         }
                     }
                     continue;
@@ -15281,7 +15339,7 @@ async fn recv_cmd(
     // BUFFER the most recent pre-auth offer per candidate peer and REPLAY it the
     // instant that peer authenticates. Bounded by RECV_MAX_CANDIDATES (same keys).
     let mut recv_pending_offers: HashMap<String, Value> = HashMap::new();
-    let mut recv_pending_direct: HashMap<String, (Vec<String>, Option<String>)> = HashMap::new();
+    let mut recv_pending_direct: HashMap<String, (Vec<String>, Option<String>, Option<String>, u8)> = HashMap::new();
     // #161: first-offer hold start times per peer. On the typed-code path the
     // buffered offer is replayed at PAKE confirm, BEFORE DirectReady issues the
     // 0x02 identity challenge, so the first offer always arrives with identity
@@ -16871,12 +16929,16 @@ async fn recv_cmd(
                         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                         .unwrap_or_default();
                     let srflx = data["srflx"].as_str().map(String::from);
+                    // #237: peer's server-asserted candidate + protocol version
+                    // (see the send-side handler; absent `proto` means older build).
+                    let peer_server_public = data["server_public"].as_str().map(String::from);
+                    let peer_proto = data["proto"].as_u64().unwrap_or(1).clamp(1, 255) as u8;
                     // If we're on the code path and this peer hasn't authenticated yet,
                     // buffer the transport-offer until PAKE completes. Otherwise
                     // on_transport_offer would find no DirectPending (no secret) and
                     // silently drop the offer, causing the QUIC race to fail.
                     if recv_code_path && !recv_pake_done {
-                        recv_pending_direct.insert(from.clone(), (cands, srflx));
+                        recv_pending_direct.insert(from.clone(), (cands, srflx, peer_server_public, peer_proto));
                         ui::debug(&format!("buffering pre-auth transport-offer from {from}"));
                         continue;
                     }
@@ -16889,7 +16951,7 @@ async fn recv_cmd(
                     // Bug 1's pre-PAKE buffer). Without this, on_transport_offer
                     // finds no pending and silently drops the offer.
                     if conn.direct_pending.contains_key(&from) {
-                        conn.on_transport_offer(&from, cands, srflx);
+                        conn.on_transport_offer(&from, cands, srflx, peer_server_public, peer_proto);
                     } else {
                         // Also try to re-arm direct proactively: if we still
                         // know this peer's (name,secret), create the pending
@@ -16902,9 +16964,9 @@ async fn recv_cmd(
                         }
                         if conn.direct_pending.contains_key(&from) {
                             // Re-arm succeeded — process the offer now.
-                            conn.on_transport_offer(&from, cands, srflx);
+                            conn.on_transport_offer(&from, cands, srflx, peer_server_public, peer_proto);
                         } else {
-                            conn.buffered_offers.insert(from.clone(), (cands, srflx));
+                            conn.buffered_offers.insert(from.clone(), (cands, srflx, peer_server_public, peer_proto));
                             ui::debug(&format!("buffering re-dial transport-offer from {from} (no pending yet)"));
                         }
                     }
@@ -17009,8 +17071,8 @@ async fn recv_cmd(
                         }
                         // Replay any buffered transport-offer that arrived before PAKE
                         // (now that start_direct created a DirectPending with the secret)
-                        if let Some((cands, srflx)) = recv_pending_direct.remove(&from) {
-                            conn.on_transport_offer(&from, cands, srflx);
+                        if let Some((cands, srflx, server_public, proto)) = recv_pending_direct.remove(&from) {
+                            conn.on_transport_offer(&from, cands, srflx, server_public, proto);
                         }
                         recv_pending_direct.clear();
                         // Replay any buffered file offers from this peer

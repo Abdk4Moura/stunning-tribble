@@ -21,6 +21,7 @@ use anyhow::{anyhow, Context, Result};
 use quinn::Endpoint;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::direct;
@@ -355,6 +356,8 @@ pub async fn connect(
     peer_uid: String,
     my_id: String,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
+    exchange: bool,
+    dialed: Arc<AtomicBool>,
 ) -> Option<Arc<dyn Transport>> {
     // Punch on a blocking thread (blocking UDP I/O), reclaim the socket.
     let punch_result = tokio::task::spawn_blocking(move || {
@@ -390,6 +393,8 @@ pub async fn connect(
         my_id,
         tx,
         "holepunched",
+        exchange,
+        dialed,
     )
     .await
 }
