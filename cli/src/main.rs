@@ -19909,8 +19909,10 @@ mod tests {
     }
 
     #[test]
-    fn link_dead_and_live_predicates_encode_246() {
+    fn link_dead_and_live_predicates_encode_246_without_suppressing_disconnected_recovery() {
         use super::{link_dead_for, link_has_live_for};
+        use crate::net::is_live_state;
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
         // The livelock shape: a WebRTC link right after `establish`. NO
         // transport, NO workers, but its ICE agent is alive and gathering. The
         // old code read "no transport AND all (zero) workers dead" as DEAD and
@@ -19920,6 +19922,14 @@ mod tests {
         let establishing = (true, true, true);
         assert!(!link_dead_for(establishing.0, establishing.1, establishing.2));
         assert!(link_has_live_for(establishing.0, false, false));
+        // Disconnected is deliberately not peer-live. A polite peer does not
+        // restart ICE, so treating it as live would suppress its sole recovery:
+        // a re-dial. This intentionally lets a re-dial displace an impolite
+        // peer's restart too, restoring the bounded pre-#246 behavior.
+        assert!(!is_live_state(RTCPeerConnectionState::Disconnected));
+        let disconnected = (false, true, true);
+        assert!(link_dead_for(disconnected.0, disconnected.1, disconnected.2));
+        assert!(!link_has_live_for(disconnected.0, false, false));
         // A link whose peer reached a terminal state with nothing serving IS
         // dead: droppable before a fresh attempt (nothing is lost).
         assert!(link_dead_for(false, true, true));

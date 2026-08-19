@@ -1394,29 +1394,21 @@ impl Peer {
         self.pc.connection_state() == RTCPeerConnectionState::Connected
     }
 
-    /// #246: a peer connection is "live" while its ICE/DTLS agent is still
-    /// working toward or past Connected. `is_connected` is the serving-state
-    /// test (the data path is up); this is the PROGRESS test. Only Failed and
-    /// Closed are terminal: New/Connecting/Connected are in-flight, and
-    /// Disconnected is recovering (webrtc-rs drives it back via `restart_ice`).
-    /// A link that merely has not CONNECTED yet is not a link that is safe to
-    /// drop.
+    /// #246: a peer connection is "live" while it is establishing or serving.
+    /// `is_connected` is the serving-state test (the data path is up); this is
+    /// the narrower PROGRESS test. New/Connecting/Connected have a concrete
+    /// operation in flight, so a re-dial must not displace them.
     ///
-    /// That every live state is BOUNDED is what keeps this a wait instead of
-    /// a hang: New/Connecting are bounded by the C3 establishment watchdog
-    /// (`WATCHDOG_SECS`, 15s, sent Ev::Stuck when the pc is not Connected),
-    /// and Disconnected is bounded by `on_pc_state`'s grace timer (6s normally,
-    /// the away-window plus 15s for an announced leave, sent Ev::GraceExpired).
-    /// Both are generation-keyed, so the bound survives even when the peer's
-    /// re-dial is suppressed (the generation does not advance). A re-dial
-    /// suppressed by `has_live_transport` therefore does not spare a dying
-    /// link; it defers the decision to the timer the link's own generation
-    /// armed.
+    /// Disconnected is deliberately NOT live. Only an impolite, non-away peer
+    /// restarts ICE in `on_pc_state`; a polite peer otherwise has no recovery
+    /// in flight. Calling both states live suppressed that polite peer's sole
+    /// recovery, the re-dial, until its grace expired. This also means a re-dial
+    /// may displace an impolite peer's ICE restart, restoring pre-#246 behavior
+    /// for that bounded state rather than silently changing recovery semantics.
+    /// New/Connecting remain bounded by the C3 establishment watchdog
+    /// (`WATCHDOG_SECS`, 15s, sent Ev::Stuck when the pc is not Connected).
     pub fn is_live(&self) -> bool {
-        !matches!(
-            self.pc.connection_state(),
-            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
-        )
+        is_live_state(self.pc.connection_state())
     }
 
     /// C4: nudge ICE recovery after a transient 'disconnected' (impolite side
@@ -1627,6 +1619,17 @@ impl Peer {
                 || pair.remote.typ == RTCIceCandidateType::Relay,
         })
     }
+}
+
+/// The state-only portion of `Peer::is_live`, exposed so #246's executable
+/// invariant can pin the disconnected recovery boundary without a live PC.
+pub(crate) fn is_live_state(state: RTCPeerConnectionState) -> bool {
+    matches!(
+        state,
+        RTCPeerConnectionState::New
+            | RTCPeerConnectionState::Connecting
+            | RTCPeerConnectionState::Connected
+    )
 }
 
 /// The concrete endpoints of a selected ICE candidate pair, for path display.
