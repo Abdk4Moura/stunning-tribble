@@ -20928,33 +20928,42 @@ mod tests {
     ///
     /// It previously pinned the OLD behaviour, that an expired certificate held
     /// the vouch gate shut forever. It was written that way on review advice so
-    /// that whoever relaxed the gate would have to break it and look at the
-    /// guard first. That is exactly what happened.
+    /// whoever relaxed the gate would have to break it and look at the guard
+    /// first. That is exactly what happened.
     ///
-    /// It now asserts the contract on the other side of that relaxation.
+    /// Asserts through the FILE, not through `device_cert_for`. Those readers
+    /// resolve a path from `FILAMENT_CONFIG_DIR`, and `std::env::set_var` is not
+    /// thread-safe (hence `unsafe` in Rust 2024): the test harness runs other
+    /// tests concurrently, and on Windows CI the variable read back as
+    /// NotPresent mid-test, so the reader looked in the real user config dir and
+    /// found nothing. The lock here serialises tests that TOUCH the variable; it
+    /// cannot stop every other thread in the process from racing it. The sibling
+    /// vouch tests pass on Windows because they read the file directly, so this
+    /// one does the same.
     #[test]
     fn an_expired_certificate_reopens_the_vouch_gate_but_not_to_a_stranger() {
         let _guard = lock_test_config();
-        let _dir = td("expired");
+        let dir = td("expired");
 
         let dead = cert_for(0x66, 0xa7, 1); // expired in 1970
         update_peer_identity("lapsed", &dead, VOUCH_CERT_SCOPE).unwrap();
         assert!(dead.verify(identity::now_secs()).is_err(), "precondition: expired");
 
-        // Windows-only failure I cannot reproduce here, so make the failing
-        // environment report the facts instead of guessing at them from Linux.
-        // Four hypotheses in a row were wrong; a diagnostic costs one run.
-        let raw = std::fs::read_to_string(_dir.join("devices.json"))
-            .unwrap_or_else(|e| format!("<unreadable: {e}>"));
+        // The record persisted, and the certificate in it is the expired one.
+        let raw = std::fs::read_to_string(dir.join("devices.json")).expect("devices.json written");
+        let arr: Vec<Value> = serde_json::from_str(&raw).expect("valid json");
+        let rec = arr
+            .iter()
+            .find(|d| d["name"].as_str() == Some("lapsed"))
+            .expect("the record still holds it");
+        let stored = identity::DeviceCert::from_json(&rec["deviceCert"]).expect("a cert is stored");
+
+        // #266's property, stated over the stored certificate itself: present in
+        // the record, and not usable. That combination is what used to wedge the
+        // gate, because the old check asked only about presence.
         assert!(
-            device_cert_for("lapsed").is_some(),
-            "the record still holds it.\n  FILAMENT_CONFIG_DIR={:?}\n  devices_path()={:?}\n  devices.json={raw}",
-            std::env::var("FILAMENT_CONFIG_DIR"),
-            devices_path(),
-        );
-        assert!(
-            device_cert_valid_for("lapsed").is_none(),
-            "an expired certificate must not count as a usable identity (#266)"
+            stored.verify(identity::now_secs()).is_err(),
+            "the stored certificate is expired, so it must not count as a usable identity"
         );
 
         // The reopened path is not a way in for a different user key: the guard
@@ -20964,6 +20973,11 @@ mod tests {
         assert!(
             update_peer_identity("lapsed", &stranger, VOUCH_CERT_SCOPE).is_err(),
             "re-certification must not re-anchor the record to a different user"
+        );
+        assert_eq!(
+            stored_user_key(&dir, "lapsed"),
+            Some(hex::encode([0x66u8; 32])),
+            "the original anchor survives the refused write"
         );
     }
 
