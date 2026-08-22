@@ -636,12 +636,23 @@ pub fn cap_gate_effective(
         // Unprovisioned is logged once per resource so a fresh node never floods.
         match (legacy_allowed, outcome) {
             (true, CapOutcome::Denied(reason)) => {
-                eprintln!(
+                // #231: every CAP-SHADOW line is internal telemetry for the #195
+                // flip decision, addressed to us and not to the person receiving
+                // a file. The `[unprovisioned]` line was already routed to debug;
+                // this one and WIDENING still wrote straight to stderr, so they
+                // could surface mid-transfer on the flagship path at the default
+                // level, which is what the issue is about.
+                //
+                // Nothing is lost by demoting it: the durable record of a flip
+                // blocker is `cap_shadow_counts()`, which survives the process
+                // and is what the flip is actually judged on. The line is the
+                // convenience view of a counter, not the counter.
+                crate::ui::debug(&format!(
                     "CAP-SHADOW CRITICAL: a header EXISTS and DENIES '{action}' on '{resource}' for dev={} user={} that legacy ALLOWED (reason: {reason}); a flip would BREAK this open [{}]",
                     hex::encode(dev),
                     hex::encode(usr),
                     cap_shadow_counts().summary(),
-                );
+                ));
             }
             (true, CapOutcome::Unprovisioned) => log_once(
                 format!("nh|{resource}"),
@@ -662,7 +673,7 @@ pub fn cap_gate_effective(
                     hex::encode(dev),
                     hex::encode(usr),
                 ),
-                false,
+                true, // #231: telemetry, not user narration (see CRITICAL above)
             ),
             _ => {}
         }
