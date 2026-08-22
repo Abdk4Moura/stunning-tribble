@@ -3720,7 +3720,7 @@ async fn up_cmd(
         // actually have a block (avoid noise for devices without one).
         for device in &revoked {
             if sshkeys::has_block(&ak_content, device) && !authoritative {
-                eprintln!("CAP-SHADOW RECONCILE (startup): WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow");
+                ui::critical(&format!("CAP-SHADOW RECONCILE (startup): WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow"));
             }
         }
         let new_ak = crate::capability::reconcile_shell_keys(&revoked, &ak_content, authoritative);
@@ -12927,7 +12927,7 @@ async fn main() -> Result<()> {
                     // Emit per-device shadow logs for actual-block devices.
                     for device in &revoked {
                         if sshkeys::has_block(&ak_content, device) && !authoritative {
-                            eprintln!("CAP-SHADOW RECONCILE: WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow");
+                            ui::critical(&format!("CAP-SHADOW RECONCILE: WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow"));
                         }
                     }
                     let new_ak = crate::capability::reconcile_shell_keys(&revoked, &ak_content, authoritative);
@@ -18146,14 +18146,6 @@ async fn recv_cmd(
                     });
                     complete_warm_bootstrap(&mut pending_bootstrap, &pid, &reply).await;
                 }
-                // Shell serving is OFF here. Without this arm the message falls
-                // through the match and the acceptor says NOTHING, so the caller
-                // can only time out: `filament shell X --ssh` burned its full
-                // bootstrap deadline and then guessed, while plain
-                // `filament shell X` printed the reason immediately. The refusal
-                // exists; only this path failed to send it. Measured across three
-                // machines, not inferred.
-                #[cfg(unix)]
                 // #268: an `l2-open` arriving while L2 is OFF used to fall
                 // through and be IGNORED. The initiator has already committed a
                 // client to that stream, so it waits for an answer that is never
@@ -18181,6 +18173,21 @@ async fn recv_cmd(
                     }
                     continue;
                 }
+                // NOTE: keep this arm ABOVE the `#[cfg(unix)]` comment block
+                // below. That attribute belongs to `shell-bootstrap`, and an
+                // outer attribute binds to the NEXT arm regardless of any
+                // comments in between: inserting here originally compiled this
+                // refusal out on Windows AND silently made the shell-bootstrap
+                // deny unconditional there. Found in review, not by the compiler,
+                // because both outcomes still build.
+                // Shell serving is OFF here. Without this arm the message falls
+                // through the match and the acceptor says NOTHING, so the caller
+                // can only time out: `filament shell X --ssh` burned its full
+                // bootstrap deadline and then guessed, while plain
+                // `filament shell X` printed the reason immediately. The refusal
+                // exists; only this path failed to send it. Measured across three
+                // machines, not inferred.
+                #[cfg(unix)]
                 Some("shell-bootstrap") if !l2_enabled => {
                     if let Some(t) = conn.transport_of(&pid) {
                         let _ = t
@@ -21965,6 +21972,42 @@ mod tests {
                 "banner lists '{verb}' but clap hides it; a command that works must be discoverable or deliberately removed"
             );
         }
+    }
+
+    #[test]
+    fn a_device_with_no_identity_is_offered_both_ways_in() {
+        // #209: there are TWO ways to be brought into an identity, a pairing code
+        // claimed with `add <code>` and a bounded invitation claimed with `join`,
+        // and the launcher offered only the second. Someone holding a pairing
+        // code, which is the path the OWNER side presents first, had no entry on
+        // the device doing the claiming.
+        //
+        // Added because review found the fix undefended: the existing menu test
+        // asserts send/devices/init and says nothing about this entry, so
+        // deleting it left the suite green. That is the same shape as #227, which
+        // this same PR exists to correct, so leaving it untested would have been
+        // the defect reappearing inside its own fix.
+        for (owner, joined, count) in [(false, false, 0usize), (false, false, 2usize)] {
+            let actions = first_screen_actions(owner, joined, count);
+            let verbs: Vec<&str> = actions.iter().map(|(_, verb)| *verb).collect();
+            assert!(
+                verbs.contains(&"add"),
+                "a device with no identity must be offered the pairing-code claim (device_count={count}): {verbs:?}"
+            );
+            assert!(
+                verbs.contains(&"join"),
+                "and the invitation claim as well (device_count={count}): {verbs:?}"
+            );
+        }
+        // An owner already has an identity; neither claim belongs on that menu.
+        let owner_verbs: Vec<&str> = first_screen_actions(true, false, 1)
+            .iter()
+            .map(|(_, v)| *v)
+            .collect();
+        assert!(
+            !owner_verbs.contains(&"join"),
+            "an owner is not claiming an invitation: {owner_verbs:?}"
+        );
     }
 
     #[test]

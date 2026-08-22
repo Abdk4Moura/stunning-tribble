@@ -314,7 +314,9 @@ fn log_once(key: String, msg: &str, verbose: bool) {
             // narration: shown only at -v (ui::debug), never on the flagship path.
             crate::ui::debug(msg);
         } else {
-            eprintln!("{msg}");
+            // #231: loud, but through the ui layer so it respects NO_COLOR and
+            // pipe mode. Loud is the level; raw stderr was never the point.
+            crate::ui::critical(msg);
         }
     }
 }
@@ -642,18 +644,19 @@ pub fn cap_gate_effective(
         // Unprovisioned is logged once per resource so a fresh node never floods.
         match (legacy_allowed, outcome) {
             (true, CapOutcome::Denied(reason)) => {
-                // #231: every CAP-SHADOW line is internal telemetry for the #195
-                // flip decision, addressed to us and not to the person receiving
-                // a file. The `[unprovisioned]` line was already routed to debug;
-                // this one and WIDENING still wrote straight to stderr, so they
-                // could surface mid-transfer on the flagship path at the default
-                // level, which is what the issue is about.
+                // #231 asks for exactly one thing to go quiet: the
+                // `[unprovisioned]` line, "which by its own text is the normal
+                // state". It says the CRITICAL variant "should keep printing
+                // loudly while shadow mode is live, since that one is a real
+                // disagreement".
                 //
-                // Nothing is lost by demoting it: the durable record of a flip
-                // blocker is `cap_shadow_counts()`, which survives the process
-                // and is what the flip is actually judged on. The line is the
-                // convenience view of a counter, not the counter.
-                crate::ui::debug(&format!(
+                // So this stays loud. What changes is only that it rides
+                // `ui::critical` instead of a raw `eprintln!`, which honours
+                // NO_COLOR and pipe mode and cannot be silenced by `-q`
+                // (critical is level 0). An earlier pass demoted this to debug,
+                // which was me overriding the issue author's explicit decision
+                // rather than implementing it.
+                crate::ui::critical(&format!(
                     "CAP-SHADOW CRITICAL: a header EXISTS and DENIES '{action}' on '{resource}' for dev={} user={} that legacy ALLOWED (reason: {reason}); a flip would BREAK this open [{}]",
                     hex::encode(dev),
                     hex::encode(usr),
@@ -679,7 +682,7 @@ pub fn cap_gate_effective(
                     hex::encode(dev),
                     hex::encode(usr),
                 ),
-                true, // #231: telemetry, not user narration (see CRITICAL above)
+                false, // #231: a WIDENING is a real disagreement; stays loud
             ),
             _ => {}
         }
