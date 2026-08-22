@@ -26,6 +26,7 @@ on:
     paths:
       - 'cli/src/**'
       - 'cli/tests/*revoke-gates.sh'
+      - 'cli/tests/shell-posture-gates.sh'
       - 'cli/tests/lib/fixture.sh'
       - 'backend/**'
       - '.github/workflows/revoke-gates.yml'
@@ -90,9 +91,9 @@ jobs:
           FILAMENT_BIN: ${{ github.workspace }}/cli/target/release/filament
         run: |
           set -uo pipefail
-          declare -A EXPECT=( [pty-revoke-gates]=3 [mount-revoke-gates]=4 [l2-revoke-gates]=3 )
+          declare -A EXPECT=( [pty-revoke-gates]=3 [mount-revoke-gates]=4 [l2-revoke-gates]=3 [shell-posture-gates]=3 )
           rc=0
-          for g in pty-revoke-gates mount-revoke-gates l2-revoke-gates; do
+          for g in pty-revoke-gates mount-revoke-gates l2-revoke-gates shell-posture-gates; do
             echo "::group::$g"
             [ -x "./$g.sh" ] || { echo "MISSING or not executable: $g.sh"; rc=1; echo "::endgroup::"; continue; }
             out="$(./$g.sh 2>&1)"; code=$?
