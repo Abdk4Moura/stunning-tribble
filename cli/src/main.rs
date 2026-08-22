@@ -20931,53 +20931,71 @@ mod tests {
     /// whoever relaxed the gate would have to break it and look at the guard
     /// first. That is exactly what happened.
     ///
-    /// Asserts through the FILE, not through `device_cert_for`. Those readers
-    /// resolve a path from `FILAMENT_CONFIG_DIR`, and `std::env::set_var` is not
-    /// thread-safe (hence `unsafe` in Rust 2024): the test harness runs other
-    /// tests concurrently, and on Windows CI the variable read back as
-    /// NotPresent mid-test, so the reader looked in the real user config dir and
-    /// found nothing. The lock here serialises tests that TOUCH the variable; it
-    /// cannot stop every other thread in the process from racing it. The sibling
-    /// vouch tests pass on Windows because they read the file directly, so this
-    /// one does the same.
+    /// Deliberately PURE: it drives `apply_peer_identity` over an in-memory
+    /// `Vec<Value>` and never touches the filesystem or the environment.
+    ///
+    /// Two earlier versions went through `update_peer_identity`, which resolves
+    /// devices.json from `FILAMENT_CONFIG_DIR`, and both failed only on Windows
+    /// CI. The diagnostic showed why: the variable read back as NotPresent
+    /// mid-test, so the call operated on the REAL user config dir. Once via a
+    /// read, then via a write that consequently found no record to refuse and
+    /// returned Ok, which looked exactly like the guard failing. `set_var` is
+    /// not thread-safe, which is why Rust 2024 marks it unsafe, and
+    /// `lock_test_config` only serialises the tests that touch the variable, not
+    /// the ~420 others running concurrently in the same process.
+    ///
+    /// The invariant under test has nothing to do with files, so testing it
+    /// through one was the mistake. This is the technique the filament-id crate
+    /// already uses on its side of the guard.
     #[test]
     fn an_expired_certificate_reopens_the_vouch_gate_but_not_to_a_stranger() {
-        let _guard = lock_test_config();
-        let dir = td("expired");
-
         let dead = cert_for(0x66, 0xa7, 1); // expired in 1970
-        update_peer_identity("lapsed", &dead, VOUCH_CERT_SCOPE).unwrap();
         assert!(dead.verify(identity::now_secs()).is_err(), "precondition: expired");
 
-        // The record persisted, and the certificate in it is the expired one.
-        let raw = std::fs::read_to_string(dir.join("devices.json")).expect("devices.json written");
-        let arr: Vec<Value> = serde_json::from_str(&raw).expect("valid json");
-        let rec = arr
-            .iter()
-            .find(|d| d["name"].as_str() == Some("lapsed"))
-            .expect("the record still holds it");
-        let stored = identity::DeviceCert::from_json(&rec["deviceCert"]).expect("a cert is stored");
-
-        // #266's property, stated over the stored certificate itself: present in
-        // the record, and not usable. That combination is what used to wedge the
-        // gate, because the old check asked only about presence.
+        // #266's property, over the certificate itself: an expired cert is
+        // STORED but not USABLE. That combination is what wedged the gate, since
+        // the old check asked only about presence. `device_cert_valid_for`
+        // filters on exactly this predicate.
+        let mut arr: Vec<Value> = vec![];
+        identity::apply_peer_identity(&mut arr, "lapsed", &dead, VOUCH_CERT_SCOPE).unwrap();
+        let stored = identity::DeviceCert::from_json(&arr[0]["deviceCert"]).expect("a cert is stored");
         assert!(
             stored.verify(identity::now_secs()).is_err(),
             "the stored certificate is expired, so it must not count as a usable identity"
         );
 
-        // The reopened path is not a way in for a different user key: the guard
-        // inside update_peer_identity still refuses. The relaxation is only safe
-        // because that invariant moved into the store first.
+        // The reopened path is not a way in for a different user key. This is
+        // the guard that makes the #266 relaxation safe, and it only became
+        // reachable because that relaxation lets a second write happen at all.
         let stranger = cert_for(0x77, 0xb8, 9_999_999_999);
         assert!(
-            update_peer_identity("lapsed", &stranger, VOUCH_CERT_SCOPE).is_err(),
+            identity::apply_peer_identity(&mut arr, "lapsed", &stranger, VOUCH_CERT_SCOPE).is_err(),
             "re-certification must not re-anchor the record to a different user"
         );
         assert_eq!(
-            stored_user_key(&dir, "lapsed"),
-            Some(hex::encode([0x66u8; 32])),
+            arr[0]["userKey"].as_str(),
+            Some(hex::encode([0x66u8; 32]).as_str()),
             "the original anchor survives the refused write"
+        );
+
+        // And the legitimate device, renewing under the SAME user and device
+        // key, is admitted, so the guard is not simply refusing everything.
+        //
+        // Asserted on `expires`, not on `verify()`. `verify` checks expiry FIRST
+        // and the signature second, and these fixtures carry a zero signature,
+        // so a renewed cert clears the expiry check and then fails on the
+        // signature. `verify().is_err()` above is still exact, because an
+        // expires-in-1970 cert bails on expiry before the signature is reached,
+        // but the inverse cannot be asserted with an unsigned fixture. Claiming
+        // it would be a check that passes for a reason other than the one named,
+        // which is the defect this whole branch is about.
+        let renewed = cert_for(0x66, 0xa7, 9_999_999_999);
+        identity::apply_peer_identity(&mut arr, "lapsed", &renewed, VOUCH_CERT_SCOPE)
+            .expect("a renewal under the same user and device key is admitted");
+        let now_stored = identity::DeviceCert::from_json(&arr[0]["deviceCert"]).unwrap();
+        assert!(
+            now_stored.expires > identity::now_secs(),
+            "the renewal replaced the expired certificate in the record"
         );
     }
 
