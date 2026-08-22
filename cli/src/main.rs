@@ -3998,6 +3998,21 @@ async fn init_experience(
         false
     } else if background {
         true
+    } else if caps.yes {
+        // `-y` means "answer prompts with their default", and this prompt's
+        // default is Y. Without this arm `filament init --yes` BLOCKED on a real
+        // terminal: the identity was written, then it sat on
+        // "Stay available in the background? [Y/n]:" forever, because the arm
+        // below is gated on `caps.interactive` and never consulted `caps.yes`.
+        //
+        // Every other confirmation goes through `UiCapability::confirm`, which
+        // starts `if self.yes { return Ok(()); }`. This one called `prompt_line`
+        // directly and so escaped that contract.
+        //
+        // Invisible to every non-TTY check: piped, redirected and scripted runs
+        // all take the `else` branch and exit 0, so a build, a pipe and CI all
+        // said the first-run command was fine while it hung in a terminal.
+        true
     } else if caps.interactive {
         !prompt_line("  Stay available in the background? [Y/n]: ")?.eq_ignore_ascii_case("n")
     } else {
