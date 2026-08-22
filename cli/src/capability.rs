@@ -25,6 +25,12 @@ pub use filament_cap::capability::*;
 pub const SHELL_OFF_REASON: &str =
     "shell serving is off there; run `filament up --shell` on that device";
 
+/// The L2 tunnel acceptor is OFF on the peer entirely, so `forward`, `netcat`
+/// and the ssh bootstrap have nothing to open against. Like SHELL_OFF_REASON
+/// this is not a capability problem and a grant does not help.
+pub const TUNNEL_OFF_REASON: &str =
+    "tunnelling is off there; run `filament up --shell` (or set FILAMENT_L2=1) on that device";
+
 /// The peer's ENROLMENT CEILING excludes this capability. A grant cannot widen a
 /// ceiling, so any hint built on this reason must not prescribe one: the fix is a
 /// fresh invitation that includes the capability.

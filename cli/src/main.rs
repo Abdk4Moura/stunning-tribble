@@ -18154,6 +18154,33 @@ async fn recv_cmd(
                 // exists; only this path failed to send it. Measured across three
                 // machines, not inferred.
                 #[cfg(unix)]
+                // #268: an `l2-open` arriving while L2 is OFF used to fall
+                // through and be IGNORED. The initiator has already committed a
+                // client to that stream, so it waits for an answer that is never
+                // coming: measured cross-machine, curl hung for its full 25s
+                // timeout while filament printed nothing at either end.
+                //
+                // `shell-bootstrap` directly below already refuses explicitly in
+                // this exact state. The tunnel open, which is the more common
+                // path (`forward`, `netcat`, ssh), did not, so the two disagreed
+                // about whether "off" is something you say or something you
+                // silently do.
+                //
+                // `on_close` turns this into OpenOutcome::Refused with the reason
+                // (#206), so the client gets a clean, immediate, explained close
+                // instead of a hang.
+                Some("l2-open") if !l2_enabled => {
+                    if let (Some(t), Some(sid)) = (conn.transport_of(&pid), v["sid"].as_u64()) {
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "l2-close",
+                                "sid": sid,
+                                "err": crate::capability::TUNNEL_OFF_REASON,
+                            }))
+                            .await;
+                    }
+                    continue;
+                }
                 Some("shell-bootstrap") if !l2_enabled => {
                     if let Some(t) = conn.transport_of(&pid) {
                         let _ = t
