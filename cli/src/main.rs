@@ -20941,7 +20941,17 @@ mod tests {
         update_peer_identity("lapsed", &dead, VOUCH_CERT_SCOPE).unwrap();
         assert!(dead.verify(identity::now_secs()).is_err(), "precondition: expired");
 
-        assert!(device_cert_for("lapsed").is_some(), "the record still holds it");
+        // Windows-only failure I cannot reproduce here, so make the failing
+        // environment report the facts instead of guessing at them from Linux.
+        // Four hypotheses in a row were wrong; a diagnostic costs one run.
+        let raw = std::fs::read_to_string(_dir.join("devices.json"))
+            .unwrap_or_else(|e| format!("<unreadable: {e}>"));
+        assert!(
+            device_cert_for("lapsed").is_some(),
+            "the record still holds it.\n  FILAMENT_CONFIG_DIR={:?}\n  devices_path()={:?}\n  devices.json={raw}",
+            std::env::var("FILAMENT_CONFIG_DIR"),
+            devices_path(),
+        );
         assert!(
             device_cert_valid_for("lapsed").is_none(),
             "an expired certificate must not count as a usable identity (#266)"
