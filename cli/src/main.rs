@@ -2609,10 +2609,25 @@ fn update_peer_identity(name: &str, peer_cert: &identity::DeviceCert, scope: u8)
     // durable write becomes reachable and this is what refuses it.
     //
     // Do not delete this because it never fires. That is the point of it.
+    // Guard and write in ONE with_devices_mut, not two.
+    //
+    // The first version called the guard in its own with_devices_mut and then
+    // `devices_upsert_atomic` in a second. On Windows that failed outright with
+    // "atomic write devices.json": the first cycle's handle was still open when
+    // the second tried to rename over the file, and Windows will not replace an
+    // open file. Linux tolerated it silently, so only the Windows CI job found
+    // it. Two lock-and-write cycles where the operation is one.
+    //
+    // It was also a TOCTOU window: between the guard reading the record and the
+    // upsert writing it, another writer could have changed the very thing the
+    // guard just approved. Folding them removes the window as well as the
+    // Windows failure, which is the better reason of the two.
     with_devices_mut(|arr| {
-        identity::apply_peer_identity(arr, name, peer_cert, scope).map_err(|e| anyhow::anyhow!("{}", e))
+        identity::apply_peer_identity(arr, name, peer_cert, scope)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        upsert_peer_record(arr, name, None, Some(peer_cert), None, Some(scope), None, None);
+        Ok(())
     })?;
-    devices_upsert_atomic(name, None, Some(peer_cert), None, Some(scope), None, None)?;
     Ok(())
 }
 
