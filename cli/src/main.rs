@@ -1769,6 +1769,14 @@ fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
 }
 
 /// Read the device cert (if any) for a named device.
+/// The certificate STORED for `name`, valid or not.
+///
+/// #266: this deliberately does NOT check expiry, and most of its callers want
+/// exactly that, because they are asking "is there a record" or are about to run
+/// their own `verify`. The name does not say so, which is the trap: a gate
+/// written as `device_cert_for(..).is_none()` closes when the first certificate
+/// is stored and never reopens when that certificate dies. Use
+/// [`device_cert_valid_for`] for any decision that should reopen on expiry.
 fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
     let p = devices_path();
     let raw = std::fs::read_to_string(&p).ok()?;
@@ -1779,6 +1787,17 @@ fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
         }
     }
     None
+}
+
+/// The certificate stored for `name` IF it is still valid right now.
+///
+/// #266: the expiry-aware half of [`device_cert_for`]. A gate meaning "do we
+/// already have a usable identity for this device" must ask this one, or an
+/// expired certificate wedges the record: unusable everywhere that verifies,
+/// still present to anything that only checks existence, with `devices forget`
+/// as the sole exit.
+fn device_cert_valid_for(name: &str) -> Option<identity::DeviceCert> {
+    device_cert_for(name).filter(|c| c.verify(identity::now_secs()).is_ok())
 }
 
 /// The three clocks that can end a delegated device's recognition. The binding
@@ -2464,7 +2483,14 @@ fn handle_identity_expose(
     // durable anchor.
     let petname = conn.link(pid).map(|l| l.name.clone()).unwrap_or_default();
     if !petname.is_empty()
-        && device_cert_for(&petname).is_none()
+        // #266: VALID, not merely present. With a plain existence check an expired
+        // vouch certificate held this gate shut forever while failing `verify`
+        // everywhere else, so the device could never be re-certified.
+        //
+        // This relaxation is what makes the guard inside `update_peer_identity`
+        // load-bearing rather than decorative: a second durable write becomes
+        // reachable, and that guard refuses one carrying a different user key.
+        && device_cert_valid_for(&petname).is_none()
         && devices_load().iter().any(|(n, _)| n == &petname)
     {
         match update_peer_identity(&petname, &cert, VOUCH_CERT_SCOPE) {
@@ -20883,24 +20909,36 @@ mod tests {
         assert!(res.is_err(), "a different device under the same user is a new trust decision");
     }
 
-    /// #266: `device_cert_for` ignores expiry, so once a certificate is stored
-    /// the vouch gate never reopens, even after that certificate dies. Pinned
-    /// deliberately rather than left accidental: when someone relaxes the gate to
-    /// `is_none() || expired` to fix #266, this test fails and makes them look at
-    /// the guard, which is the reason the guard is in the path at all.
+    /// #266, now fixed, and this test is why the fix was safe to make.
+    ///
+    /// It previously pinned the OLD behaviour, that an expired certificate held
+    /// the vouch gate shut forever. It was written that way on review advice so
+    /// that whoever relaxed the gate would have to break it and look at the
+    /// guard first. That is exactly what happened.
+    ///
+    /// It now asserts the contract on the other side of that relaxation.
     #[test]
-    fn expired_certificate_still_closes_the_vouch_gate() {
+    fn an_expired_certificate_reopens_the_vouch_gate_but_not_to_a_stranger() {
         let _guard = lock_test_config();
         let _dir = td("expired");
+
         let dead = cert_for(0x66, 0xa7, 1); // expired in 1970
         update_peer_identity("lapsed", &dead, VOUCH_CERT_SCOPE).unwrap();
+        assert!(dead.verify(identity::now_secs()).is_err(), "precondition: expired");
 
-        assert!(dead.verify(identity::now_secs()).is_err(), "precondition: the cert is expired");
+        assert!(device_cert_for("lapsed").is_some(), "the record still holds it");
         assert!(
-            device_cert_for("lapsed").is_some(),
-            "device_cert_for ignores expiry (#266), so the gate stays shut; \
-             if this now fails, #266 was fixed and the store-side guard is the \
-             only thing left protecting this path"
+            device_cert_valid_for("lapsed").is_none(),
+            "an expired certificate must not count as a usable identity (#266)"
+        );
+
+        // The reopened path is not a way in for a different user key: the guard
+        // inside update_peer_identity still refuses. The relaxation is only safe
+        // because that invariant moved into the store first.
+        let stranger = cert_for(0x77, 0xb8, 9_999_999_999);
+        assert!(
+            update_peer_identity("lapsed", &stranger, VOUCH_CERT_SCOPE).is_err(),
+            "re-certification must not re-anchor the record to a different user"
         );
     }
 
