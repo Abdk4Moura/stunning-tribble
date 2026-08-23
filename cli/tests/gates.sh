@@ -214,7 +214,7 @@ sleep 2
 # replacement receiver runs with -v to surface it for the assertion below. The
 # resume itself is verbosity-independent (the sender re-offers from the saved
 # offset); -v only makes the proof visible.
-timeout 180 "$BIN" -v recv -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv2.log" 2>&1
+timeout 180 "$BIN" -v receive -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv2.log" 2>&1
 RC2=$?
 wait $SP; RCS=$?
 if [ $RC2 -eq 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ] \
@@ -437,7 +437,7 @@ done
 kill -STOP $R1 2>/dev/null
 sleep 3   # > FILAMENT_ADOPT_ACTIVE_MS so the frozen link reads as idle (#28)
 # -v on the replacement: "resuming at" is a DEBUG (resilience-internal) line.
-FILAMENT_UID="samedevice$$" timeout 180 "$BIN" -v recv -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv2.log" 2>&1
+FILAMENT_UID="samedevice$$" timeout 180 "$BIN" -v receive -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv2.log" 2>&1
 RC2=$?
 # bounded wait: a hung sender must fail the gate, not the whole suite
 RCS=99
@@ -742,7 +742,7 @@ WA=$(wait_code "$WORK/g18ba-send.log") || { bad "gate-18b Mode B (no code minted
 ( sleep 6; kill -9 $SPA 2>/dev/null ) &   # sender departs after delivering the file
 FILAMENT_TEST_DISABLE_MODEB_DROP=1 FILAMENT_TEST_CHURN_AFTER_COMPLETE=1 \
   FILAMENT_TEST_DROP_PEER_LEFT=1 FILAMENT_QUIET_EXIT_SECS=2 \
-  timeout 30 "$BIN" -v recv "$WA" -y --dir "$DA" --server "$SERVER" </dev/null >"$WORK/g18ba-recv.log" 2>&1
+  timeout 30 "$BIN" -v receive "$WA" -y --dir "$DA" --server "$SERVER" </dev/null >"$WORK/g18ba-recv.log" 2>&1
 RCA=$?
 kill -9 $SPA 2>/dev/null; wait $SPA 2>/dev/null
 # Baseline MUST hang (RC=124) yet still have the bytes on disk (it's the EXIT
@@ -759,7 +759,7 @@ WB=$(wait_code "$WORK/g18bb-send.log") || { bad "gate-18b Mode B (no code minted
 T0=$(date +%s)
 ( sleep 6; kill -9 $SPB 2>/dev/null ) &
 FILAMENT_TEST_CHURN_AFTER_COMPLETE=1 FILAMENT_TEST_DROP_PEER_LEFT=1 FILAMENT_QUIET_EXIT_SECS=2 \
-  timeout 30 "$BIN" -v recv "$WB" -y --dir "$DB" --server "$SERVER" </dev/null >"$WORK/g18bb-recv.log" 2>&1
+  timeout 30 "$BIN" -v receive "$WB" -y --dir "$DB" --server "$SERVER" </dev/null >"$WORK/g18bb-recv.log" 2>&1
 RCB=$?
 T1=$(date +%s)
 kill -9 $SPB 2>/dev/null; wait $SPB 2>/dev/null
