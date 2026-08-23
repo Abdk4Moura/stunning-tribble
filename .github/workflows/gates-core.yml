@@ -69,6 +69,14 @@ jobs:
           SKIP_BROWSER: "1"
           FILAMENT_TEST_AUTOSTART: "1"
           RUST_BACKTRACE: "1"
+          # NOT optional, and not a speed choice. The expected-green list was
+          # measured in RELEASE. In debug the #281 debug_assert is live, and a
+          # peer reaching the capability gate before identity resolution PANICS
+          # the receiving daemon instead of being refused, which takes several
+          # gates down with it (kill-resume, code transfer, corruption guard,
+          # dir/stdin, deferred-drop). Running this job in debug would fail the
+          # ratchet on day one against gates that are fine.
+          FILAMENT_GATE_RELEASE: "1"
         run: bash tests/gates.sh --with-relay 2>&1 | tee /tmp/gates.log || true
 
       - name: Ratchet
