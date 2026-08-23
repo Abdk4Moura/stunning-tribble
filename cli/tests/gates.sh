@@ -314,10 +314,16 @@ R8="g8room$$"
 "$BIN" receive --dir "$D" --room "$R8" --server "$SERVER" </dev/null >"$WORK/g8-recv.log" 2>&1 &
 R=$!; pids+=($R); sleep 3
 G8=0
-timeout 60 "$BIN" send "$SMALL" --room "$R8" --server "$SERVER" >"$WORK/g8-send.log" 2>&1 || G8=1
+timeout 60 "$BIN" send "$SMALL" --room "$R8" --server "$SERVER" >"$WORK/g8-send.log" 2>&1; G8=$?
 kill $R 2>/dev/null
-if [ $G8 -eq 0 ] && grep -q "declined" "$WORK/g8-send.log" && [ ! -e "$D/small.bin" ]; then
-  ok "offer declined without consent; sender exited cleanly"
+# #274: a send whose every file was declined now exits NONZERO and suppresses
+# the completion line. This gate used to require exit 0 while printing
+# "declined", which is precisely the contract #274 called a bug: a script could
+# not tell a delivered transfer from a refused one. Asserting 1 specifically,
+# not merely nonzero, so a `timeout` kill (124) cannot satisfy this gate.
+if [ $G8 -eq 1 ] && grep -q "declined" "$WORK/g8-send.log" \
+   && grep -q "no files delivered" "$WORK/g8-send.log" && [ ! -e "$D/small.bin" ]; then
+  ok "offer declined without consent; sender reported the decline and exited 1"
 else bad "consent decline"; tail -n 3 "$WORK/g8-send.log" "$WORK/g8-recv.log"; fi
 
 # ---------------------------------------------------------------- gate 9 ----
