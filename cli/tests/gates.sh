@@ -226,7 +226,15 @@ for _ in $(seq 1 60); do
   [ "$sz" -gt $((10 * 1024 * 1024)) ] && break
   sleep 0.5
 done
-kill_tree $R1; wait $R1 2>/dev/null
+# NOT kill_tree: this receiver is started WITHOUT a timeout wrapper, so $R1 is
+# the real process and SIGKILL reaches it. kill_tree sends SIGTERM first, which
+# `filament receive` handles gracefully and uses to clean up its partial file,
+# leaving nothing for the resume half of this gate to resume from. The gate
+# needs an abrupt death, which is the whole premise of "receiver killed
+# mid-transfer". Regression from #287, whose commit message claimed it touched
+# only timeout-wrapped sites; this one is not, and I did not check before
+# changing it.
+kill -9 $R1 2>/dev/null; wait $R1 2>/dev/null
 echo "(killed receiver at $(stat -c %s "$D/big.bin.part" 2>/dev/null || echo '?') bytes)"
 sleep 2
 # The "resuming at" line is a DEBUG (resilience-internal) message, so the

@@ -14,9 +14,12 @@
 # The expected-green list lives in cli/tests/gates-ratchet.sh and only grows:
 # repair a red gate, add it in the same commit.
 #
-# Runs WITHOUT --with-relay, so no coturn and no docker. The relay gates are
-# already red and tracked; adding a container dependency to buy nothing would
-# make this job slower and more fragile for no coverage.
+# Runs WITH --with-relay, matching the exact configuration the expected-green
+# list was measured under. Gate 10 starts its own coturn and skips cleanly when
+# docker or a usable interpreter is absent (#284), so this costs nothing on a
+# runner that lacks either. The no-relay configuration was NOT verified: three
+# attempts to measure it locally were killed by concurrent builds on the shared
+# host, so shipping a list against it would be asserting something unobserved.
 
 name: Gates Core
 
@@ -66,7 +69,7 @@ jobs:
           SKIP_BROWSER: "1"
           FILAMENT_TEST_AUTOSTART: "1"
           RUST_BACKTRACE: "1"
-        run: bash tests/gates.sh 2>&1 | tee /tmp/gates.log || true
+        run: bash tests/gates.sh --with-relay 2>&1 | tee /tmp/gates.log || true
 
       - name: Ratchet
         run: bash cli/tests/gates-ratchet.sh /tmp/gates.log
