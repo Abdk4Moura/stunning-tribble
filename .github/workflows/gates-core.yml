@@ -36,7 +36,14 @@ jobs:
   ratchet:
     name: deterministic core ratchet
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The suite genuinely takes this long: the CI attempt at 45 was cut off
+    # mid-run with a filament still resident, and a local release run measured
+    # roughly the same. This is slow feedback and that is a real cost, accepted
+    # because the job only triggers on cli/** and backend/** changes. If it
+    # becomes the bottleneck, the answer is to make gates faster or narrow the
+    # trigger, NOT to shorten this and have runs killed halfway, which reports
+    # a red board that says nothing about the code.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
