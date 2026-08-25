@@ -19,6 +19,18 @@
 # the commit message, because it means a behaviour that used to hold no longer
 # does.
 #
+# MEASURE THE LIST WHERE THE RATCHET RUNS. The first version of this list was
+# measured on the do-vm host and asserted against GitHub runners, and one gate
+# differed: "kill-resume: replacement receiver resumed" passes locally and fails
+# on a runner. It is deliberately NOT in the list below. The kill half works
+# there (the .part reached 20336640 bytes, so the gate's premise held); it is
+# the resume half that does not, which makes it environment-sensitive rather
+# than deterministic by construction, and an environment-sensitive gate in this
+# list makes the job fail for reasons that are not regressions.
+#
+# It is a candidate to add back once it is understood, not a gate to quietly
+# drop. Tracked in #249.
+#
 # Matching is on a stable SUBSTRING of each gate's ok() text, deliberately not
 # the whole line: some carry a measured value ("22.8 MB/s") that varies per run,
 # and pinning those would make this fail for the wrong reason.
@@ -32,7 +44,6 @@ EXPECTED_GREEN=(
   "pair-code variance/security tests"
   "code transfer, hashes match"
   "code burns on first use"
-  "kill-resume: replacement receiver resumed"
   "head mismatch detected, restarted from 0"
   "dir tar + stdin round-trip"
   "offer declined without consent"
