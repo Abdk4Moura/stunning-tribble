@@ -1,25 +1,24 @@
-//! Host hooks for filament's transport layer.
+//! The transport ladder: an authenticated byte pipe to a peer behind NAT, that
+//! fails over.
 //!
-//! # What this is, and what it is not yet
+//! `net` is signalling and WebRTC; `direct` is authenticated QUIC with the
+//! fallback ladder. Both implement the `Transport` trait, which is the whole
+//! interface the layers above need: send bytes, receive bytes, tell me the
+//! channel binding, tell me the route.
 //!
-//! The transport ladder itself (`net.rs`, `direct.rs`: the `Transport` trait,
-//! direct QUIC, WebRTC, relay failover) still lives in the CLI. This crate holds
-//! the thing that was BLOCKING it from leaving: the handful of places where
-//! connection code reached sideways into terminal output, user settings, config
-//! paths and interface enumeration.
+//! # What it does not know
 //!
-//! Those files now call `hooks::` instead of `crate::ui` / `crate::doctor` /
-//! `crate::settings` / `crate::platform` / `crate::interact`. With no CLI
-//! references left in them, moving them here becomes a file move rather than a
-//! refactor, which is deliberate: the transport is what the whole reliability
-//! story rests on, and a half-verified transport is worse than a coupled one.
+//! Nothing here knows how to draw on a terminal, where this machine keeps config
+//! files, how the user configured membership, or how to enumerate local
+//! interfaces. It used to know all four. Those are asked through `hooks`, each
+//! with a safe default, so a consumer that installs none still gets a working
+//! transport with diagnostics discarded.
 //!
-//! # Why function pointers rather than a trait object
-//!
-//! These are process-global facts, not per-connection policy. Threading a
-//! `&dyn Host` through 4,000 lines of connection code would be a far larger and
-//! riskier change than the coupling it removes. Every hook has a safe default,
-//! so a consumer that installs nothing still gets a working transport with the
-//! diagnostics simply discarded.
+//! That separation is why this could become a crate at all, and it was done as
+//! its own step, verified live, BEFORE the files moved: the transport is what
+//! filament's reliability rests on, and a half-verified transport is worse than
+//! a coupled one.
 
+pub mod direct;
 pub mod hooks;
+pub mod net;

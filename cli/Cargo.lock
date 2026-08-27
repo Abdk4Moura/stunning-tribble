@@ -1295,6 +1295,23 @@ version = "0.1.0"
 [[package]]
 name = "filament-transport"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "quinn",
+ "quinn-proto",
+ "rcgen",
+ "reqwest 0.13.4",
+ "rust_socketio",
+ "rustls",
+ "serde_json",
+ "sha2 0.11.0",
+ "socket2 0.5.10",
+ "tokio",
+ "webrtc",
+]
 
 [[package]]
 name = "filedescriptor"

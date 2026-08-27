@@ -302,9 +302,9 @@ fn parse_rule_list(csv: &str) -> Vec<CidrRule> {
 /// ("interfaces"), returns the raw JSON. For prefer, reads from config.
 fn read_iface_setting(key: &str, peer: Option<&str>) -> String {
     if key == "interfaces" {
-        return filament_transport::hooks::raw_membership(peer);
+        return crate::hooks::raw_membership(peer);
     }
-    filament_transport::hooks::settings_get_str(key, peer).unwrap_or_default()
+    crate::hooks::settings_get_str(key, peer).unwrap_or_default()
 }
 
 /// Filter local IPs for candidate gathering using membership (avoid/only store)
@@ -364,7 +364,7 @@ fn filter_local_ips(ips: Vec<IpAddr>, peer: Option<&str>) -> Vec<IpAddr> {
         .collect();
 
     if kept.is_empty() {
-        filament_transport::hooks::debug("membership filter removed ALL host candidates");
+        crate::hooks::debug("membership filter removed ALL host candidates");
         return vec![];
     }
 
@@ -556,7 +556,7 @@ pub async fn gather_candidates(server: &str, port: u16) -> Vec<String> {
     let ips = filter_local_ips(local_ips(), peer);
     let mut cands: Vec<String> = ips.into_iter().map(|ip| cand_str(ip, port)).collect();
     if cands.is_empty() && !local_ips().is_empty() {
-        filament_transport::hooks::debug("iface filter removed ALL host candidates; connectivity may fail");
+        crate::hooks::debug("iface filter removed ALL host candidates; connectivity may fail");
     }
     if !suppress_public() {
         if let Some(pip) = public_ip(server).await {
@@ -671,7 +671,7 @@ fn direct_transport_config() -> Arc<quinn::TransportConfig> {
     Arc::new(tc)
 }
 
-pub(crate) fn server_config() -> Result<quinn::ServerConfig> {
+pub fn server_config() -> Result<quinn::ServerConfig> {
     let ck = rcgen::generate_simple_self_signed(vec!["filament-direct".to_string()])
         .context("self-signed cert")?;
     let cert_der = CertificateDer::from(ck.cert.der().clone());
@@ -692,7 +692,7 @@ pub(crate) fn server_config() -> Result<quinn::ServerConfig> {
     Ok(sc)
 }
 
-pub(crate) fn client_config() -> Result<quinn::ClientConfig> {
+pub fn client_config() -> Result<quinn::ClientConfig> {
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .context("client tls versions")?
@@ -1504,7 +1504,7 @@ pub async fn dial_workers(
                         if workers.len() >= count { break; }
                     }
                     Some(Err(e)) => {
-                        filament_transport::hooks::debug(&format!("worker dial: {e}"));
+                        crate::hooks::debug(&format!("worker dial: {e}"));
                     }
                     None => break,
                 }
@@ -1566,7 +1566,7 @@ pub async fn accept_workers(
                         if workers.len() >= count { break; }
                     }
                     Some(Err(e)) => {
-                        filament_transport::hooks::debug(&format!("worker accept: {e}"));
+                        crate::hooks::debug(&format!("worker accept: {e}"));
                     }
                     None => break,
                 }
@@ -1717,7 +1717,7 @@ pub async fn race_connect_labeled(
                     // greppable. Dial failures (unreachable candidate) are noise.
                     let s = e.to_string();
                     if s.contains("DIRECT-AUTH-FAIL") {
-                        filament_transport::hooks::trace(&format!("filament: {s}"));
+                        crate::hooks::trace(&format!("filament: {s}"));
                     }
                     continue;
                 }
@@ -1737,7 +1737,7 @@ pub async fn race_connect_labeled(
     let (conn, send, recv, _is_dialer) = winner;
     // DEBUG, direct-connect diagnostic (the user-facing route label is the
     // `route:` line emitted in main.rs; this is the internal detail).
-    filament_transport::hooks::debug(&format!(
+    crate::hooks::debug(&format!(
         "filament: DIRECT-CONNECT ok (route: {}) peer={} remote={}",
         route,
         peer_id,

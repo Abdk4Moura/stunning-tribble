@@ -12,7 +12,7 @@ with a public API and no obligation to bring the rest.
 That is not a rewrite. Nine crates exist now: the trust layer was already out
 (`filament-cap`, `filament-id`, `filament-pair`, `authkeys-managed`,
 `secret-write`), and `filament-transfer`, `filament-proto`, `filament-overlay`
-and `filament-fleet` followed. What is left in the CLI is transport and the
+and `filament-fleet` followed. What is left in the CLI is `Conn` and the
 event loop.
 
 ## Why it is worth doing, from this repo's own history
@@ -67,10 +67,11 @@ Done:
 | `filament-proto` | the wire vocabulary + the pure ceremony decisions |
 | `filament-overlay` | self-certifying addresses, link-bound announcements |
 | `filament-fleet` | the admission ceremony + the per-peer session |
+| `filament-transport` | the ladder: signalling, WebRTC, authenticated direct QUIC |
 
-Next, in dependency order:
+Next:
 
-3. **`filament-transport`** — the `Transport` trait and the ladder beneath it
+3-DONE. **`filament-transport`** — the `Transport` trait and the ladder beneath it
    (direct QUIC, WebRTC, relay). The piece with the most standalone value: "an
    authenticated byte pipe to a peer behind NAT, that fails over".
 
@@ -91,9 +92,15 @@ Next, in dependency order:
    presentation together, and it is what the eight event loops all manipulate,
    so it should be split as part of step 4 rather than dragged out whole here.
 
-   DO THIS CAREFULLY. It is the file the entire reliability story rests on, and
-   a half-verified transport is worse than a coupled one. It wants the gated
-   interleaved harness (see WORK-STATE) green before and after.
+   DONE 2026-08-27, in two commits on purpose. First the sideways dependencies
+   were cut in place, leaving both files at zero `crate::` references and
+   verified live. Only then did the files move, which was by then a `git mv`
+   plus three visibility promotions. Splitting it that way meant the risky
+   commit landed on code already proven decoupled.
+
+   `Conn` did NOT come with it, and still lives in `main.rs`: it carries link
+   state, adoption policy and presentation together, and it is what all eight
+   event loops manipulate, so it belongs with step 4.
 
 4. **`filament-peerloop`** — one driver replacing the eight hand-written loops.
    Do this LAST: it should be assembled from the crates above, not extracted

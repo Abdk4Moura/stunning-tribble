@@ -763,7 +763,7 @@ fn dns_timeout_ms() -> u64 {
 }
 
 fn dns_cache_path() -> PathBuf {
-    filament_transport::hooks::config_path("signaling-dns.json")
+    crate::hooks::config_path("signaling-dns.json")
 }
 
 /// Pull `host` and `port` out of an `http(s)://` URL for resolution. Returns the
@@ -972,7 +972,7 @@ pub async fn fetch_auto_room(server: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("no room in /api/room response"))
 }
 
-pub(crate) async fn http_get_json(url: &str) -> Result<Value> {
+pub async fn http_get_json(url: &str) -> Result<Value> {
     // rust_socketio already pulls in reqwest; reuse it instead of adding a dep.
     // 3 quick attempts: establish() refetches config per connection attempt
     // (C5), and one blip of the API mustn't kill a transfer in progress.
@@ -1288,7 +1288,7 @@ impl Peer {
         tx: mpsc::UnboundedSender<Ev>,
         generation: u32,
     ) -> Result<Arc<Peer>> {
-        filament_transport::hooks::debug(&format!(
+        crate::hooks::debug(&format!(
             "filament: ICE-CONFIG peer={peer_id} servers={} urls={:?}",
             ice_servers.len(),
             ice_servers.iter().flat_map(|s| s.urls.clone()).collect::<Vec<_>>()
@@ -1330,11 +1330,11 @@ impl Peer {
         // P2P ICE diagnostic: log gathering state changes to see when/if
         // complete fires vs stalls (used for CI capability-harness debugging).
         pc.on_ice_gathering_state_change(Box::new(move |s| {
-            filament_transport::hooks::trace(&format!("[ice-gathering] state={}", s));
+            crate::hooks::trace(&format!("[ice-gathering] state={}", s));
             Box::pin(async {})
         }));
         pc.on_ice_connection_state_change(Box::new(move |s| {
-            filament_transport::hooks::trace(&format!("[ice-connection] state={}", s));
+            crate::hooks::trace(&format!("[ice-connection] state={}", s));
             Box::pin(async {})
         }));
 
@@ -1354,7 +1354,7 @@ impl Peer {
                         let typ = c.typ.to_string();
                         let addr = c.address.clone();
                         let port = c.port;
-                        filament_transport::hooks::trace(&format!("[ice-candidate] type={} addr={} port={}", typ, addr, port));
+                        crate::hooks::trace(&format!("[ice-candidate] type={} addr={} port={}", typ, addr, port));
                         if let Ok(init) = c.to_json() {
                             let _ = sio
                                 .emit(
@@ -1364,7 +1364,7 @@ impl Peer {
                                 .await;
                         }
                     } else {
-                        filament_transport::hooks::trace(&format!("[ice-candidate] gathering complete (null candidate)"));
+                        crate::hooks::trace(&format!("[ice-candidate] gathering complete (null candidate)"));
                     }
                 })
             }));
@@ -1375,7 +1375,7 @@ impl Peer {
             let closed = closed.clone();
             let pid = peer_id.clone();
             pc.on_peer_connection_state_change(Box::new(move |s| {
-                filament_transport::hooks::trace(&format!("[pc-state] {} -> {}", pid, s));
+                crate::hooks::trace(&format!("[pc-state] {} -> {}", pid, s));
                 if !closed.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = tx.send(Ev::PcState(pid.clone(), s.to_string()));
                 }
@@ -1527,7 +1527,7 @@ impl Peer {
                 };
                 for c in pending {
                     if let Err(e) = self.pc.add_ice_candidate(c).await {
-                        filament_transport::hooks::trace(&format!("filament: queued candidate failed: {e}"));
+                        crate::hooks::trace(&format!("filament: queued candidate failed: {e}"));
                     }
                 }
                 if is_offer {
@@ -1562,7 +1562,7 @@ impl Peer {
                 };
                 if !buffered {
                     if let Err(e) = self.pc.add_ice_candidate(init).await {
-                        filament_transport::hooks::trace(&format!("filament: addIceCandidate failed: {e}"));
+                        crate::hooks::trace(&format!("filament: addIceCandidate failed: {e}"));
                     }
                 }
             }
@@ -1725,10 +1725,10 @@ pub async fn describe_path(t: &dyn Transport, peer: Option<&Peer>) -> PathInfo {
     let mut info = PathInfo::default();
     if let Some(ra) = t.remote_addr() {
         info.remote = Some(ra.to_string());
-        info.class = Some(filament_transport::hooks::ip_class(ra.ip()));
+        info.class = Some(crate::hooks::ip_class(ra.ip()));
         if let Some(la) = t.local_ip().or_else(|| source_ip_for(ra)) {
             info.local = Some(la.to_string());
-            if let Some((n, v)) = filament_transport::hooks::iface_for_ip(la) {
+            if let Some((n, v)) = crate::hooks::iface_for_ip(la) {
                 info.iface = Some(n);
                 info.vpn = v;
             }
@@ -1740,10 +1740,10 @@ pub async fn describe_path(t: &dyn Transport, peer: Option<&Peer>) -> PathInfo {
             info.cand = Some(format!("{}\u{2194}{}", pp.local_typ, pp.remote_typ));
             info.relay = pp.relayed;
             if let Ok(rip) = pp.remote_ip.parse::<std::net::IpAddr>() {
-                info.class = Some(filament_transport::hooks::ip_class(rip));
+                info.class = Some(crate::hooks::ip_class(rip));
             }
             if let Ok(lip) = pp.local_ip.parse::<std::net::IpAddr>() {
-                if let Some((n, v)) = filament_transport::hooks::iface_for_ip(lip) {
+                if let Some((n, v)) = crate::hooks::iface_for_ip(lip) {
                     info.iface = Some(n);
                     info.vpn = v;
                 }
@@ -1844,7 +1844,7 @@ pub fn is_tailscale_addr(addr: &str) -> bool {
 /// Enumerating interfaces shells out on Linux, which is host business, so the
 /// whole lookup is a hook rather than dragging the interface type in here.
 fn resolve_iface_name(addr: &str) -> String {
-    filament_transport::hooks::resolve_iface_name(addr)
+    crate::hooks::resolve_iface_name(addr)
 }
 
 async fn wire_channel(
@@ -1866,7 +1866,7 @@ async fn wire_channel(
             let raw = match dc2.detach().await {
                 Ok(raw) => raw,
                 Err(e) => {
-                    filament_transport::hooks::trace(&format!("filament: data channel detach failed: {e}"));
+                    crate::hooks::trace(&format!("filament: data channel detach failed: {e}"));
                     return;
                 }
             };

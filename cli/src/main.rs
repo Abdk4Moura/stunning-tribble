@@ -19,7 +19,7 @@ mod codeentry;
 mod armed;
 mod ctl;
 mod diag;
-mod direct;
+use filament_transport::direct;
 mod doctor;
 /// `filament ephemeral`: auth-key delegation for ephemeral devices, pre-authorized
 /// self-enrollment, and delegated principal ceiling enforcement.
@@ -52,7 +52,9 @@ mod mount_fuse;
 mod mount_winfsp;
 mod backup;
 mod capability;
-mod net;
+// The transport ladder now lives in filament-transport. Aliased so every
+// `net::` / `direct::` call site in the CLI reads unchanged.
+use filament_transport::net;
 mod overlay;
 mod platform;
 // PAKE first-pairing lives in the standalone `filament-pair` crate; alias it as
