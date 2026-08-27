@@ -5771,12 +5771,7 @@ async fn enroll_and_send_cmd(
                 let _ = tx.send(Ev::ChannelReady(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
-                conn.mark_ready(&pid, &t, true);
-                crate::ephemeral::register_enrollment_legacy(pid.clone(), enroll_seed, device_pub, ak.clone());
-                let _ = t.send_control(&json!({
-                    "type": "identity-auth-key-enroll-request",
-                    "auth_key": ak.to_json(),
-                })).await;
+                open_enrollment(&mut conn, &pid, &t, enroll_seed, device_pub, &ak).await;
                 ui::say(&format!("  {} enrollment request sent", ui::paint(ui::Tone::Dim, "->")));
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
@@ -6003,9 +5998,7 @@ async fn enroll_and_netcat_cmd(
                 let _ = tx.send(Ev::ChannelReady(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
-                conn.mark_ready(&pid, &t, true);
-                crate::ephemeral::register_enrollment_legacy(pid.clone(), enroll_seed, device_pub, ak.clone());
-                let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-request", "auth_key": ak.to_json()})).await;
+                open_enrollment(&mut conn, &pid, &t, enroll_seed, device_pub, &ak).await;
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
                 Some("identity-auth-key-enroll-challenge") => {
@@ -13264,6 +13257,36 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
 
 // ------------------------------------------------------------------- send --
 
+
+/// Register a pending enrollment and send the request over a freshly-ready link.
+///
+/// Both enrollment commands opened their `ChannelReady` arm with exactly this,
+/// and differed only in whether they printed a line afterwards. Two copies of a
+/// ceremony step is how the two halves drift apart: one gets a fix, the other
+/// keeps the bug, which this file has already recorded happening between `mount`
+/// and `pty`.
+async fn open_enrollment(
+    conn: &mut Conn,
+    pid: &str,
+    t: &Arc<dyn Transport>,
+    enroll_seed: [u8; 32],
+    device_pub: [u8; 32],
+    ak: &filament_cap::ephemeral::AuthKey,
+) {
+    conn.mark_ready(pid, t, true);
+    crate::ephemeral::register_enrollment_legacy(
+        pid.to_string(),
+        enroll_seed,
+        device_pub,
+        ak.clone(),
+    );
+    let _ = t
+        .send_control(&json!({
+            "type": "identity-auth-key-enroll-request",
+            "auth_key": ak.to_json(),
+        }))
+        .await;
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn send_cmd(
