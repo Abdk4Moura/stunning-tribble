@@ -25,7 +25,7 @@ mod doctor;
 /// self-enrollment, and delegated principal ceiling enforcement.
 mod ephemeral;
 mod fleet;
-mod fleet_session;
+use filament_fleet::session as fleet_session;
 // The byte-moving mechanics now live in their own crate: out-of-order range
 // reassembly, the untrusted-name reduction, and the short-write-safe positional
 // write. None of it has any opinion about how a peer was found, which is exactly
@@ -14131,7 +14131,9 @@ async fn send_cmd(
                 // plausible but unproven, and rig-to-rig variance is larger than
                 // the effect. Settle the measurement before revisiting it.
                 if fleet_target && !fleet_sess.proved(&pid) {
-                    match fleet_sess.greet(&pid, t.channel_binding(), &display_name(), link_nonce) {
+                    match fleet_sess.greet(&pid, t.channel_binding(), link_nonce, |cb| {
+                        fleet::make_hello(cb, &display_name())
+                    }) {
                         fleet_session::Action::Send(msg) => {
                             let _ = t.send_control(&msg).await;
                         }
@@ -14249,10 +14251,10 @@ async fn send_cmd(
                         &v,
                         exporter,
                         fleet::my_owner_pub(),
-                        &display_name(),
                         Some(&fleet_target_name),
                         identity::now_secs(),
                         link_nonce,
+                        |cb| fleet::make_hello(cb, &display_name()),
                         |pubk| device_name_for_pub(pubk),
                     );
                     match outcome {

@@ -42,6 +42,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use anyhow::Result;
 use serde_json::{json, Value};
 
 /// What the caller should do next for a peer. The caller owns the transport.
@@ -183,18 +184,21 @@ impl FleetSession {
     ///
     /// With an exporter we can sign immediately. Without one we open the
     /// challenge and our hello waits for their nonce.
+    /// `make_hello` builds OUR hello for a given channel binding. It is injected
+    /// because that needs the host's key and certificate, which this module has
+    /// no business touching. Same shape as `filament-id` taking a `&dyn KeyStore`.
     pub fn greet(
         &mut self,
         pid: &str,
         exporter: Option<Vec<u8>>,
-        display_name: &str,
         mint: impl FnOnce() -> Vec<u8>,
+        make_hello: impl FnOnce(&[u8]) -> Result<Value>,
     ) -> Action {
         if self.proved(pid) {
             return Action::Idle;
         }
         match exporter {
-            Some(cb) => match crate::fleet::make_hello(&cb, display_name) {
+            Some(cb) => match make_hello(&cb) {
                 Ok(hello) => Action::Send(hello),
                 Err(_) => Action::Idle,
             },
@@ -213,10 +217,10 @@ impl FleetSession {
         v: &Value,
         exporter: Option<Vec<u8>>,
         owner_pub: Option<[u8; 32]>,
-        display_name: &str,
         want: Option<&str>,
         now_secs: u64,
         mint: impl Fn() -> Vec<u8>,
+        make_hello: impl Fn(&[u8]) -> Result<Value>,
         name_for_pub: impl Fn(&[u8; 32]) -> Option<String>,
     ) -> Outcome {
         if self.proved(pid) {
@@ -225,18 +229,18 @@ impl FleetSession {
         match v["type"].as_str() {
             // Their challenge: sign what they sent, they verify against it.
             Some("l3-nonce") => {
-                let Some(Ok(nonce)) = v["nonce"].as_str().map(crate::overlay::unb64) else {
+                let Some(Ok(nonce)) = v["nonce"].as_str().map(filament_overlay::unb64) else {
                     return Outcome::Ignored;
                 };
                 if nonce.len() < 16 {
                     return Outcome::Ignored;
                 }
-                match crate::fleet::make_hello(&nonce, display_name) {
+                match make_hello(&nonce) {
                     Ok(hello) => Outcome::Send(hello),
                     Err(_) => Outcome::Ignored,
                 }
             }
-            Some(t) if t == crate::fleet::HELLO => {
+            Some(t) if t == crate::HELLO => {
                 let Some(owner) = owner_pub else {
                     return Outcome::Refused("no owner key".into());
                 };
@@ -252,7 +256,7 @@ impl FleetSession {
                     }
                     return Outcome::Refused("no channel binding".into());
                 };
-                match crate::fleet::verify_hello(v, &cb, &owner, now_secs) {
+                match crate::verify_hello(v, &cb, &owner, now_secs) {
                     Ok(ok) => {
                         // The name is resolved from the PROVEN certificate key,
                         // never from the name the peer asserted. A peer that
@@ -286,7 +290,7 @@ impl FleetSession {
 }
 
 fn nonce_msg(nonce: &[u8]) -> Value {
-    json!({ "type": "l3-nonce", "nonce": crate::overlay::b64(nonce) })
+    json!({ "type": "l3-nonce", "nonce": filament_overlay::b64(nonce) })
 }
 
 #[cfg(test)]
@@ -381,9 +385,9 @@ mod tests {
     #[test]
     fn their_nonce_is_answered_with_a_hello() {
         let mut s = FleetSession::new();
-        let msg = json!({ "type": "l3-nonce", "nonce": crate::overlay::b64(&[7u8; 32]) });
+        let msg = json!({ "type": "l3-nonce", "nonce": filament_overlay::b64(&[7u8; 32]) });
         let out = s.on_control(
-            "a", &msg, None, Some([0u8; 32]), "me", None, 0, n1, |_| None,
+            "a", &msg, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None,
         );
         assert!(matches!(out, Outcome::Send(_) | Outcome::Ignored));
     }
@@ -392,9 +396,9 @@ mod tests {
     #[test]
     fn short_nonce_is_rejected() {
         let mut s = FleetSession::new();
-        let msg = json!({ "type": "l3-nonce", "nonce": crate::overlay::b64(&[7u8; 4]) });
+        let msg = json!({ "type": "l3-nonce", "nonce": filament_overlay::b64(&[7u8; 4]) });
         let out =
-            s.on_control("a", &msg, None, Some([0u8; 32]), "me", None, 0, n1, |_| None);
+            s.on_control("a", &msg, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None);
         assert_eq!(out, Outcome::Ignored);
     }
 
@@ -402,12 +406,12 @@ mod tests {
     #[test]
     fn hello_without_binding_challenges_once_then_refuses() {
         let mut s = FleetSession::new();
-        let hello = json!({ "type": crate::fleet::HELLO });
+        let hello = json!({ "type": crate::HELLO });
         let first =
-            s.on_control("a", &hello, None, Some([0u8; 32]), "me", None, 0, n1, |_| None);
+            s.on_control("a", &hello, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None);
         assert!(matches!(first, Outcome::Send(_)), "first is a challenge");
         let second =
-            s.on_control("a", &hello, None, Some([0u8; 32]), "me", None, 0, n1, |_| None);
+            s.on_control("a", &hello, None, Some([0u8; 32]), None, 0, n1, |_| Ok(json!({})), |_| None);
         assert!(matches!(second, Outcome::Refused(_)), "second must refuse, not loop");
     }
 
@@ -415,8 +419,8 @@ mod tests {
     #[test]
     fn no_owner_key_refuses() {
         let mut s = FleetSession::new();
-        let hello = json!({ "type": crate::fleet::HELLO });
-        let out = s.on_control("a", &hello, None, None, "me", None, 0, n1, |_| None);
+        let hello = json!({ "type": crate::HELLO });
+        let out = s.on_control("a", &hello, None, None, None, 0, n1, |_| Ok(json!({})), |_| None);
         assert!(matches!(out, Outcome::Refused(_)));
     }
 }

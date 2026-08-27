@@ -1187,6 +1187,7 @@ dependencies = [
  "crossterm",
  "directories",
  "filament-cap",
+ "filament-fleet",
  "filament-id",
  "filament-overlay",
  "filament-pair",
@@ -1228,6 +1229,16 @@ dependencies = [
  "wintun",
  "zeroize",
  "zip",
+]
+
+[[package]]
+name = "filament-fleet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "filament-id",
+ "filament-overlay",
+ "serde_json",
 ]
 
 [[package]]
