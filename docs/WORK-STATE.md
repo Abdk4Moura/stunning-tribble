@@ -596,11 +596,48 @@ amendment section in `docs/design-mesh-network.md`. Proof:
      fires only on a link's FIRST verification, so on a warm link every deferred
      offer was stranded: 0/8. That is "decision on a narrow view" again, mine.
 
-   WHAT REMAINS is an establishment race, not an authorization one: the failures
-   are "no peer connected within 45s", and the same send succeeds under `-vv`
-   (2/2), which changes timing. That points at discovery/establishment on the
-   fleet channel, the same area as the signaling-harness finding, and it wants a
-   deterministic harness rather than more live retries.
+   ROOT CAUSE FOUND (2026-08-27). It was never a discovery race. The
+   `ChannelReady` handler opens with `if !conn.is_active(&pid) { continue }`, and
+   the fleet path re-emits `ChannelReady` when a peer proves its certificate. On
+   the fleet channel some OTHER sibling routinely wins the active slot first (the
+   owner especially, since it is paired with everyone and answers no fleet
+   challenge). So the real target proved itself into a slot it did not own, its
+   re-emit was discarded one line in, its offer was never made, and the send
+   timed out 45s after verifying the right device. Fixed: on a fleet send,
+   identity IS the selector, so a peer whose certificate names the target BECOMES
+   the active peer (`conn.active = Some(pid)`) before the re-emit.
+
+   That also explains the cold/warm pattern that made this look environmental:
+   warm runs passed because the target happened to win the slot, cold runs failed
+   because a competitor did.
+
+   MEASURED, interleaved A/B (treatment and control alternate inside the same
+   time window, so any drift hits both), two independent rigs:
+
+       sibling -> sibling   ~50/55  (91%)   with all fixes
+       sibling -> sibling    8/15   (53%)   before the active-slot fix
+       device  -> owner     45/45  (100%)   throughout
+
+   METHODOLOGY, and it is why the earlier numbers moved. Running all of one arm
+   then all of the other let a bad two-minute window land entirely on one arm:
+   the SAME binary measured 2/8 and 8/8. Only interleaved runs are comparable.
+
+   STILL OPEN, ~9%: the receiver sometimes declines with "not in auth key caps".
+   Its gate decides the offer before the one-shot sender's `fleet-hello` has been
+   verified, so an unverified fleet link is judged against the empty ceiling it
+   is born with. The narrow deferral (`fleet_pending`, meaning "a hello IS
+   coming") plus a bounded grace covers most of it. Broadening the predicate to
+   "any untrusted fleet-shaped link could still verify" was tried and MEASURED
+   WORSE, 11/15 -> 3/15: it parks offers whose hello was already handled, which
+   then wait out the grace and are declined anyway. Do not retry that.
+
+   THE RIGHT FIX IS ARCHITECTURAL, and the data points at it. The daemon-to-daemon
+   mesh verified 100% of the time in every run, including every run where the
+   one-shot send failed. The one-shot is a THIRD process that re-does discovery
+   and identity from scratch against a channel full of siblings. It should not:
+   it should ride the daemon's already-verified link (item 1c, warm-send), or
+   have the daemon broker a private single-use rendezvous for it. Build the
+   flaky thing on top of the thing that is already reliable.
 
 2-DONE. **Owner-signed grant distribution: BUILT and verified (2026-08-27).**
    Owner-signed `CapOp`s now reach fleet devices two ways: seeded in the

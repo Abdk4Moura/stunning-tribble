@@ -13531,27 +13531,28 @@ async fn send_cmd(
                 // "some peer proved", read as "THIS peer proved") is fixed, and
                 // no measured run has ever delivered to the wrong device.
                 //
-                // It simply does not complete often enough. Measured 2026-08-27,
-                // 8 attempts per direction between two siblings, release build,
-                // three daemons, one inbox each, NO stale daemons on the channel:
+                // It still does not complete often enough. Measured 2026-08-27,
+                // interleaved A/B so the sibling arm and the paired control share
+                // one time window, two independent rigs, release build, one inbox
+                // per node, zero stale daemons on the channel:
                 //
-                //     sibling -> sibling   8/16   (this build)
-                //     sibling -> sibling   6/16   (before the fixes below)
-                //     device  -> owner    16/16   (the ordinary PAIRED path)
+                //     sibling -> sibling   ~50/55   (91%)  with the active-slot fix
+                //     sibling -> sibling     8/15   (53%)  before it
+                //     device  -> owner      45/45  (100%)  throughout
                 //
-                // The paired control passing 16/16 in the same runs is what says
-                // this is specific to the fleet path and not the box or the rig.
-                // A failure costs the user a 45s timeout, so the default stays
-                // the accurate "not yet a send target" message.
+                // The paired control at 100% across the same windows is what says
+                // the gap is specific to the fleet path, not the box or the rig.
                 //
-                // NOTE the earlier claim here, "exercised in one topology", was
-                // measured on a rig with stale daemons from previous runs still
-                // on the fleet channel under the same owner key: indistinguishable
-                // from real siblings, so the sender was choosing among impostors.
-                // Treat any fleet number taken without a zero-daemon check as void.
+                // TWO measurement traps, both of which produced wrong numbers here:
+                // stale daemons from previous runs sit on the SAME fleet channel
+                // under the SAME owner key and are indistinguishable from real
+                // siblings; and running one arm fully before the other lets a bad
+                // window land on one arm, which had the SAME binary read 2/8 and
+                // 8/8. Any fleet number without a zero-daemon check AND
+                // interleaving is void.
                 ui::say(&ui::paint(
                     ui::Tone::Warn,
-                    "  FILAMENT_FLEET_SEND: experimental. Fails closed and has never misdelivered, but it only completes about half the time; a failure costs a 45s timeout.",
+                    "  FILAMENT_FLEET_SEND: experimental. Fails closed and has never misdelivered; it completes about 9 times in 10, and a failure costs a 45s timeout.",
                 ));
                 let rv = fleet::rv()?;
                 fleet_indexed_name(t).then(|| {
@@ -14392,6 +14393,27 @@ async fn send_cmd(
                                     }
                                     fleet_proven.insert(pid.clone());
                                     ui::debug(&format!("fleet target '{fleet_target_name}' proved its certificate on pid={pid}"));
+                                    // THE PROVEN PEER IS THE TARGET. On a fleet
+                                    // send, identity is the selector: a peer whose
+                                    // certificate names the device the user asked
+                                    // for IS that device, and nothing else can be.
+                                    //
+                                    // Without this the re-emit below is thrown away
+                                    // one line into the ChannelReady handler, which
+                                    // opens with `if !conn.is_active(&pid) continue`.
+                                    // Whoever won the active slot first keeps it,
+                                    // and on the fleet channel that is routinely
+                                    // some OTHER sibling: the owner answers, holds
+                                    // the slot, is proved wrong, and the real target
+                                    // then proves itself into a slot it does not own,
+                                    // so its offer is silently dropped and the send
+                                    // times out at 45s having verified the right
+                                    // device seconds earlier. Measured exactly that
+                                    // way, and it is the whole "sibling send is
+                                    // unreliable" symptom: cold runs failed because
+                                    // the wrong peer tended to win the slot first,
+                                    // warm runs passed because the target did.
+                                    conn.active = Some(pid.clone());
                                     // RE-EMIT ChannelReady, exactly as the PAKE
                                     // path does on confirm. The offer lives in the
                                     // ChannelReady handler, which already ran and
@@ -16213,7 +16235,16 @@ async fn recv_cmd(
     // later. Measured as a ~1-in-6 spurious decline between two siblings. The
     // answer is to wait for the identity to settle, not to widen the gate:
     // whether the peer is authorized is exactly what is still being computed.
-    let mut fleet_deferred_offers: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut fleet_deferred_offers: Vec<(String, serde_json::Value, Instant)> = Vec::new();
+    // How long an offer may wait for its sender to prove itself before we decide
+    // anyway. Bounded on purpose: waiting forever for a hello that never comes
+    // would turn a clean decline into the 45s timeout it replaced.
+    let fleet_offer_grace = Duration::from_secs(
+        std::env::var("FILAMENT_FLEET_OFFER_GRACE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8),
+    );
     let mut fleet_greeted: std::collections::HashSet<String> = Default::default();
 
     // Daemon-managed mount state: the daemon holds the sshfs child processes and
@@ -16804,6 +16835,25 @@ async fn recv_cmd(
         }
         // #28: discharge any deferred peer-left whose channel has gone idle/dead.
         conn.reap_deferred();
+        // Grace expired: decide these offers normally rather than hold them.
+        // Re-injected with `__fleet_waited` so the deferral above does not catch
+        // them a second time and park them forever.
+        {
+            let now = Instant::now();
+            let due: Vec<_> = fleet_deferred_offers
+                .iter()
+                .filter(|(_, _, dl)| now > *dl)
+                .cloned()
+                .collect();
+            fleet_deferred_offers.retain(|(_, _, dl)| now <= *dl);
+            for (p, mut ov, _) in due {
+                ui::debug(&format!(
+                    "fleet: offer from {p} waited out its grace unverified; deciding it"
+                ));
+                ov["__fleet_waited"] = serde_json::Value::Bool(true);
+                let _ = tx.send(Ev::Control(p, ov));
+            }
+        }
         // Drop warm-bootstrap waiters whose peer never acked; the client's read
         // hits EOF and falls back to the cold establish.
         #[cfg(unix)]
@@ -17084,7 +17134,7 @@ async fn recv_cmd(
                     // link must re-prove on a NEW binding, so replaying an offer
                     // buffered under the old one is precisely the stale-trust bug
                     // the channel binding exists to prevent.
-                    fleet_deferred_offers.retain(|(p, _)| p != &pid);
+                    fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
                     // A new link gets a NEW challenge. Carrying the old nonce
                     // forward would let a message captured on the previous link
                     // verify on this one, which is the whole thing the binding
@@ -17982,7 +18032,7 @@ async fn recv_cmd(
                                 Ok(ok) if device_cert_revoked(&ok.device_pub) => {
                                     ui::debug(&format!("fleet-hello from {pid} refused: device revoked"));
                                     fleet_pending.remove(&pid);
-                                    fleet_deferred_offers.retain(|(p, _)| p != &pid);
+                                    fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
                                     conn.drop_link(&pid);
                                 }
                                 Ok(ok) => {
@@ -17995,11 +18045,11 @@ async fn recv_cmd(
                                     {
                                         let replay: Vec<_> = fleet_deferred_offers
                                             .iter()
-                                            .filter(|(p, _)| p == &pid)
+                                            .filter(|(p, _, _)| p == &pid)
                                             .cloned()
                                             .collect();
-                                        fleet_deferred_offers.retain(|(p, _)| p != &pid);
-                                        for (p, ov) in replay {
+                                        fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
+                                        for (p, ov, _) in replay {
                                             ui::debug(&format!(
                                                 "fleet: replaying offer deferred while {p} was unverified"
                                             ));
@@ -18127,7 +18177,7 @@ async fn recv_cmd(
                                 Err(e) => {
                                     ui::debug(&format!("fleet-hello from {pid} rejected: {e}"));
                                     fleet_pending.remove(&pid);
-                                    fleet_deferred_offers.retain(|(p, _)| p != &pid);
+                                    fleet_deferred_offers.retain(|(p, _, _)| p != &pid);
                                     conn.drop_link(&pid);
                                 }
                             }
@@ -19363,16 +19413,43 @@ async fn recv_cmd(
                     // link: `fleet-hello` either verifies (we replay) or is
                     // rejected and the link is dropped (the entry goes with it),
                     // so a peer cannot park offers here indefinitely.
-                    if fleet_identity_pending(
-                        &conn,
-                        &pid,
-                        fleet_pending.contains(&pid),
-                        fleet_verified.contains(&pid),
-                    ) {
+                    // "Could this link still prove itself?" is the question, and
+                    // `fleet_pending` alone answers a NARROWER one: "have we already
+                    // classified it?". The offer can arrive before ChannelReady has
+                    // run for that pid, so the set is still empty and the gate
+                    // decides against a peer that is seconds from being Proven,
+                    // declining with "not in auth key caps" against the empty
+                    // ceiling an unverified fleet link is born with. Measured as the
+                    // dominant failure once the active-slot bug was fixed: 3 of 4
+                    // remaining failures were this decline, not a timeout.
+                    //
+                    // `__fleet_waited` marks an offer that has already served its
+                    // grace, so a peer that never proves itself is decided normally
+                    // instead of deferred forever.
+                    // MEASURED, and the wider condition was WORSE. Broadening this
+                    // to "any untrusted fleet-shaped link could still verify" took
+                    // sibling sends from 11/15 to 3/15: `fleet_shaped_link` is true
+                    // for nearly every such link, so offers whose hello had ALREADY
+                    // been handled were parked too, waited out the full grace, and
+                    // were then declined anyway. `fleet_pending` is the honest
+                    // predicate because it means "a hello is actually coming".
+                    let already_waited = v["__fleet_waited"].as_bool() == Some(true);
+                    if !already_waited
+                        && fleet_identity_pending(
+                            &conn,
+                            &pid,
+                            fleet_pending.contains(&pid),
+                            fleet_verified.contains(&pid),
+                        )
+                    {
                         ui::debug(&format!(
                             "deferring file-offer from {pid}: fleet identity still verifying"
                         ));
-                        fleet_deferred_offers.push((pid.clone(), v.clone()));
+                        fleet_deferred_offers.push((
+                            pid.clone(),
+                            v.clone(),
+                            Instant::now() + fleet_offer_grace,
+                        ));
                         continue;
                     }
                     let id = v["id"].as_str().unwrap_or_default().to_string();
