@@ -12066,7 +12066,7 @@ async fn main() -> Result<()> {
                 }
             } else {
                 // Show this machine's address.
-                let id = overlay::Identity::load_or_create()?;
+                let id = overlay::load_identity()?;
                 let my_name = config_get("name").unwrap_or_else(|| l3::hostname());
                 let mesh_name = l3::sanitize_host(&my_name);
                 if json_output {
@@ -15716,7 +15716,7 @@ async fn recv_cmd(
         match settings::get_str("tun-addr", None) {
             Some(setting) => {
                 let (cidr, identity) = if setting == "auto" {
-                    match overlay::Identity::load_or_create() {
+                    match overlay::load_identity() {
                         Ok(id) => (format!("{}/128", id.addr()), Some(id)),
                         Err(e) => {
                             ui::say(&ui::paint(ui::Tone::Warn, &format!("  L3 disabled: {e}")));

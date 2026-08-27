@@ -1188,6 +1188,7 @@ dependencies = [
  "directories",
  "filament-cap",
  "filament-id",
+ "filament-overlay",
  "filament-pair",
  "filament-proto",
  "filament-transfer",
@@ -1241,6 +1242,17 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "zeroize",
+]
+
+[[package]]
+name = "filament-overlay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "ring",
+ "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]

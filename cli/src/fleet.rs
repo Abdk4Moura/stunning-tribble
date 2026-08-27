@@ -78,7 +78,7 @@ pub fn is_fleet_channel(ch: &str) -> bool {
 /// that verifies against `cb` is already a live possession proof of the key the
 /// certificate names.
 pub fn make_hello(cb: &[u8], name: &str) -> Result<Value> {
-    let id = crate::overlay::Identity::load_or_create()?;
+    let id = crate::overlay::load_identity()?;
     let ann = id.announce(crate::overlay::next_announce_seq(), cb);
     let cert = crate::local_device_cert()
         .ok_or_else(|| anyhow!("this device holds no certificate to present"))?;

@@ -1018,7 +1018,7 @@ mod tests {
     #[tokio::test]
     async fn l3_start_with_ipv4() {
         use super::*;
-        let identity = Identity::load_or_create().unwrap();
+        let identity = crate::overlay::load_identity().unwrap();
         let expected_v4 = identity.addr_v4();
         let cidr = format!("{}/128", identity.addr());
         let l3 = L3::start(&cidr, 1280, Some(identity), L3Mode::Userspace).unwrap();
