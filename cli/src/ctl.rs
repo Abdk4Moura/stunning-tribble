@@ -49,7 +49,8 @@ pub use imp::{
 
 #[cfg(not(unix))]
 pub use stub::{
-    try_approve_request, try_cap_status, try_deny_request, try_fleet_rendezvous, try_list_pending, try_list_warm, try_ping,
+    daemon_present, try_approve_request, try_cap_status, try_deny_request, try_fleet_rendezvous,
+    try_list_pending, try_list_warm, try_ping,
     Req,
 };
 
@@ -885,6 +886,13 @@ mod stub {
     /// Callers treat `None` as "no daemon reply" and degrade gracefully.
     pub async fn try_list_pending() -> Option<Value> {
         None
+    }
+
+    /// There is no control socket on this platform, so there is never a daemon
+    /// to reach. Callers use this to decide whether a daemon-mediated path is
+    /// available at all, and here it never is.
+    pub async fn daemon_present() -> bool {
+        false
     }
 
     /// No control socket here, so no daemon can broker a rendezvous. `None`
