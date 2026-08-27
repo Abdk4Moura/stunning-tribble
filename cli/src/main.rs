@@ -7757,6 +7757,22 @@ impl Link {
     /// and clamps the certificate expiry before any owner-derived authorization.
     /// A same-owner certificate with no matching record fails closed as a
     /// delegated principal with an empty ceiling and expiry zero.
+    /// Admit a same-owner FLEET device: identity proven, no ceiling, not owner.
+    ///
+    /// Deliberately NOT `admit_delegated`. That pins an auth-key ceiling, and the
+    /// ceiling check is unconditional and purely restrictive, so the empty
+    /// ceiling a sibling starts with denied everything before the fleet policy
+    /// was consulted. `trusted` stays false here for the same reason it does
+    /// there: binding=Proven is what authorizes, and `trusted` leaks into the
+    /// legacy_ok gates.
+    fn admit_fleet(&mut self, owner_pub: [u8; 32], device_pub: [u8; 32], expires: u64) {
+        self.identity_user_pub = Some(owner_pub);
+        self.identity_device_pub = Some(device_pub);
+        self.identity_binding = crate::capability::BindingStrength::Proven;
+        self.identity_cert_expires = Some(expires);
+        self.principal_kind = crate::capability::PrincipalKind::FleetDevice;
+    }
+
     fn admit_delegated(&mut self, owner_pub: [u8; 32], device_pub: [u8; 32], expires: u64, caps: Vec<String>) {
         // A delegated principal acts UNDER the owner's user identity (the auth
         // key issuer), so it presents user_pub = owner_pub. evaluate()'s owner
@@ -17762,13 +17778,9 @@ async fn recv_cmd(
                                     // adds. A sibling we hold no record for still
                                     // gets nothing, which is the intended
                                     // reachability-without-capability default.
-                                    let ceiling = proven_name
-                                        .as_deref()
-                                        .and_then(device_caps)
-                                        .unwrap_or_default();
                                     if let Some(l) = conn.link_mut(&pid) {
                                         l.verified_name = proven_name.clone();
-                                        l.admit_delegated(ok.owner_pub, ok.device_pub, ok.cert_expires, ceiling);
+                                        l.admit_fleet(ok.owner_pub, ok.device_pub, ok.cert_expires);
                                     }
                                     // Answer once, so a mutual hello terminates.
                                     if fleet_greeted.insert(pid.clone()) {

@@ -512,8 +512,24 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    rather than silent: `send --to <sibling>` names the limitation and points at
    the two things that DO work (the peer's `.mesh` address, or pairing directly).
 
-1d. **Ungranted fleet-scope transfer needs a NEW PRINCIPAL KIND. Analysed, not
-   started.** The capability layer already implements the policy: a same-owner
+1d. **Ungranted fleet-scope transfer: DONE (`PrincipalKind::FleetDevice`).**
+   A sibling with NO grant now lands a file in the receiver's drop dir; the
+   deliberate tier stays grant-only. Measured:
+       transfer, no grant -> allowed=true has_grant=false in_bounds=true,
+                             delivered to the NAMED device
+       shell,    no grant -> refused, "capability not granted"
+   410 bin tests + 90 capability-crate tests green.
+
+   The earlier entry below called this a security-model change on the grounds
+   that a ceiling-less kind would inherit the owner shortcut. That reasoning was
+   WRONG: `cap_gate_effective` already discards the owner shortcut for a
+   same-owner peer and recomputes from fleet policy (its own finding-#24 note
+   says so). The policy was already written and reviewed; it could simply never
+   be reached, because `Delegated`'s ceiling is unconditional and a sibling
+   starts with an empty one. `Delegated` was wrong twice over: it also means
+   "ephemeral, drop on disconnect", which a persistent sibling is not.
+
+1d-old. **(superseded analysis, kept for the reasoning) needed a NEW PRINCIPAL KIND** The capability layer already implements the policy: a same-owner
    Proven device may land a file inside the receiver's own drop dir without a
    grant (`cap_fleet_inputs` + `scoped_in_bounds`). It cannot fire for a fleet
    link, and the reason is structural rather than a tweak:

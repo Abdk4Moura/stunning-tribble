@@ -514,6 +514,37 @@ It is also the same shape as everything else in this document: a value whose
 scope is narrower than the decision resting on it. `fleet_proven` had no peer in
 it at all.
 
+### Ungranted fleet-scope transfer: DONE (PrincipalKind::FleetDevice)
+
+A sibling with NO grant now lands a file in the receiver's own drop dir, while
+the deliberate tier stays grant-only. Measured:
+
+    transfer (scoped default, in drop dir), no grant -> allowed, delivered to the NAMED device
+        gate: allowed=true legacy_ok=false trusted=false binding=Proven
+              own_user=true has_grant=false in_bounds=true
+    shell (deliberate tier), no grant               -> refused, "capability not granted"
+
+**What was actually wrong.** An earlier note in this document said this needed a
+principal kind that "does not exist" and called it a security-model change. The
+kind was needed, but the reasoning behind calling it a model change was WRONG: it
+assumed a ceiling-less kind would inherit the owner shortcut and become
+owner-equivalent. `cap_gate_effective` already DISCARDS the owner shortcut for a
+same-owner peer and recomputes from fleet policy (the finding-#24 note in that
+function says so explicitly). The policy was already written and reviewed; it
+simply could never be reached.
+
+`PrincipalKind::FleetDevice` carries no ceiling and is neither `Delegated` nor
+`OwnerDevice`:
+  - not `Delegated`, whose auth-key ceiling is unconditional and purely
+    restrictive, so the empty ceiling a sibling starts with denied everything
+    before the fleet policy ran. `Delegated` ALSO means "ephemeral, drop on
+    disconnect", which a persistent sibling is not, so it was wrong twice.
+  - not `OwnerDevice`, so nothing reads a sibling as the local primary.
+
+This is 4b revised, not abandoned: reachability is still the default, the
+deliberate tier is still grant-only, and what a sibling gains without a grant is
+exactly the scoped default the capability layer already defined.
+
 ### Sibling transfer works, with a grant
 
     filament grant <sibling> transfer      (on the receiver)
