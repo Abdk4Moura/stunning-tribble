@@ -717,8 +717,18 @@ amendment section in `docs/design-mesh-network.md`. Proof:
      - broaden the receiver deferral to any fleet-shaped link:  11/15 -> 3/15
      - classify fleet links at adoption instead of ChannelReady: 0/20 and 5/20
      - greet every fleet link, not only the active one:         17/20 and 7/20
-   All three are plausible on paper. Two of them park offers waiting for a hello
-   that never arrives, which converts a fast decline into a slow one.
+     - mutual `fleet-hello-ack` before offering:                0/15
+   All four are plausible on paper, and the fourth is arguably the CORRECT
+   protocol fix: verification is mutual, the sender only ever knew its own half,
+   and it offered into a race it could not see. It still measured 0/15 against a
+   paired control of 15/15 on the same rig, and a verbose run showed the target
+   never proving at all rather than the offer being held. Reverted.
+
+   FOUR patches to this handshake, four regressions. That is the finding, not an
+   accident: each one adds a wait or a condition to a ceremony that is already
+   losing races, and the marginal fix keeps making the ceremony longer. The
+   conclusion the evidence supports is the architectural one below, and future
+   work should go THERE rather than at a fifth condition.
 
    THE RIGHT FIX IS ARCHITECTURAL, and the data points at it. The daemon-to-daemon
    mesh verified 100% of the time in every run, including every run where the
