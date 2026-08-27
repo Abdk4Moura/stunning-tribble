@@ -1,0 +1,20 @@
+# filament-transport — host hooks for the transport ladder.
+#
+# The ladder itself is still in the CLI. This crate holds what was blocking it
+# from leaving: the few places connection code reached sideways into terminal
+# output, settings, config paths and interface enumeration. With net.rs and
+# direct.rs calling hooks:: instead of crate::, moving them here is a file move
+# rather than a refactor.
+[package]
+name = "filament-transport"
+version = "0.1.0"
+authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abdk4Moura/filament"
+description = "Host hooks for filament's peer-to-peer transport ladder"
+readme = "README.md"
+keywords = ["transport", "p2p", "nat-traversal", "hooks"]
+categories = ["network-programming"]
+
+[dependencies]

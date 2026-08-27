@@ -9,10 +9,11 @@ Someone should be able to build on filament's ideas without adopting filament.
 Not "vendor the CLI and shell out to it" — take the piece they need, as a crate,
 with a public API and no obligation to bring the rest.
 
-That is not a rewrite. Five crates already exist (`filament-cap`, `filament-id`,
-`filament-pair`, `authkeys-managed`, `secret-write`), so the trust layer is
-already out. What is left in the CLI is transport, the event loop, the protocol,
-and the transfer mechanics.
+That is not a rewrite. Nine crates exist now: the trust layer was already out
+(`filament-cap`, `filament-id`, `filament-pair`, `authkeys-managed`,
+`secret-write`), and `filament-transfer`, `filament-proto`, `filament-overlay`
+and `filament-fleet` followed. What is left in the CLI is transport and the
+event loop.
 
 ## Why it is worth doing, from this repo's own history
 
@@ -63,18 +64,11 @@ Done:
 | `filament-pair` | the pairing ceremony (PAKE) |
 | `secret-write` | writing secrets to disk safely |
 | `filament-transfer` | out-of-order reassembly, untrusted names, short-write-safe writes |
+| `filament-proto` | the wire vocabulary + the pure ceremony decisions |
+| `filament-overlay` | self-certifying addresses, link-bound announcements |
+| `filament-fleet` | the admission ceremony + the per-peer session |
 
 Next, in dependency order:
-
-1. **`filament-proto`** — the wire vocabulary. `cli/src/protocol.rs` is already
-   this: message constructors plus PURE decision functions (`decide_verify`,
-   `decide_ack_fallback`, `recv_transfer_done`). It has no host dependencies and
-   should simply move.
-
-2. **`filament-fleet`** — auto-mesh. `fleet.rs` (the crypto: build/verify a
-   hello, derive the channel) plus `fleet_session.rs` (the conversation, already
-   extracted and I/O-free by design). Blocked only on `overlay::Announce` and
-   `identity::DeviceCert`, so it wants `filament-id` to absorb those first.
 
 3. **`filament-transport`** — the `Transport` trait and the ladder beneath it
    (direct QUIC, WebRTC, relay). The piece with the most standalone value: "an

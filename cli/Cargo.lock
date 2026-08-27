@@ -1193,6 +1193,7 @@ dependencies = [
  "filament-pair",
  "filament-proto",
  "filament-transfer",
+ "filament-transport",
  "flate2",
  "fuser",
  "futures-util",
@@ -1289,6 +1290,10 @@ dependencies = [
 
 [[package]]
 name = "filament-transfer"
+version = "0.1.0"
+
+[[package]]
+name = "filament-transport"
 version = "0.1.0"
 
 [[package]]

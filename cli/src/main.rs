@@ -11688,12 +11688,41 @@ fn classify_bare_token(
     BareTarget::Unknown
 }
 
+/// Install the CLI's answers to the transport's host questions. One place, so
+/// there is no doubt about what the transport can and cannot see.
+fn install_transport_hooks() {
+    use filament_transport::hooks;
+    hooks::set_trace(|m| ui::trace(m));
+    hooks::set_debug(|m| ui::debug(m));
+    hooks::set_ip_class(|ip| doctor::ip_class(ip));
+    hooks::set_iface_for_ip(|ip| doctor::iface_for_ip(ip));
+    hooks::set_settings_get_str(|k, p| settings::get_str(k, p));
+    hooks::set_raw_membership(|p| settings::raw_membership(p));
+    hooks::set_config_path(|n| platform::Paths::config_path(n));
+    hooks::set_resolve_iface_name(|addr| {
+        if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
+            for iface in interact::enumerate_interfaces() {
+                if iface.ips.iter().any(|i| *i == ip) {
+                    return iface.name;
+                }
+            }
+        }
+        "?".to_string()
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // F2: both ring (webrtc) and aws-lc (reqwest) end up in the dep tree;
     // rustls refuses to guess between two providers, so pick ring explicitly
     // BEFORE anything touches TLS.
     rustls::crypto::ring::default_provider().install_default().ok();
+    // Tell the transport how to reach this host. It no longer reaches sideways
+    // into the CLI for terminal output, settings, config paths or interface
+    // enumeration; it asks, and these are our answers. Every hook has a safe
+    // default, so a library consumer that installs none still gets a working
+    // transport with the diagnostics discarded.
+    install_transport_hooks();
     // #161 probe scope: mark this process as a live flow so the gate's
     // ordering-window probe fires here (and in the harness) but not in unit
     // tests that construct the window state deliberately.
