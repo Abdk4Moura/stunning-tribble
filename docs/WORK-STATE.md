@@ -601,7 +601,41 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    records one instance of the cost: the close-reason hole was found and fixed
    for `mount` and survived in `pty` because nobody walked the other copy.
 
-1e. **`send --to <sibling>`: STAYS OPT-IN. Four bugs fixed, still ~50% (2026-08-27).**
+1h. **SOLVED: brokered rendezvous. Sibling send is reliable and ON by default
+   (2026-08-27).** The architectural fix the evidence had been pointing at.
+
+   The daemon already holds a certificate-verified link to the sibling. So it
+   mints a SINGLE-USE secret, hands it over THAT link, and returns the same
+   secret to the one-shot. Both ends then meet on `channel_of(secret)`, where
+   exactly two parties exist, instead of the fleet channel where every sibling
+   does. The secret doubles as the proof, which is why this reuses the
+   most-tested path in the product instead of adding one: `send --to` already
+   knows how to meet a known device on a shared secret, so a brokered send is
+   just an ordinary known-device send. Its authenticity is inherited from the
+   link it travelled over, which was verified by certificate.
+
+   The race does not get safer. It stops existing, because only the target was
+   ever told the address.
+
+   MEASURED, three gated rigs, interleaved against the paired control, 58/58:
+
+       rig 1   sibling 15/15    paired 15/15
+       rig 2   sibling 15/15    paired 15/15
+       rig 3   sibling 20/20    paired 20/20
+       default path, NO flag    8/8
+
+   That is the first 100% this path has ever recorded, after four patches that
+   each made it worse. FILAMENT_FLEET_SEND is no longer needed: brokering works
+   without it, and the flag now only exercises the old unbrokered fallback
+   deliberately. A fleet name is accepted as a `send --to` target whenever a
+   daemon is present to broker.
+
+   SECURITY. The ticket is accepted ONLY from a link whose certificate we
+   already verified (`fleet_verified.contains(&pid)`). Otherwise mere presence
+   on the fleet channel could manufacture a trusted-looking peering, which is
+   the one thing this design says presence must never buy.
+
+1e-old. **`send --to <sibling>`: was OPT-IN, superseded by 1h. Four bugs fixed, still ~50% (2026-08-27).**
    Item 1b said "enable it when item 2 lands, not before". Item 2 has landed, so
    the gate was re-examined and the flip is REFUSED on measurement.
 

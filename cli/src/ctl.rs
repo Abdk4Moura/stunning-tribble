@@ -42,14 +42,14 @@ pub fn reuse_disabled() -> bool {
 #[cfg(unix)]
 pub use imp::{
     daemon_present, send_reply, serve, serve_at, try_approve_request, try_bootstrap,
-    try_cap_status, try_deny_request, try_dial, try_list_mounts, try_list_pending, try_list_warm, try_mount,
+    try_cap_status, try_deny_request, try_dial, try_fleet_rendezvous, try_list_mounts, try_list_pending, try_list_warm, try_mount,
     try_mount_health, try_open, try_open_at, try_ping, try_pty, try_pty_reason, try_reconfigure, try_reload,
     try_reload_expose, try_resize, try_unmount, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
 pub use stub::{
-    try_approve_request, try_cap_status, try_deny_request, try_list_pending, try_list_warm, try_ping,
+    try_approve_request, try_cap_status, try_deny_request, try_fleet_rendezvous, try_list_pending, try_list_warm, try_ping,
     Req,
 };
 
@@ -463,6 +463,26 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
+    /// Ask our daemon to broker a private rendezvous with a fleet sibling.
+    ///
+    /// Returns the one-time secret both ends will meet on. `None` when there is
+    /// no daemon, or it holds no verified link to that peer, in which case the
+    /// caller falls back to finding the peer itself.
+    pub async fn try_fleet_rendezvous(name: &str) -> Option<String> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "fleet-rendezvous", "name": name });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), read_line(&mut s, 4096))
+            .await.ok()?.ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true))
+            .then(|| v["secret"].as_str().map(str::to_string))
+            .flatten()
+    }
+
     /// Ask the daemon to approve a pending request by id.
     pub async fn try_approve_request(id: u64, allow: &str, expires: u64) -> Option<Value> {
         let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
@@ -498,6 +518,7 @@ mod imp {
     // ----------------------------------------------------------------- daemon -
 
     /// What a warm-reuse client is asking the daemon to do over its warm link.
+    #[derive(Clone)]
     pub enum ReqKind {
         /// Open one raw L2 stream to `peer`'s localhost:`rport` (netcat/ssh/forward).
         Open { peer: String, rport: u16 },
@@ -553,6 +574,13 @@ mod imp {
         CapStatus,
         /// Snapshot already-held warm links without probing peers.
         ListWarm,
+        /// Broker a one-time private rendezvous with a fleet sibling.
+        ///
+        /// The daemon already holds a certificate-verified link to that sibling.
+        /// It mints a single-use secret, hands it over THAT link, and returns it
+        /// here. Both ends then meet on `channel_of(secret)`, where exactly two
+        /// parties exist, instead of the fleet channel where every sibling does.
+        FleetRendezvous { name: String },
         /// List pending consent requests.
         ListPending,
         /// Approve a pending request by id.
@@ -708,6 +736,10 @@ mod imp {
                     }
                     Some("cap-status") => ReqKind::CapStatus,
                     Some("list-warm") => ReqKind::ListWarm,
+                    Some("fleet-rendezvous") => {
+                        let Some(name) = v["name"].as_str().map(str::to_string) else { return };
+                        ReqKind::FleetRendezvous { name }
+                    }
                     Some("list-pending") => ReqKind::ListPending,
                     Some("approve-request") => {
                         let Some(id) = v["id"].as_u64() else { return };
@@ -852,6 +884,12 @@ mod stub {
     /// No control socket here, so there is no daemon consent queue to list.
     /// Callers treat `None` as "no daemon reply" and degrade gracefully.
     pub async fn try_list_pending() -> Option<Value> {
+        None
+    }
+
+    /// No control socket here, so no daemon can broker a rendezvous. `None`
+    /// means the caller finds the peer itself, which is the pre-existing path.
+    pub async fn try_fleet_rendezvous(_name: &str) -> Option<String> {
         None
     }
 

@@ -11015,6 +11015,9 @@ async fn handle_warm_req(
         ctl::ReqKind::MountHealth { .. } => req.reject("mount-health not handled here").await,
         ctl::ReqKind::CapStatus => req.reject("cap-status not handled here").await,
         ctl::ReqKind::ListWarm => req.reject("list-warm not handled here").await,
+        ctl::ReqKind::FleetRendezvous { .. } => {
+            req.reject("fleet-rendezvous not handled here").await
+        }
         ctl::ReqKind::ListPending => req.reject("list-pending not handled here").await,
         ctl::ReqKind::ApproveRequest { .. } => req.reject("approve-request not handled here").await,
         ctl::ReqKind::DenyRequest { .. } => req.reject("deny-request not handled here").await,
@@ -13344,9 +13347,15 @@ async fn send_cmd(
         // A fleet sibling has no pair secret, so `devices_load` skips it, but it IS
         // a valid target: the cold path dials it on the fleet secret and then
         // PROVES its certificate before any bytes move (`verify_fleet_identity`).
+        // A fleet sibling is a valid target when our daemon can broker a private
+        // rendezvous with it, which needs a daemon to ask. The opt-in flag still
+        // lets the old unbrokered path be exercised deliberately; brokering does
+        // not need it, because it does not have the reliability problem the flag
+        // exists to warn about.
         let known = devices_load().iter().any(|(n, _)| n.eq_ignore_ascii_case(target))
             || (fleet_indexed_name(target)
-                && std::env::var("FILAMENT_FLEET_SEND").as_deref() == Ok("1"));
+                && (ctl::daemon_present().await
+                    || std::env::var("FILAMENT_FLEET_SEND").as_deref() == Ok("1")));
         if !known {
             if fleet_indexed_name(target) {
                 bail!(
@@ -13506,7 +13515,50 @@ async fn send_cmd(
     // `to` is moved into the peer filter further down; keep the name for the
     // refusal messages, which are emitted long after that move.
     let fleet_target_name: String = to.clone().unwrap_or_default();
-    let known_target: Option<(String, String)> = to.as_ref().and_then(|t| {
+    // BROKERED RENDEZVOUS, tried before anything else for a fleet sibling.
+    //
+    // Our daemon already holds a certificate-verified link to that peer, so it
+    // can hand it a one-time secret over that link and tell us the same secret.
+    // Both ends then meet on channel_of(secret), where exactly two parties
+    // exist, and the secret proves the peer exactly as a pair secret does.
+    //
+    // This is the answer to the reliability problem rather than another
+    // condition on the fleet handshake. A one-shot on the fleet channel has to
+    // work out which of several answering siblings is the target while they all
+    // race; four attempts to make that race safer each measured WORSE. Here the
+    // race does not exist, because only the target was ever told the address.
+    //
+    // Falls through silently when there is no daemon or no verified link: then
+    // the existing paths apply and nothing is lost.
+    let brokered_target: Option<(String, String)> = match (to.as_deref(), fleet::rv()) {
+        (Some(t), Some(_)) if fleet_indexed_name(t) => {
+            match ctl::try_fleet_rendezvous(t).await {
+                Some(sec) => {
+                    ui::debug(&format!("fleet: daemon brokered a private rendezvous with '{t}'"));
+                    Some((t.to_string(), sec))
+                }
+                None => {
+                    ui::debug(&format!("fleet: no brokered rendezvous for '{t}'; falling back"));
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    if brokered_target.is_none()
+        && std::env::var("FILAMENT_FLEET_SEND").as_deref() != Ok("1")
+    {
+        if let Some(t) = to.as_deref() {
+            if fleet_indexed_name(t) && !devices_load().iter().any(|(n, _)| n.eq_ignore_ascii_case(t)) {
+                bail!(
+                    "send --to '{t}': your daemon has no verified link to it right now, so it \
+                     cannot broker a private rendezvous. Start `filament up` on both devices and \
+                     retry, or use its mesh address ({t}.mesh)."
+                );
+            }
+        }
+    }
+    let known_target: Option<(String, String)> = brokered_target.clone().or_else(|| to.as_ref().and_then(|t| {
         devices_load()
             .into_iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(t))
@@ -13563,7 +13615,7 @@ async fn send_cmd(
                     (t.clone(), rv)
                 })
             })
-    });
+    }));
     // Proven identity for a fleet target, PER PEER.
     //
     // This was a single bool, and that was a misdelivery bug: it meant "some peer
@@ -16025,6 +16077,10 @@ async fn recv_cmd(
     // answer is to wait for the identity to settle, not to widen the gate:
     // whether the peer is authorized is exactly what is still being computed.
     let mut fleet_deferred_offers: Vec<(String, serde_json::Value, Instant)> = Vec::new();
+    // Brokered meeting places we have joined: channel -> its one-time secret.
+    // Kept so a peer arriving on one is proved by that secret, exactly as a
+    // paired peer is proved by a pair secret.
+    let mut brokered: HashMap<String, String> = HashMap::new();
     // How long an offer may wait for its sender to prove itself before we decide
     // anyway. Bounded on purpose: waiting forever for a hello that never comes
     // would turn a clean decline into the 45s timeout it replaced.
@@ -16235,6 +16291,50 @@ async fn recv_cmd(
                             })).await;
                         } else if matches!(&req.kind, ctl::ReqKind::ListWarm) {
                             handle_list_warm(&conn, req).await;
+                        } else if let ctl::ReqKind::FleetRendezvous { name } =
+                            req.kind.clone()
+                        {
+                            // Broker a PRIVATE meeting place for a one-shot.
+                            //
+                            // The reliability problem this solves: a one-shot
+                            // `send` joins the fleet channel, where every sibling
+                            // is, and has to work out which of them is the target
+                            // while they all answer. The daemon does not have that
+                            // problem, because it already holds a
+                            // certificate-verified link to the peer. So it mints a
+                            // single-use secret, hands it over THAT link, and both
+                            // ends meet on channel_of(secret) where exactly two
+                            // parties exist.
+                            //
+                            // The secret doubles as the proof, which is why this
+                            // reuses the most-tested path in the product rather
+                            // than adding one: `send --to` already knows how to
+                            // meet a known device on a shared secret. Its
+                            // authenticity is inherited from the link it travelled
+                            // over, which was verified by certificate.
+                            match warm_link_for(&conn, &name) {
+                                Some((pid, t)) => {
+                                    let secret = fresh_secret();
+                                    let sent = t
+                                        .send_control(&json!({
+                                            "type": "fleet-rendezvous",
+                                            "secret": secret,
+                                        }))
+                                        .await
+                                        .is_ok();
+                                    if sent {
+                                        ui::debug(&format!(
+                                            "fleet-rendezvous: brokered for '{name}' over pid={pid}"
+                                        ));
+                                        req.reply(&json!({ "ok": true, "secret": secret })).await;
+                                    } else {
+                                        req.reject("could not reach that peer over the warm link").await;
+                                    }
+                                }
+                                None => {
+                                    req.reject(&format!("no verified link to '{name}'")).await;
+                                }
+                            }
                         } else if matches!(&req.kind, ctl::ReqKind::ListPending) {
                             let mut requests = load_requests();
                             expire_requests(&mut requests);
@@ -17143,6 +17243,29 @@ async fn recv_cmd(
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((n.clone(), sec.clone()));
                     }
+                } else if let Some(sec) = brokered
+                    .get(v["channel"].as_str().unwrap_or(""))
+                    .cloned()
+                {
+                    // A peer arrived on a meeting place we were TOLD about over a
+                    // certificate-verified link. Exactly one other party is
+                    // expected here, and the brokered secret proves it the same
+                    // way a pair secret proves a paired device, so this joins the
+                    // ordinary known-device path rather than the fleet one.
+                    //
+                    // That is the whole point of brokering: the one-shot never has
+                    // to work out which of several siblings is the target, because
+                    // only the target was ever given the address.
+                    let pid = v["id"].as_str().unwrap_or_default().to_string();
+                    if pid.is_empty() {
+                        continue;
+                    }
+                    let name = v["name"].as_str().unwrap_or("peer").to_string();
+                    conn.start_direct(&pid, &name, &sec).await;
+                    conn.maybe_adopt(&v, true).await?;
+                    if let Some(l) = conn.link_mut(&pid) {
+                        l.expected_secret = Some((name, sec));
+                    }
                 } else if fleet::is_fleet_channel(v["channel"].as_str().unwrap_or("")) {
                     // Fleet auto-mesh: a device is present on our fleet meeting
                     // point. We hold NO pair secret for it, so this is the
@@ -17972,6 +18095,33 @@ async fn recv_cmd(
                             }
                         }
                         _ => ui::debug(&format!("fleet-hello from {pid} ignored: no channel binding or no owner key")),
+                    }
+                }
+                // A sibling's daemon brokered a private meeting place for one of
+                // its one-shots. Join it, so the one-shot meets exactly us.
+                //
+                // ONLY from a link whose certificate we already verified. The
+                // secret grants a meeting place and, on that place, the ordinary
+                // known-device proof, so accepting one from an unverified link
+                // would let mere presence on the fleet channel manufacture a
+                // trusted-looking peering, which is the one thing this design says
+                // presence must never buy.
+                Some("fleet-rendezvous") if fleet_verified.contains(&pid) => {
+                    match v["secret"].as_str() {
+                        Some(sec) if hex::decode(sec).map(|b| b.len()).ok() == Some(32) => {
+                            let ch = channel_of(sec);
+                            if !sess.channels.contains(&ch) {
+                                sess.channels.push(ch.clone());
+                                let _ = sio
+                                    .emit("subscribe", json!({ "channels": [ch.clone()] }))
+                                    .await;
+                                brokered.insert(ch, sec.to_string());
+                                ui::debug(&format!(
+                                    "fleet-rendezvous: joined a brokered channel for {pid}"
+                                ));
+                            }
+                        }
+                        _ => ui::debug("fleet-rendezvous: ignored a malformed secret"),
                     }
                 }
                 #[cfg(l3)]
