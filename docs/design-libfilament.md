@@ -28,9 +28,18 @@ produced bugs in one copy and not the other:
 - The close-reason hole was found and FIXED for `mount`, and survived in `pty`,
   because nobody walked the other copy. That one is recorded in WORK-STATE.md by
   the person who hit it the second time.
-- `main.rs` is ~22,600 lines and hand-writes the peer event loop EIGHT times:
-  24 `Ev::ChannelReady` arms, 24 `Ev::Control`, 22 `Ev::Signal`,
-  14 `Ev::DirectReady`, 9 `Ev::PeerLeft`.
+- `main.rs` is ~22,400 lines and hand-writes the peer event loop EIGHT times.
+
+  CORRECTION (2026-08-27): an earlier version of this line said the eight were
+  copies of each other. They are not, and the difference matters for what to do
+  about them. Measured, the eight `Ev::ChannelReady` arms are 5, 8, 12, 26, 39,
+  88, 133 and 294 lines: they share a PROLOGUE and then diverge genuinely, because
+  they belong to different commands. So the duplication to remove is the shared
+  prologue and the handful of near-identical whole handlers (the two enrollment
+  arms differ only in whether they print a line), not the loops wholesale.
+
+  The prologue is now `Conn::mark_ready`, six call sites collapsed into one. The
+  rest of the unification waits on splitting `Conn`.
 
 A module boundary is not decoration here. It is the thing that makes a whole
 class of bug unwritable.

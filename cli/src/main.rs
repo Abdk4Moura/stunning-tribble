@@ -5159,13 +5159,7 @@ async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
                 let _ = tx.send(Ev::ChannelReady(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
-                if let Some(l) = conn.link_mut(&pid) {
-                    l.transport = Some(t.clone());
-                    l.presence = Presence::Ready;
-                }
-                if conn.active.is_none() {
-                    conn.active = Some(pid.clone());
-                }
+                conn.mark_ready(&pid, &t, true);
             }
             Ev::Control(_pid, v) => {
                 if v["type"].as_str() == Some("depart-ack") {
@@ -5576,13 +5570,7 @@ async fn enroll_cmd(
                 let _ = tx.send(Ev::ChannelReady(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
-                if let Some(l) = conn.link_mut(&pid) {
-                    l.transport = Some(t.clone());
-                    l.presence = Presence::Ready;
-                }
-                if conn.active.is_none() {
-                    conn.active = Some(pid.clone());
-                }
+                conn.mark_ready(&pid, &t, true);
 
                 crate::ephemeral::register_enrollment(
                     pid.clone(),
@@ -5783,11 +5771,7 @@ async fn enroll_and_send_cmd(
                 let _ = tx.send(Ev::ChannelReady(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
-                if let Some(l) = conn.link_mut(&pid) {
-                    l.transport = Some(t.clone());
-                    l.presence = Presence::Ready;
-                }
-                if conn.active.is_none() { conn.active = Some(pid.clone()); }
+                conn.mark_ready(&pid, &t, true);
                 crate::ephemeral::register_enrollment_legacy(pid.clone(), enroll_seed, device_pub, ak.clone());
                 let _ = t.send_control(&json!({
                     "type": "identity-auth-key-enroll-request",
@@ -6019,8 +6003,7 @@ async fn enroll_and_netcat_cmd(
                 let _ = tx.send(Ev::ChannelReady(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
-                if let Some(l) = conn.link_mut(&pid) { l.transport = Some(t.clone()); l.presence = Presence::Ready; }
-                if conn.active.is_none() { conn.active = Some(pid.clone()); }
+                conn.mark_ready(&pid, &t, true);
                 crate::ephemeral::register_enrollment_legacy(pid.clone(), enroll_seed, device_pub, ak.clone());
                 let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-request", "auth_key": ak.to_json()})).await;
             }
@@ -6867,10 +6850,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
                 conn.apply_signal(&from, data).await;
             }
             Ev::ChannelReady(pid, t) => {
-                if let Some(l) = conn.link_mut(&pid) {
-                    l.transport = Some(t.clone());
-                    l.presence = Presence::Ready;
-                }
+                conn.mark_ready(&pid, &t, false);
                 let Some(&is_b) = who.get(&pid) else { continue };
                 let (dev_name, sec) = if is_b { (&b_name, &b_sec) } else { (&a_name, &a_sec) };
                 let other_name = if is_b { &a_name } else { &b_name };
@@ -8625,6 +8605,28 @@ impl Conn {
         self.transport_of(pid)
             .map(|t| t.idle_ms() < threshold)
             .unwrap_or(false)
+    }
+
+    /// Attach a freshly-opened channel to its link and mark the peer Ready.
+    ///
+    /// Every `Ev::ChannelReady` arm opened with these same few lines, copied
+    /// eight times with three different formattings. The tails genuinely differ
+    /// per command, but this prologue never did, and a prologue that is retyped
+    /// per call site is one that can drift per call site.
+    ///
+    /// `claim_active` asks for the peer to become the target if no target exists
+    /// yet. Attaching the transport happens FIRST either way: claiming the slot
+    /// while the link has no transport hands the caller a target it cannot send
+    /// to. Returns true if this peer is now the active one.
+    fn mark_ready(&mut self, pid: &str, t: &Arc<dyn Transport>, claim_active: bool) -> bool {
+        if let Some(l) = self.link_mut(pid) {
+            l.transport = Some(t.clone());
+            l.presence = Presence::Ready;
+        }
+        if claim_active && self.active.is_none() {
+            self.active = Some(pid.to_string());
+        }
+        self.active.as_deref() == Some(pid)
     }
 
     /// May this peer become the TRANSFER TARGET? (Filters gate targeting,
@@ -14138,10 +14140,7 @@ async fn send_cmd(
                     conn.drop_link(&pid);
                     continue;
                 }
-                if let Some(l) = conn.link_mut(&pid) {
-                    l.transport = Some(t.clone());
-                    l.presence = Presence::Ready;
-                }
+                conn.mark_ready(&pid, &t, false);
                 // Responder links stop here: connected, polite, idle. Only
                 // the active target gets announcements + offers.
                 if !conn.is_active(&pid) {
