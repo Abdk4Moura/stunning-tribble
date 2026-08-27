@@ -6796,14 +6796,17 @@ async fn handle_auth_key_enroll_response(
             let secret = fresh_secret();
             let now = identity::now_secs();
             let certificate_ttl = ak.expires.saturating_sub(now);
-            let device_cert = match identity::DeviceCert::certify(&owner_key, device_pub, now, certificate_ttl) {
-                Ok(cert) => cert,
-                Err(error) => {
-                    ui::debug(&format!("enroll response certificate failed: {error}"));
-                    let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
-                    return;
-                }
-            };
+            // ONE enrolment builder, shared with the pairing ceremony. Minting a
+            // certificate for a peer happens in exactly one place.
+            let (device_cert, enrolment) =
+                match mesh_enrolment(&owner_key, device_pub, &ak.caps, ak.expires, persistent) {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        ui::debug(&format!("enroll response certificate failed: {error}"));
+                        let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+                        return;
+                    }
+                };
             let stored_name = if persistent {
                 match devices_upsert_atomic(
                     &requested_name,
@@ -6830,39 +6833,14 @@ async fn handle_auth_key_enroll_response(
                 link.verified_name = Some(stored_name.clone());
                 link.admit_delegated(owner_pub, device_pub, ak.expires, ak.caps.clone());
             }
-            let _ = t.send_control(&json!({
-                "type": "identity-auth-key-enroll-ack",
-                "name": stored_name,
-                "owner_name": display_name(),
-                "secret": secret,
-                "device_pub": hex::encode(device_pub),
-                "device_cert": device_cert.to_json(),
-                "owner_cert": local_device_cert().map(|cert| cert.to_json()),
-                // Fleet auto-mesh: a PERSISTENT enrollment is an owner-certified
-                // device, so hand it the fleet meeting point. An ephemeral
-                // borrower never gets it: it holds a certificate for one session,
-                // it is not part of the fleet's standing presence.
-                "fleet_rv": persistent.then(|| fleet::rv_load_or_create().ok()).flatten(),
-                // Same-owner fleet-trust, first increment. A joined device has no
-                // capability store, so `cap_fleet_inputs` finds no `cap_header`,
-                // `own_user` is None, and the fleet-scope path the capability layer
-                // already implements can never engage there. It cannot make its
-                // own: `ensure_self_genesis_header` SIGNS the header with the
-                // owner's UserKey, which a joined device does not hold. So the
-                // owner hands its header over, exactly as it hands over fleet_rv.
-                // The header carries no secret: it is signed, self-certifying, and
-                // names `owner_pub` and a nonce.
-                "cap_header": persistent.then(owner_cap_header).flatten(),
-                // Fleet policy: the grants the owner has signed. The joiner
-                // verifies each against the owner key in the header above, so
-                // this is a relay of owner-authored policy, not a trust decision
-                // handed to whoever sends it.
-                "cap_ops": persistent.then(|| json!(owner_signed_cap_ops())).unwrap_or(Value::Null),
-                "ceiling": ak.caps,
-                "expires": ak.expires,
-                "max_offline": ak.max_offline,
-                "persistent": persistent
-            })).await;
+            let mut ack = enrolment;
+            ack["type"] = json!("identity-auth-key-enroll-ack");
+            ack["name"] = json!(stored_name);
+            ack["owner_name"] = json!(display_name());
+            ack["secret"] = json!(secret);
+            ack["device_pub"] = json!(hex::encode(device_pub));
+            ack["max_offline"] = json!(ak.max_offline);
+            let _ = t.send_control(&ack).await;
             ui::say(&format!("  {} ephemeral device {pid} enrolled (caps: {})",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                 capability_list_summary(&ak.caps)));
@@ -6872,6 +6850,52 @@ async fn handle_auth_key_enroll_response(
             let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
         }
     }
+}
+
+/// The owner-signed artifact that makes a peer a member of this mesh.
+///
+/// A certificate for the peer's device key, our own certificate so it can verify
+/// the chain, and (for a PERSISTENT member) the fleet meeting point plus the
+/// capability header and signed policy.
+///
+/// This exists as ONE function because it is the only place a DeviceCert is
+/// minted for somebody else. It was written inline in the enrol handler, and the
+/// pairing ceremony could not produce one, which is why `filament add` left a
+/// device paired but not on the mesh. Hand-writing it a second time is how the
+/// fleet handshake ended up with four per-peer bugs in copies that had drifted.
+///
+/// `persistent` is the whole distinction between a member and a borrower: an
+/// ephemeral peer holds a certificate for one session and never receives
+/// `fleet_rv`, so it cannot take part in the fleet's standing presence.
+fn mesh_enrolment(
+    owner_key: &identity::UserKey,
+    device_pub: [u8; 32],
+    caps: &[String],
+    expires: u64,
+    persistent: bool,
+) -> Result<(identity::DeviceCert, Value)> {
+    let now = identity::now_secs();
+    let cert = identity::DeviceCert::certify(owner_key, device_pub, now, expires.saturating_sub(now))
+        .map_err(|e| anyhow!("could not certify the device: {e}"))?;
+    let payload = json!({
+        "device_cert": cert.to_json(),
+        "owner_cert": local_device_cert().map(|c| c.to_json()),
+        // Only a persistent member joins the fleet meeting point.
+        "fleet_rv": persistent.then(|| fleet::rv_load_or_create().ok()).flatten(),
+        // A joined device cannot make its own header: ensure_self_genesis_header
+        // SIGNS it with the owner's UserKey, which the joiner does not hold. So
+        // the owner hands it over. It carries no secret, being signed and
+        // self-certifying, and naming owner_pub and a nonce.
+        "cap_header": persistent.then(owner_cap_header).flatten(),
+        // Owner-authored policy, relayed. The joiner verifies every op against
+        // the owner key in the header above, so this is not a trust decision
+        // handed to whoever transmits it.
+        "cap_ops": persistent.then(|| json!(owner_signed_cap_ops())).unwrap_or(Value::Null),
+        "ceiling": caps,
+        "expires": expires,
+        "persistent": persistent,
+    });
+    Ok((cert, payload))
 }
 
 fn down_cmd() -> Result<()> {
@@ -24026,6 +24050,95 @@ mod tests {
             }
         }
         assert!(checked >= 6, "expected the internal subcommand invocations to be found, got {checked}");
+    }
+
+    /// A keystore rooted in a fresh temp dir, so enrolment tests never touch the
+    /// real config and never race each other through the process environment.
+    struct ScratchStore(std::path::PathBuf);
+    impl ScratchStore {
+        fn new(tag: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = std::env::temp_dir()
+                .join(format!("fil-enrol-{}-{n}-{tag}", std::process::id()));
+            std::fs::create_dir_all(&p).expect("scratch dir");
+            ScratchStore(p)
+        }
+    }
+    impl identity::KeyStore for ScratchStore {
+        fn write_secret(&self, path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+            std::fs::write(path, data)
+        }
+        fn read(&self, path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+            std::fs::read(path)
+        }
+        fn config_path(&self, relative: &str) -> std::path::PathBuf {
+            self.0.join(relative)
+        }
+    }
+
+    // --- mesh enrolment: what an add must NEVER hand out -------------------
+    // Written BEFORE the pairing path could issue anything, so they constrain
+    // the implementation rather than describe it.
+
+    #[test]
+    #[test]
+    fn ephemeral_enrolment_never_carries_the_fleet_meeting_point() {
+        // fleet_rv is standing membership. A borrower holds a certificate for one
+        // session; handing it the meeting point would make a loan permanent, and
+        // nothing later in the fleet path re-checks how the secret was obtained.
+        let store = ScratchStore::new("ephemeral");
+        let owner = identity::UserKey::generate(&store).expect("owner key");
+        let (_cert, payload) =
+            mesh_enrolment(&owner, [7u8; 32], &["transfer".into()], u64::MAX, false)
+                .expect("enrolment");
+        assert!(payload["fleet_rv"].is_null(), "an ephemeral peer must not get fleet_rv");
+        assert!(payload["cap_header"].is_null(), "nor the capability header");
+        assert!(payload["cap_ops"].is_null(), "nor owner-signed policy");
+        assert_eq!(payload["persistent"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn enrolment_ceiling_is_exactly_what_was_asked_for() {
+        // The posture chosen when adding is the ceiling. If this widens, an
+        // operator who added a device deliberately without `shell` gets shell.
+        let store = ScratchStore::new("ceiling");
+        let owner = identity::UserKey::generate(&store).expect("owner key");
+        let asked = vec!["transfer".to_string(), "mount".to_string()];
+        let (_c, payload) =
+            mesh_enrolment(&owner, [9u8; 32], &asked, u64::MAX, true).expect("enrolment");
+        let got: Vec<String> = serde_json::from_value(payload["ceiling"].clone()).unwrap();
+        assert_eq!(got, asked, "the ceiling must be the requested posture, verbatim");
+        assert!(!got.contains(&"shell".to_string()), "shell must not appear unasked");
+    }
+
+    #[test]
+    fn enrolment_certifies_the_device_key_it_was_given() {
+        // The certificate must name the key that will be proven on the link. If
+        // it names anything else, a valid certificate fronts for another device,
+        // which is the binding bug the fleet handshake already had once.
+        let store = ScratchStore::new("devicekey");
+        let owner = identity::UserKey::generate(&store).expect("owner key");
+        let device_pub = [3u8; 32];
+        let (cert, _payload) =
+            mesh_enrolment(&owner, device_pub, &["transfer".into()], u64::MAX, true)
+                .expect("enrolment");
+        assert_eq!(cert.device_pub, device_pub);
+        assert_eq!(cert.user_pub, owner.public_key_bytes(), "must chain to THIS owner");
+        assert!(cert.verify(identity::now_secs()).is_ok(), "must be a valid certificate");
+    }
+
+    #[test]
+    fn a_persistent_member_gets_the_meeting_point() {
+        // The positive case, so the negatives above cannot be satisfied by a
+        // function that simply never returns anything.
+        let store = ScratchStore::new("member");
+        let owner = identity::UserKey::generate(&store).expect("owner key");
+        let (_c, payload) =
+            mesh_enrolment(&owner, [4u8; 32], &["transfer".into()], u64::MAX, true)
+                .expect("enrolment");
+        assert!(payload["fleet_rv"].is_string(), "a member must receive fleet_rv");
+        assert_eq!(payload["persistent"], serde_json::json!(true));
     }
 
     #[test]
