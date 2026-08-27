@@ -25,6 +25,7 @@ mod doctor;
 /// self-enrollment, and delegated principal ceiling enforcement.
 mod ephemeral;
 mod fleet;
+mod fleet_session;
 mod fleet_enrollment;
 /// `filament expose`: publish a local port on the L3 overlay. The CLI/config side
 /// is portable; the daemon listeners (Exposer) are Linux-gated with L3.
@@ -13569,62 +13570,26 @@ async fn send_cmd(
     // verified, the offer guard passed for all of them and the file went to
     // whichever peer the loop reached next. Measured: verified pid=8gNe as
     // 'laptop', then offered to pid=yNDj (the owner), which accepted.
-    let mut fleet_proven: std::collections::HashSet<String> = Default::default();
-    // Peers whose certificate PROVED they are some other sibling. A wrong answer
-    // is final: identity does not change mid-send, so this peer can never become
-    // the target. Without it, dropping the link merely freed the pid to be
-    // re-adopted on the next roster tick and re-established as the target again,
-    // in a loop, which starved the real device of the establishment budget.
-    // Measured: the owner's pid was re-dialed as `laptop` over and over until
-    // the send timed out having never reached the device the user named.
-    let mut fleet_wrong: std::collections::HashSet<String> = Default::default();
-    // How long a peer may hold the target slot without proving who it is.
+    // The fleet handshake, as ONE object rather than six ad-hoc collections.
     //
-    // Not every peer on the fleet channel will ever answer a fleet challenge.
-    // The OWNER is the standing example: it is PAIRED with us, so its daemon
-    // classifies our link as a paired one and never sends `fleet-hello` at all.
-    // If such a peer wins the active slot, waiting for its proof waits forever
-    // and the device we actually asked for never gets a turn. Measured exactly
-    // that way: `owner` answered, "verifying fleet identity..." printed, and the
-    // send timed out having never reached the sibling it named.
+    // This used to be `fleet_proven` + `fleet_wrong` + `fleet_bind_ours` +
+    // `fleet_rechallenged` + `fleet_deadline`, hand-maintained here and
+    // hand-maintained AGAIN in the daemon's receive loop. The two copies drifted
+    // and every drift was the same shape: state describing "the peer", stored as
+    // one value, on a channel that carries EVERY sibling. Four bugs came out of
+    // that, including a misdelivery. `FleetSession` keys all of it by peer id by
+    // construction, so the mistake has nowhere to live.
     //
-    // So unproven is a TIMEOUT, not a wait. Dropping the link and moving on
-    // costs a reconnect if we were merely early; not dropping it costs the send.
-    let mut fleet_deadline: HashMap<String, Instant> = HashMap::new();
+    // The daemon's copy was the one that already got this right (its bindings
+    // were per-peer HashMaps), so `fleet_session.rs` follows THAT implementation,
+    // not this one.
+    let mut fleet_sess = fleet_session::FleetSession::new();
     let fleet_proof_budget = Duration::from_secs(
         std::env::var("FILAMENT_FLEET_PROOF_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(12),
     );
-    // Link binding for a transport with no RFC-5705 exporter (a WebRTC link).
-    // Same challenge the daemon runs: our nonce verifies what THEY send, theirs
-    // signs what we send. Without this a fleet send over a relay-class link
-    // fails closed, which is safe but useless.
-    // Created EAGERLY, not on ChannelReady. The peer's `fleet-hello` can arrive
-    // before our ChannelReady handler runs, and a nonce that does not exist yet
-    // cannot verify it: that is precisely how this failed closed with "cannot
-    // verify its certificate" on a link that was working. The nonce is ours to
-    // choose, it depends on nothing, so there is no reason to wait for an event
-    // to mint it.
-    //
-    // PER PEER, and that is the whole point. The FLEET channel carries EVERY
-    // sibling, so a nonce is meaningful only against the link it was minted for.
-    // Held as one value each, the last peer to connect overwrote the binding the
-    // previous one signed against, and the real target's hello then failed as
-    // "signature or channel-binding mismatch" while an unrelated sibling was
-    // still connecting. Measured exactly that way: C asked for `laptop`,
-    // `laptop`'s hello was checked against the OWNER's binding, failed, consumed
-    // the single retry, and the send timed out having never reached the device
-    // it named. This is the same shape as `fleet_proven` (a single bool meaning
-    // "some peer proved", read as "THIS peer proved") and the third time
-    // one-value-for-many-siblings has bitten on this channel.
-    let mut fleet_bind_ours: HashMap<String, Vec<u8>> = HashMap::new();
-    // One re-challenge PER PEER: a hello that arrived before our nonce is a RACE
-    // and deserves a retry; a hello that fails again is a bad certificate. Per
-    // peer, because one sibling losing the race must not spend the retry that a
-    // different sibling needs.
-    let mut fleet_rechallenged: std::collections::HashSet<String> = Default::default();
     let mut channel_digest_absent: HashMap<String, u8> = HashMap::new();
     // L1-a: `send --code` now mints a v2 nameplate (client-minted words, the
     // server allocates ONLY the numeric nameplate) and runs the SAME ephemeral
@@ -13808,18 +13773,11 @@ async fn send_cmd(
         // owner above), and the device we asked for may still be out there.
         if fleet_target {
             let now = Instant::now();
-            let lapsed: Vec<String> = fleet_deadline
-                .iter()
-                .filter(|(p, dl)| now > **dl && !fleet_proven.contains(*p))
-                .map(|(p, _)| p.clone())
-                .collect();
-            for p in lapsed {
+            for p in fleet_sess.lapsed(Instant::now()) {
                 ui::debug(&format!(
                     "fleet: pid={p} did not prove itself within {}s; releasing the slot",
                     fleet_proof_budget.as_secs()
                 ));
-                fleet_deadline.remove(&p);
-                fleet_wrong.insert(p.clone());
                 if conn.is_active(&p) {
                     conn.active = None;
                 }
@@ -14196,7 +14154,7 @@ async fn send_cmd(
             Ev::ChannelReady(pid, t) => {
                 // Already proved itself to be a DIFFERENT sibling. Stay polite,
                 // never target: re-running the handshake here is what looped.
-                if fleet_target && fleet_wrong.contains(&pid) {
+                if fleet_target && fleet_sess.is_wrong(&pid) {
                     if conn.is_active(&pid) {
                         conn.active = None;
                     }
@@ -14219,26 +14177,19 @@ async fn send_cmd(
                 // Fleet target: present our certificate and demand theirs before
                 // anything is offered. Fails closed, including on a transport with
                 // no channel binding, because there is nothing to bind a proof to.
-                if fleet_target && !fleet_proven.contains(&pid) {
-                    match t.channel_binding() {
-                        Some(cb) => match fleet::make_hello(&cb, &display_name()) {
-                            Ok(hello) => { let _ = t.send_control(&hello).await; }
-                            Err(e) => bail!(
-                                "cannot prove identity to '{fleet_target_name}': {e}"
-                            ),
-                        },
-                        None => {
-                            // No exporter: open the challenge. Our hello waits for
-                            // their nonce (handled in the Control arm).
-                            let nonce = fleet_bind_ours
-                                .entry(pid.clone())
-                                .or_insert_with(link_nonce)
-                                .clone();
-                            let _ = t.send_control(&json!({
-                                "type": "l3-nonce",
-                                "nonce": crate::overlay::b64(&nonce),
-                            })).await;
+                //
+                // Greeting EVERY fleet link rather than only the active one was
+                // tried (a receiver cannot verify a sender that never introduced
+                // itself) and measured 17/20 and 7/20 across two rigs against a
+                // committed baseline of 15/15 and 16/20. Not shipped: it is
+                // plausible but unproven, and rig-to-rig variance is larger than
+                // the effect. Settle the measurement before revisiting it.
+                if fleet_target && !fleet_sess.proved(&pid) {
+                    match fleet_sess.greet(&pid, t.channel_binding(), &display_name(), link_nonce) {
+                        fleet_session::Action::Send(msg) => {
+                            let _ = t.send_control(&msg).await;
                         }
+                        fleet_session::Action::Idle => {}
                     }
                 }
                 if let Some(l) = conn.link(&pid) {
@@ -14290,11 +14241,9 @@ async fn send_cmd(
                     // our certificate is not enough; nothing is offered until
                     // THEIRS has verified (the Control arm sets `fleet_proven`,
                     // and a mismatch bails there rather than falling through).
-                    if fleet_target && !fleet_proven.contains(&pid) {
+                    if fleet_target && !fleet_sess.proved(&pid) {
                         ui::debug(&format!("fleet-send: deferring offer to pid={pid} (identity unproven)"));
-                        fleet_deadline
-                            .entry(pid.clone())
-                            .or_insert_with(|| Instant::now() + fleet_proof_budget);
+                        fleet_sess.arm_deadline(&pid, fleet_proof_budget);
                         ui::say(&ui::paint(ui::Tone::Dim, "  verifying fleet identity..."));
                         continue;
                     }
@@ -14339,161 +14288,77 @@ async fn send_cmd(
                 // it is IN the fleet; this proves WHICH member. The device key it
                 // names must resolve to the local record the user typed, or we
                 // refuse and send nothing.
-                Some("l3-nonce") if fleet_target && !fleet_proven.contains(&pid) => {
-                    if let Some(Ok(nonce)) = v["nonce"].as_str().map(crate::overlay::unb64) {
-                        if nonce.len() >= 16 {
+                // The fleet handshake, delegated. Both arms of the conversation
+                // (their challenge, their certificate) are ONE call into
+                // `FleetSession`, which owns the per-peer binding, the per-peer
+                // retry budget and the proven/wrong verdict. This block used to
+                // be ~150 lines duplicating the daemon's, and every place the two
+                // drifted was a bug.
+                Some("l3-nonce") | Some(fleet::HELLO)
+                    if fleet_target && !fleet_sess.proved(&pid) =>
+                {
+                    let exporter = conn.transport_of(&pid).and_then(|t| t.channel_binding());
+                    let outcome = fleet_sess.on_control(
+                        &pid,
+                        &v,
+                        exporter,
+                        fleet::my_owner_pub(),
+                        &display_name(),
+                        Some(&fleet_target_name),
+                        identity::now_secs(),
+                        link_nonce,
+                        |pubk| device_name_for_pub(pubk),
+                    );
+                    match outcome {
+                        fleet_session::Outcome::Ignored => {}
+                        fleet_session::Outcome::Send(msg) => {
                             if let Some(t) = conn.transport_of(&pid) {
-                                if let Ok(hello) = fleet::make_hello(&nonce, &display_name()) {
-                                    let _ = t.send_control(&hello).await;
-                                }
+                                let _ = t.send_control(&msg).await;
                             }
                         }
-                    }
-                }
-                Some(fleet::HELLO) if fleet_target && !fleet_proven.contains(&pid) => {
-                    let cb = conn
-                        .transport_of(&pid)
-                        .and_then(|t| t.channel_binding())
-                        .or_else(|| fleet_bind_ours.get(&pid).cloned());
-                    let owner = fleet::my_owner_pub();
-                    match (cb, owner) {
-                        (Some(cb), Some(owner)) => {
-                            match fleet::verify_hello(&v, &cb, &owner, identity::now_secs()) {
-                                Ok(ok) => {
-                                    let proven = device_name_for_pub(&ok.device_pub);
-                                    ui::debug(&format!(
-                                        "fleet-send verify: pid={pid} wanted='{fleet_target_name}' proven={:?} device_pub={}",
-                                        proven,
-                                        hex::encode(&ok.device_pub[..8])
-                                    ));
-                                    if proven
-                                        .as_deref()
-                                        .map(|n| n.eq_ignore_ascii_case(&fleet_target_name))
-                                        != Some(true)
-                                    {
-                                        // WRONG SIBLING, not an attack and not
-                                        // fatal. Every fleet member sits on this
-                                        // channel, so whoever answered first is
-                                        // simply not the one asked for. Drop it,
-                                        // free the active slot, and keep waiting
-                                        // for the device whose certificate names
-                                        // it. Bailing here would make `send --to`
-                                        // fail whenever a sibling answered sooner.
-                                        ui::debug(&format!(
-                                            "fleet: '{}' answered for '{fleet_target_name}'; not the target, waiting",
-                                            proven.as_deref().unwrap_or("an unknown device")
-                                        ));
-                                        fleet_wrong.insert(pid.clone());
-                                        if conn.is_active(&pid) {
-                                            conn.active = None;
-                                        }
-                                        conn.drop_link(&pid);
-                                        established = false;
-                                        continue;
-                                    }
-                                    fleet_proven.insert(pid.clone());
-                                    ui::debug(&format!("fleet target '{fleet_target_name}' proved its certificate on pid={pid}"));
-                                    // THE PROVEN PEER IS THE TARGET. On a fleet
-                                    // send, identity is the selector: a peer whose
-                                    // certificate names the device the user asked
-                                    // for IS that device, and nothing else can be.
-                                    //
-                                    // Without this the re-emit below is thrown away
-                                    // one line into the ChannelReady handler, which
-                                    // opens with `if !conn.is_active(&pid) continue`.
-                                    // Whoever won the active slot first keeps it,
-                                    // and on the fleet channel that is routinely
-                                    // some OTHER sibling: the owner answers, holds
-                                    // the slot, is proved wrong, and the real target
-                                    // then proves itself into a slot it does not own,
-                                    // so its offer is silently dropped and the send
-                                    // times out at 45s having verified the right
-                                    // device seconds earlier. Measured exactly that
-                                    // way, and it is the whole "sibling send is
-                                    // unreliable" symptom: cold runs failed because
-                                    // the wrong peer tended to win the slot first,
-                                    // warm runs passed because the target did.
-                                    conn.active = Some(pid.clone());
-                                    // RE-EMIT ChannelReady, exactly as the PAKE
-                                    // path does on confirm. The offer lives in the
-                                    // ChannelReady handler, which already ran and
-                                    // deferred (identity was unproven then).
-                                    // Setting the flag without re-entering that
-                                    // handler means the offer is never emitted at
-                                    // all: the sender sits until its timeout and
-                                    // the receiver's gate never even sees a
-                                    // request. Measured exactly that way, with a
-                                    // `transfer-gate:` probe on the receiver that
-                                    // never fired.
-                                    if let Some(t) = conn.transport_of(&pid) {
-                                        let _ = tx.send(Ev::ChannelReady(pid.clone(), t));
-                                    }
-                                }
-                                Err(e) => {
-                                    // The peer signed against a binding we cannot
-                                    // reproduce, which happens when its hello was
-                                    // sent before our challenge reached it. Our
-                                    // nonce is the binding WE can verify, so send
-                                    // it and let the peer re-present: its daemon
-                                    // answers an `l3-nonce` with a fresh hello
-                                    // bound to it. Retry ONCE, then refuse, so a
-                                    // genuinely bad certificate cannot loop.
-                                    if fleet_rechallenged.insert(pid.clone()) {
-                                        ui::debug(&format!(
-                                            "fleet: '{fleet_target_name}' hello did not verify ({e}); re-challenging"
-                                        ));
-                                        if let (Some(t), Some(nonce)) =
-                                            (
-                                                conn.transport_of(&pid),
-                                                Some(
-                                                    fleet_bind_ours
-                                                        .entry(pid.clone())
-                                                        .or_insert_with(link_nonce)
-                                                        .clone(),
-                                                ),
-                                            )
-                                        {
-                                            let _ = t.send_control(&json!({
-                                                "type": "l3-nonce",
-                                                "nonce": crate::overlay::b64(&nonce),
-                                            })).await;
-                                        }
-                                        continue;
-                                    }
-                                    bail!(
-                                        "refusing to send to '{fleet_target_name}': its certificate did not verify ({e})"
-                                    )
-                                }
-                            }
-                        }
-                        // No binding for THIS link yet, but we do know the owner
-                        // key. That is the race, not a bad certificate: their
-                        // hello beat our challenge, so there is nothing yet for
-                        // it to have been signed against. Minting the nonce here
-                        // and asking them to re-present is the remedy; bailing
-                        // would fail a working link closed. (The nonce used to be
-                        // minted eagerly for exactly this reason, which stopped
-                        // being possible once it became per-peer: we cannot mint
-                        // for a pid we have not met.) Same one-retry-per-peer
-                        // budget, so a genuinely bad certificate cannot loop.
-                        (None, Some(_)) if fleet_rechallenged.insert(pid.clone()) => {
+                        fleet_session::Outcome::WrongPeer { proved } => {
+                            // Not an attack and not fatal: every fleet member sits
+                            // on this channel, so whoever answered first is simply
+                            // not the one asked for. Drop it, free the slot, keep
+                            // waiting. Bailing here would make `send --to` fail
+                            // whenever a sibling answered sooner.
                             ui::debug(&format!(
-                                "fleet: hello from pid={pid} arrived before our challenge; challenging"
+                                "fleet: '{}' answered for '{fleet_target_name}'; not the target, waiting",
+                                proved.as_deref().unwrap_or("an unknown device")
                             ));
-                            let nonce = fleet_bind_ours
-                                .entry(pid.clone())
-                                .or_insert_with(link_nonce)
-                                .clone();
-                            if let Some(t) = conn.transport_of(&pid) {
-                                let _ = t.send_control(&json!({
-                                    "type": "l3-nonce",
-                                    "nonce": crate::overlay::b64(&nonce),
-                                })).await;
+                            if conn.is_active(&pid) {
+                                conn.active = None;
                             }
+                            conn.drop_link(&pid);
+                            established = false;
                             continue;
                         }
-                        _ => bail!(
-                            "refusing to send to '{fleet_target_name}': cannot verify its certificate (no channel binding or no owner key)"
+                        fleet_session::Outcome::Proved { .. } => {
+                            ui::debug(&format!(
+                                "fleet target '{fleet_target_name}' proved its certificate on pid={pid}"
+                            ));
+                            // THE PROVEN PEER IS THE TARGET. On a fleet send
+                            // identity is the selector: a peer whose certificate
+                            // names the device the user asked for IS that device.
+                            //
+                            // Without this the re-emit below is thrown away one
+                            // line into the ChannelReady handler, which opens with
+                            // `if !conn.is_active(&pid) { continue }`. Whoever won
+                            // the slot first keeps it, and on this channel that is
+                            // routinely some OTHER sibling, so the real target
+                            // proved itself into a slot it did not own and its
+                            // offer was never made. That was the whole "sibling
+                            // send is unreliable" symptom.
+                            conn.active = Some(pid.clone());
+                            // RE-EMIT ChannelReady, exactly as the PAKE path does
+                            // on confirm: the offer lives in that handler, which
+                            // already ran and deferred while identity was unproven.
+                            if let Some(t) = conn.transport_of(&pid) {
+                                let _ = tx.send(Ev::ChannelReady(pid.clone(), t));
+                            }
+                        }
+                        fleet_session::Outcome::Refused(e) => bail!(
+                            "refusing to send to '{fleet_target_name}': its certificate did not verify ({e})"
                         ),
                     }
                 }

@@ -550,6 +550,31 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    Granted transfer already works today and is verified, so this affects the
    no-grant convenience case only.
 
+1f. **Shared module extracted: `cli/src/fleet_session.rs` (2026-08-27).**
+   The fleet identity handshake was typed out TWICE, inline: once in the
+   daemon's receive loop and once in `send_cmd`. Every per-peer bug this session
+   existed in one copy and not the other, and the daemon's copy was the one that
+   already had it right (its bindings were per-peer `HashMap`s while the
+   sender's were single values). So the module follows the DAEMON's shape, and
+   the sender's duplicate was deleted: 225 lines out, 97 in.
+
+   The module owns the conversation (who is challenged, proved, wrong, lapsed)
+   and does no I/O: `greet`/`on_control` return an `Action`/`Outcome` and the
+   caller sends it. That makes it testable without a network and lets two very
+   different event loops share one implementation. 11 tests, each pinning one of
+   the four bug shapes so they cannot be reintroduced.
+
+   NOT YET DONE: the daemon still runs its own copy of the same conversation.
+   Porting it onto `FleetSession` is the other half and is what makes the
+   extraction pay. Also still inline: the TRANSFER core (offer/chunk/resume/
+   progress) inside `send_cmd`, which is what blocks warm-send.
+
+   THE BIGGER DUPLICATION, measured: `main.rs` is 22,691 lines and hand-writes
+   the peer event loop EIGHT times (24 `Ev::ChannelReady` arms, 24 `Ev::Control`,
+   22 `Ev::Signal`, 14 `Ev::DirectReady`, 9 `Ev::PeerLeft`). This file already
+   records one instance of the cost: the close-reason hole was found and fixed
+   for `mount` and survived in `pty` because nobody walked the other copy.
+
 1e. **`send --to <sibling>`: STAYS OPT-IN. Four bugs fixed, still ~50% (2026-08-27).**
    Item 1b said "enable it when item 2 lands, not before". Item 2 has landed, so
    the gate was re-examined and the flip is REFUSED on measurement.
@@ -630,6 +655,44 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    "any untrusted fleet-shaped link could still verify" was tried and MEASURED
    WORSE, 11/15 -> 3/15: it parks offers whose hello was already handled, which
    then wait out the grace and are declined anyway. Do not retry that.
+
+   MEASUREMENT IS THE BLOCKER NOW, and this is the thing to fix first.
+   Interleaving controls for drift WITHIN a rig, but RIG IDENTITY is a
+   confounder and it is larger than any effect being chased. The same release
+   binary measured:
+
+       rig A   sibling 17/20      rig B   sibling  7/20
+       rig A   paired  20/20      rig B   paired  20/20
+
+   The paired control is 20/20 on BOTH, so a rig is not simply "bad": whatever
+   varies touches only the sibling path. Until a rig-to-rig control exists, any
+   two numbers from different rigs are not comparable, and three separate
+   conclusions in this file were drawn from exactly that comparison before the
+   confounder was noticed. Candidate controls: many rigs per arm with the arm
+   randomised per rig, or a deterministic harness that removes real signaling
+   and ICE from the loop (the Python control-plane harness already does this for
+   the signaling flakiness and is the obvious model).
+
+   THE HARNESS HAD THREE HOLES, all found by disbelieving its own output:
+     1. stale daemons from earlier runs sit on the SAME fleet channel under the
+        SAME owner key, indistinguishable from real siblings;
+     2. the cleanup matched `release/filament up`, which does NOT match a daemon
+        started as `filament -vv up`, so a hand-started verbose daemon survived
+        every purge AND was invisible to the "0 strays" assertion, since both
+        used the same pattern. Identify a test daemon by its config dir in
+        /proc/environ, never by its command line;
+     3. no health gate, so a run where B and C never started reported 0/20 on
+        BOTH arms, including a paired control that has never honestly failed.
+   All three are now asserted before any sweep, and the gate polls, because
+   `up --detach` returns well before the daemon is serving (A can take over 40s).
+   A number from an ungated rig is not evidence.
+
+   THINGS TRIED THAT MEASURED WORSE, recorded so they are not retried blind:
+     - broaden the receiver deferral to any fleet-shaped link:  11/15 -> 3/15
+     - classify fleet links at adoption instead of ChannelReady: 0/20 and 5/20
+     - greet every fleet link, not only the active one:         17/20 and 7/20
+   All three are plausible on paper. Two of them park offers waiting for a hello
+   that never arrives, which converts a fast decline into a slow one.
 
    THE RIGHT FIX IS ARCHITECTURAL, and the data points at it. The daemon-to-daemon
    mesh verified 100% of the time in every run, including every run where the
