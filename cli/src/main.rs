@@ -26,6 +26,13 @@ mod doctor;
 mod ephemeral;
 mod fleet;
 mod fleet_session;
+// The byte-moving mechanics now live in their own crate: out-of-order range
+// reassembly, the untrusted-name reduction, and the short-write-safe positional
+// write. None of it has any opinion about how a peer was found, which is exactly
+// why it could leave this file.
+use filament_transfer::{
+    coverage_complete, first_gap, pwrite_at, record_range, safe_incoming_name, Outgoing,
+};
 mod fleet_enrollment;
 /// `filament expose`: publish a local port on the L3 overlay. The CLI/config side
 /// is portable; the daemon listeners (Exposer) are Linux-gated with L3.
@@ -101,42 +108,6 @@ use zeroize::Zeroizing;
 // caught as a failed transfer (measured ~44% on direct-QUIC, ~88% on DataChannel for large
 // files). Loop until the whole buffer lands; return Err on a real failure so the caller
 // can react instead of silently dropping bytes.
-#[cfg(unix)]
-fn pwrite_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    let mut written = 0usize;
-    let mut iters = 0u32;
-    while written < buf.len() {
-        iters += 1;
-        match file.write_at(&buf[written..], offset + written as u64) {
-            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "pwrite wrote 0 bytes")),
-            Ok(n) => written += n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    // DIAG (temporary): prove whether short-writes actually happen. If corruption is
-    // short-write-caused this fires; if the re-rig shows zero of these AND corruption
-    // persists, the cause is the await-before-digest race, not the write. Remove after.
-    if iters > 1 {
-        eprintln!("[pwrite-diag] SHORT WRITE: {iters} iterations to write {} bytes @ off {offset}", buf.len());
-    }
-    Ok(())
-}
-#[cfg(windows)]
-fn pwrite_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    let mut written = 0usize;
-    while written < buf.len() {
-        match file.seek_write(&buf[written..], offset + written as u64) {
-            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "seek_write wrote 0 bytes")),
-            Ok(n) => written += n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
 
 const DEFAULT_SERVER: &str = "https://api.filament.autumated.com";
 /// C7: content identity for resume, sha256 over the first 256 KiB.
@@ -13258,33 +13229,6 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
 
 // ------------------------------------------------------------------- send --
 
-struct Outgoing {
-    id: String,
-    sid: u32,
-    name: String,
-    size: u64,
-    head: Option<String>,
-    /// P4 (GAP-5): sha256 of the WHOLE file, carried in file-offer as `full`. The
-    /// receiver compares its received bytes against this on completion and only
-    /// accepts (and acks) on a match, so no transfer can "complete" truncated or
-    /// corrupt. `None` only when the digest couldn't be computed (degrades to the
-    /// legacy size-only check on the receiver, bounded, never a hang).
-    full: Option<String>,
-    path: PathBuf,
-    temp: bool,          // delete after sending (tar spools, stdin spools)
-    accepted_once: bool, // re-offers carry resume:true after first accept
-    /// P4: the bytes left this side (stream finished / file-end sent). NOT the
-    /// same as `done`: a transfer is `sent` once but is only `done` after the
-    /// receiver's whole-file-verified `delivery-ack` lands (the no-ack window
-    /// NEVER sets `done`, it re-probes then fails the send, silent-data-loss fix).
-    sent: bool,
-    /// P4: the receiver returned a verified `delivery-ack` for this id. This is
-    /// the deterministic "it landed intact" signal, the ONLY thing that completes
-    /// a send. (Exception: an un-hashable file with no `full` digest has nothing
-    /// to verify-and-ack, so it is `done` on send, the legacy size-only path.)
-    acked: bool,
-    done: bool,
-}
 
 #[allow(clippy::too_many_arguments)]
 async fn send_cmd(
@@ -14978,18 +14922,6 @@ async fn stream_one(
 /// stripped. A NUL in particular would fail the CString conversion in
 /// safe_open_beneath and abort the whole receive loop, so a peer must not be able
 /// to embed one. Empties / `.` / `..` fall back to a fixed name.
-fn safe_incoming_name(raw: &str) -> String {
-    let base = std::path::Path::new(raw)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file.bin".into());
-    let cleaned: String = base.chars().filter(|c| !c.is_control()).collect();
-    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
-        "file.bin".to_string()
-    } else {
-        cleaned
-    }
-}
 
 /// Create a FRESH .part file. Uses RESOLVE_BENEATH on Linux (TOCTOU-safe,
 /// protects symlinked parents too), O_NOFOLLOW on other Unix, create_new
@@ -15218,71 +15150,6 @@ struct IncomingFile {
 /// Delta is the number of previously-unseen bytes added by this chunk.
 /// Total is the authoritative received count for multi-stream OOO reassembly.
 /// Optimized: binary search + incremental total via removed_total tracking.
-fn record_range(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> (u64, u64) {
-    let end = pos + len as u64;
-    if ranges.is_empty() {
-        ranges.push((pos, end));
-        let total = len as u64;
-        return (total, total);
-    }
-    // Binary search for first range with end >= pos
-    let mut lo = 0usize;
-    let mut hi = ranges.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if ranges[mid].1 < pos {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    let mut idx = lo;
-    let mut new_s = pos;
-    let mut new_e = end;
-    let mut removed_total: u64 = 0;
-    // Merge all overlapping / adjacent ranges (adjacent if start <= new_e)
-    while idx < ranges.len() && ranges[idx].0 <= new_e {
-        let (s, e) = ranges[idx];
-        removed_total += e - s;
-        new_s = new_s.min(s);
-        new_e = new_e.max(e);
-        ranges.remove(idx);
-    }
-    let new_len = new_e - new_s;
-    ranges.insert(idx, (new_s, new_e));
-    let delta = new_len.saturating_sub(removed_total);
-    // Compute total: we could maintain it incrementally in caller, but for
-    // simplicity compute via sum of ranges (N = number of disjoint intervals,
-    // which is <= K, not number of chunks, so O(K) not O(N_chunks)).
-    // For true O(1), caller should track total via fetch_add(delta).
-    let total: u64 = ranges.iter().map(|(s, e)| e - s).sum();
-    (delta, total)
-}
-
-/// Legacy wrapper returning total only (for call sites that need total)
-fn record_range_total(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> u64 {
-    let (_delta, total) = record_range(ranges, pos, len);
-    total
-}
-
-/// True iff the recorded ranges tile [0,size) with no gap (one contiguous interval).
-fn coverage_complete(ranges: &[(u64, u64)], size: u64) -> bool {
-    if size == 0 { return true; }
-    ranges.len() == 1 && ranges[0].0 == 0 && ranges[0].1 == size
-}
-
-/// First uncovered byte position in [0,size), or None if complete.
-fn first_gap(ranges: &[(u64, u64)], size: u64) -> Option<u64> {
-    if size == 0 { return None; }
-    let mut cursor = 0u64;
-    for &(s, e) in ranges {
-        if s > cursor { return Some(cursor); }
-        cursor = cursor.max(e);
-        if cursor >= size { return None; }
-    }
-    if cursor < size { Some(cursor) } else { None }
-}
-
 /// Build the live shell policy from the persistent settings (global `shell` +
 /// per-peer `shell on` overrides). Mirrors `up_cmd`'s startup construction so a
 /// `set shell ...` reconfigure lands the daemon in the same state a restart would.
@@ -19948,11 +19815,22 @@ async fn recv_cmd(
                     let trace_inner = trace;
                     tokio::task::spawn_blocking(move || {
                         let t_pwrite = if trace_inner { Some(std::time::Instant::now()) } else { None };
-                        if let Err(e) = pwrite_at(&file, &data, pos) {
+                        // `pwrite_at` reports how many iterations the write took;
+                        // more than one means a genuine short write. It used to
+                        // print that itself, which put terminal output inside the
+                        // byte-writing primitive. The primitive returns the fact
+                        // now and the decision to report it lives out here.
+                        let wrote = pwrite_at(&file, &data, pos);
+                        if let Err(e) = &wrote {
                             // Write failed: do NOT record coverage (leaves the gap).
                             // The whole-file digest will fail and trigger a re-fetch.
                             dlog!("[recv] pwrite_at FAILED at pos={pos} len={data_len}: {e}");
                         } else {
+                            if let Ok(iters) = &wrote {
+                                if *iters > 1 {
+                                    dlog!("[recv] short write: {iters} iterations for {data_len} bytes at {pos}");
+                                }
+                            }
                             // Write succeeded: record coverage AFTER bytes landed.
                             let mut r = ranges.lock().unwrap();
                             let (_delta, total) = record_range(&mut *r, pos, data_len);
