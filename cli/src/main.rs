@@ -2017,6 +2017,59 @@ pub(crate) fn fleet_indexed_name(name: &str) -> bool {
 /// Only an owner device does: the header is signed with the UserKey. This is what
 /// gets handed to a joining device so its capability store can resolve which
 /// owner it answers to.
+/// Every capability OP this device holds that the FLEET owner signed.
+///
+/// A grant is a `CapOp` with `resource: "self"`, and the self-resource id is
+/// derived from the OWNER's key, not the machine's. So an owner-signed op means
+/// the same thing on every device in the fleet, which is what makes distributing
+/// them coherent rather than a category error.
+fn owner_signed_cap_ops() -> Vec<Value> {
+    let dir = crate::settings::config_dir();
+    let store = crate::capability::load_cap_store(&dir);
+    let Some(owner) = fleet::my_owner_pub() else { return Vec::new() };
+    store
+        .into_iter()
+        .filter(|e| {
+            crate::capability::CapOp::from_json(e)
+                .map(|op| op.grantor == owner)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Merge fleet policy received from a peer, keeping only what the OWNER signed.
+///
+/// Every op is verified against the owner key THIS device already trusts (from
+/// its own cap header), so a peer cannot inject policy: it can only relay ops the
+/// owner authored. Unverifiable or foreign-grantor entries are dropped silently,
+/// and duplicates are skipped so repeated pushes are idempotent. Returns how many
+/// were newly stored.
+fn merge_owner_cap_ops(ops: &[Value]) -> usize {
+    let Some(owner) = fleet::my_owner_pub() else { return 0 };
+    let dir = crate::settings::config_dir();
+    let mut store = crate::capability::load_cap_store(&dir);
+    let now = crate::capability::now_secs();
+    let mut added = 0usize;
+    for v in ops {
+        let Some(op) = crate::capability::CapOp::from_json(v) else { continue };
+        if op.grantor != owner || op.verify(&owner, now).is_err() {
+            continue;
+        }
+        let dup = store.iter().any(|e| e == v);
+        if !dup {
+            store.push(v.clone());
+            added += 1;
+        }
+    }
+    if added > 0 {
+        if let Err(e) = crate::capability::save_cap_store(&dir, &store) {
+            ui::debug(&format!("fleet policy not stored: {e}"));
+            return 0;
+        }
+    }
+    added
+}
+
 fn owner_cap_header() -> Option<Value> {
     crate::capability::load_cap_store(&crate::settings::config_dir())
         .into_iter()
@@ -4871,6 +4924,14 @@ fn persist_join_ack(v: &Value, auth_key: &crate::ephemeral::AuthKey) -> Result<S
             }
         }
     }
+    // Fleet policy from the owner. Verified against the owner key in the header
+    // just stored, so an unverifiable or foreign-grantor entry is dropped.
+    if let Some(ops) = v["cap_ops"].as_array() {
+        let n = merge_owner_cap_ops(ops);
+        if n > 0 {
+            ui::debug(&format!("stored {n} owner-signed capability op(s)"));
+        }
+    }
     config_set("name", assigned_name)?;
     Ok(assigned_name.to_string())
 }
@@ -4980,6 +5041,14 @@ fn persist_join_ack_v2(v: &Value, inv: &crate::ephemeral::InvitationV2) -> Resul
             if let Err(e) = crate::capability::save_cap_store(&dir, &store) {
                 ui::debug(&format!("owner capability header not stored: {e}"));
             }
+        }
+    }
+    // Fleet policy from the owner. Verified against the owner key in the header
+    // just stored, so an unverifiable or foreign-grantor entry is dropped.
+    if let Some(ops) = v["cap_ops"].as_array() {
+        let n = merge_owner_cap_ops(ops);
+        if n > 0 {
+            ui::debug(&format!("stored {n} owner-signed capability op(s)"));
         }
     }
     config_set("name", assigned_name)?;
@@ -6336,6 +6405,11 @@ async fn handle_auth_key_enroll_response(
                 // The header carries no secret: it is signed, self-certifying, and
                 // names `owner_pub` and a nonce.
                 "cap_header": persistent.then(owner_cap_header).flatten(),
+                // Fleet policy: the grants the owner has signed. The joiner
+                // verifies each against the owner key in the header above, so
+                // this is a relay of owner-authored policy, not a trust decision
+                // handed to whoever sends it.
+                "cap_ops": persistent.then(|| json!(owner_signed_cap_ops())).unwrap_or(Value::Null),
                 "ceiling": ak.caps,
                 "expires": ak.expires,
                 "max_offline": ak.max_offline,
@@ -17705,6 +17779,17 @@ async fn recv_cmd(
                 // The peer's half of the link challenge (transports with no
                 // RFC-5705 exporter). Store it, then send everything that was
                 // waiting on a binding: our announce, and our fleet-hello.
+                // Fleet policy relayed by a sibling. Only ops the OWNER signed
+                // survive `merge_owner_cap_ops`, so a peer can relay policy but
+                // never author it.
+                Some("fleet-policy") => {
+                    if let Some(ops) = v["ops"].as_array() {
+                        let n = merge_owner_cap_ops(ops);
+                        if n > 0 {
+                            ui::debug(&format!("fleet policy from {pid}: {n} new op(s)"));
+                        }
+                    }
+                }
                 Some("l3-nonce") => {
                     match v["nonce"].as_str().map(crate::overlay::unb64) {
                         Some(Ok(nonce)) if nonce.len() >= 16 => {
@@ -17799,6 +17884,23 @@ async fn recv_cmd(
                                         if let Some(t) = conn.transport_of(&pid) {
                                             if let Some(ann) = l3.make_announce(&cb) {
                                                 let _ = t.send_control(&ann.to_json()).await;
+                                            }
+                                        }
+                                    }
+                                    // Fleet policy push. Enrollment seeds a device
+                                    // once; grants made LATER would never reach it,
+                                    // so re-push on every verified hello. The peer
+                                    // verifies each op against the owner key it
+                                    // already holds, and merging is idempotent, so
+                                    // repeating this is cheap and self-healing.
+                                    {
+                                        let ops = owner_signed_cap_ops();
+                                        if !ops.is_empty() {
+                                            if let Some(t) = conn.transport_of(&pid) {
+                                                let _ = t.send_control(&json!({
+                                                    "type": "fleet-policy",
+                                                    "ops": ops,
+                                                })).await;
                                             }
                                         }
                                     }

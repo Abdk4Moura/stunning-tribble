@@ -514,6 +514,29 @@ It is also the same shape as everything else in this document: a value whose
 scope is narrower than the decision resting on it. `fleet_proven` had no peer in
 it at all.
 
+### Grant distribution: DONE
+
+A grant is a `CapOp` with `resource: "self"`, and the self-resource id is derived
+from the OWNER's key rather than the machine's. So an owner-signed op means the
+same thing on every device in the fleet, which is what makes distributing it
+coherent instead of a category error: it is one policy, replicated, not a policy
+about one machine being applied to another.
+
+Two paths, because each covers what the other misses:
+  - the enrollment ack carries the owner's signed ops, seeding a device at join
+  - a verified `fleet-hello` re-pushes them, so grants made LATER still arrive
+
+**A peer can relay policy but never author it.** `merge_owner_cap_ops` keeps only
+ops whose `grantor` equals the owner key the receiving device already holds AND
+whose signature verifies against it. Anything else is dropped silently.
+
+Measured with three daemons:
+
+    owner grants `mount` to laptop AFTER enrollment -> owner has 1 op
+    mesh forms                                      -> laptop 1 op, phone 1 op
+    stored op is byte-identical to the owner's
+    full mesh restart, repeated pushes              -> still 1 op each (idempotent)
+
 ### Ungranted fleet-scope transfer: DONE (PrincipalKind::FleetDevice)
 
 A sibling with NO grant now lands a file in the receiver's own drop dir, while

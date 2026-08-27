@@ -550,7 +550,16 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    Granted transfer already works today and is verified, so this affects the
    no-grant convenience case only.
 
-2. **Owner-signed fleet ceiling.** Capabilities do not flow across a fleet today;
+2-DONE. **Owner-signed grant distribution: BUILT and verified (2026-08-27).**
+   Owner-signed `CapOp`s now reach fleet devices two ways: seeded in the
+   enrollment ack, and re-pushed on every verified `fleet-hello` so later grants
+   propagate. `merge_owner_cap_ops` keeps only ops whose grantor IS the owner key
+   the receiver already holds and whose signature verifies, so a peer relays
+   policy without being able to author it. Measured: a grant made after
+   enrollment reached both siblings, byte-identical, and stayed at one op across
+   a full mesh restart (idempotent).
+
+2-old. **Owner-signed fleet ceiling.** Capabilities do not flow across a fleet today;
    every grant stays explicit. An owner-signed default ceiling delivered at
    enrollment is the shape, deferred deliberately.
 3. **L3-over-relay performance.** The DataChannel is reliable and ordered, so the
