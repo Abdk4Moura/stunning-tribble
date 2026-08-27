@@ -77,10 +77,29 @@ Next, in dependency order:
    `identity::DeviceCert`, so it wants `filament-id` to absorb those first.
 
 3. **`filament-transport`** — the `Transport` trait and the ladder beneath it
-   (direct QUIC, WebRTC, relay). This is the piece with the most standalone
-   value: "an authenticated byte pipe to a peer behind NAT, that fails over".
-   Largest job, because `Conn` currently carries link state, adoption policy and
-   UI concerns together.
+   (direct QUIC, WebRTC, relay). The piece with the most standalone value: "an
+   authenticated byte pipe to a peer behind NAT, that fails over".
+
+   MEASURED 2026-08-27, and it is smaller than it looks. `net.rs` (2,180 lines)
+   and `direct.rs` (1,838) reach into the CLI in only ~23 places, and 15 of those
+   are `ui::trace` / `ui::debug`. The full list of what must be injected:
+
+   | dep | sites | why it is host-bound |
+   |---|---|---|
+   | `ui::trace` / `ui::debug` | 15 | terminal output; becomes a log hook |
+   | `doctor::ip_class`, `iface_for_ip` | 4 | classifies local interfaces |
+   | `settings::get_str`, `raw_membership` | 2 | user config |
+   | `platform::Paths::config_path` | 1 | the signaling-DNS cache file |
+   | `interact::enumerate_interfaces` | 1 | shells out to `ip` |
+
+   So the carve is a log facade plus four small injected traits, not a rewrite.
+   `Conn` is the harder half: it carries link state, adoption policy and
+   presentation together, and it is what the eight event loops all manipulate,
+   so it should be split as part of step 4 rather than dragged out whole here.
+
+   DO THIS CAREFULLY. It is the file the entire reliability story rests on, and
+   a half-verified transport is worse than a coupled one. It wants the gated
+   interleaved harness (see WORK-STATE) green before and after.
 
 4. **`filament-peerloop`** — one driver replacing the eight hand-written loops.
    Do this LAST: it should be assembled from the crates above, not extracted

@@ -550,6 +550,32 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    Granted transfer already works today and is verified, so this affects the
    no-grant convenience case only.
 
+1g. **libfilament: four crates carved (2026-08-27).** See
+   `docs/design-libfilament.md` for the rule and the order.
+
+       filament-transfer   byte mechanics: reassembly, safe names, pwrite   14 tests
+       filament-proto      wire vocabulary + pure ceremony decisions         8 tests
+       filament-overlay    self-certifying addresses, link-bound announces  13 tests
+       filament-fleet      admission ceremony + the per-peer session        13 tests
+
+   The rule each one obeys: a thing may leave when it has no opinion about how a
+   peer was found, where files live on this machine, or how anything is rendered.
+   Where a pure module still needed host state, it is INJECTED (the fleet session
+   takes a hello-builder closure) rather than reaching for the filesystem, which
+   is the shape `filament-id` already used with `&dyn KeyStore`.
+
+   Found while moving: the reassembly functions, which DECIDE whether a file is
+   complete, had no tests at all, in the one path with a measured corruption
+   history. And `pwrite_at` printed a short-write diagnostic to stderr from
+   inside the byte-writing primitive; it now returns the count and the caller
+   decides. Total 525 tests, all green, model checker still proves all tiers.
+
+   REMAINING, both genuinely multi-session:
+     - `filament-transport`: ~23 coupling sites across 4,000 lines, 15 of them
+       `ui::trace`. Concrete injection list now in design-libfilament.md.
+     - one peer loop replacing eight: the big one, and it should be ASSEMBLED
+       from the crates above rather than extracted around them.
+
 1f. **Shared module extracted: `cli/src/fleet_session.rs` (2026-08-27).**
    The fleet identity handshake was typed out TWICE, inline: once in the
    daemon's receive loop and once in `send_cmd`. Every per-peer bug this session
