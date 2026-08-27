@@ -14,7 +14,7 @@
 // Three surfaces, smallest-primitive-first (each is sugar over the one below):
 //   * `filament netcat <peer> <rport>`            stdio  <-> one L2 stream
 //   * `filament forward <lport> <peer> <rport>`   local TCP listener; conn=stream
-//   * `filament ssh <peer> [args...]`             real ssh -o ProxyCommand=netcat
+//   * `filament shell --ssh <peer> [args...]`             real ssh -o ProxyCommand=netcat
 //
 // The ACCEPTOR (the side that dials the localhost target) is NOT a subcommand:
 // it lives inside `filament up` / `filament recv`, gated on the existing
@@ -22,16 +22,16 @@
 // dialing (the SSRF defense). See `Mux::on_open` and main.rs's recv loop.
 
 use crate::net::{self, Ev, Peer, Transport};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::AbortHandle;
 
 /// L2 stream ids live in the HIGH half of the u32 sid space (`sid | 0x8000_0000`)
@@ -104,7 +104,8 @@ impl PtyGuard {
             if cur >= MAX_PTYS_GLOBAL {
                 return None;
             }
-            match LIVE_PTYS.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed) {
+            match LIVE_PTYS.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
+            {
                 Ok(_) => return Some(PtyGuard),
                 Err(actual) => cur = actual,
             }
@@ -115,6 +116,22 @@ impl Drop for PtyGuard {
     fn drop(&mut self) {
         LIVE_PTYS.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// What the acceptor answered to an initiator's open (mount-open / pty-open).
+/// One channel per stream id, shared by every verb, so a new open kind inherits
+/// the denial path instead of silently starting without one (the lesson of the
+/// mount-only `mount_ack_tx`, which left pty with no way to learn why it was
+/// refused).
+enum OpenOutcome {
+    /// The acceptor acked the open. The carried control JSON is the verb's ack
+    /// payload (mount-open-ack carries `caps`; pty-open-ack carries nothing).
+    Opened(serde_json::Value),
+    /// The acceptor closed the stream with an explicit reason (a real refusal).
+    Refused(String),
+    /// The stream closed with no ack and no reason: we never established that
+    /// the peer opened anything.
+    ClosedWithoutAck,
 }
 
 /// The multiplexer: routes inbound control/data frames to per-stream pipes and
@@ -131,11 +148,20 @@ pub struct Mux {
     /// inbound `l2-close` (`on_close`), the session task exit (`drop_pty`), and
     /// link/mux death (`shutdown_all`), closing the resizer-map leak.
     resizers: Mutex<HashMap<u32, mpsc::UnboundedSender<(u16, u16)>>>,
-    /// mount: per-sid oneshot senders for delivering mount-open-ack caps back to
-    /// the caller that issued open_mount_stream. pump_initiator receives the ack
-    /// control message, resolves the sid, and sends the caps; open_mount_stream
-    /// awaits the receiver. Cleaned up on stream teardown.
-    mount_ack_tx: Mutex<HashMap<u32, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>>,
+    /// per-sid oneshot senders delivering the acceptor's answer to an open back
+    /// to the caller that issued it (mount-open via `open_mount_stream`, pty-open
+    /// via `pty_attach_once`). pump_initiator receives the ack control message
+    /// (mount-open-ack / pty-open-ack), resolves the sid, and sends `Opened`;
+    /// an inbound l2-close (`on_close`) sends `Refused`/`ClosedWithoutAck`. The
+    /// caller awaits the receiver. Shared across verbs and keyed by stream id, so
+    /// a denial carries a reason for every open kind instead of just mount.
+    open_ack_tx: Mutex<HashMap<u32, tokio::sync::oneshot::Sender<OpenOutcome>>>,
+    /// A reason an inbound `l2-close` carried for a stream whose open waiter was
+    /// already consumed (i.e. a mid-session close). A revoked peer loses a live
+    /// shell/stream this way; the reason must reach the caller as a denial, not
+    /// be swallowed into a clean close. Entries for streams that never read them
+    /// linger only until link death (`shutdown_all`), bounded and harmless.
+    close_err: Mutex<HashMap<u32, String>>,
 }
 
 impl Mux {
@@ -146,7 +172,8 @@ impl Mux {
             next_sid: AtomicU32::new(0),
             accepted: Mutex::new(HashMap::new()),
             resizers: Mutex::new(HashMap::new()),
-            mount_ack_tx: Mutex::new(HashMap::new()),
+            open_ack_tx: Mutex::new(HashMap::new()),
+            close_err: Mutex::new(HashMap::new()),
         })
     }
 
@@ -163,7 +190,11 @@ impl Mux {
         // allocated - preventing cross-tunnel frame collisions when both ends open
         // L2 streams on one link (pty + warm-reuse forward, etc.).
         let n = self.next_sid.fetch_add(1, Ordering::Relaxed) & 0x3FFF_FFFF;
-        let role = if self.transport.sid_answerer() { 0x4000_0000 } else { 0 };
+        let role = if self.transport.sid_answerer() {
+            0x4000_0000
+        } else {
+            0
+        };
         n | L2_SID_BASE | role
     }
 
@@ -186,7 +217,13 @@ impl Mux {
             return None; // sid already live: refuse, do NOT overwrite/drop
         }
         let (tx, rx) = mpsc::channel::<PipeItem>(256);
-        streams.insert(sid, StreamHandle { tx, read_pump: None });
+        streams.insert(
+            sid,
+            StreamHandle {
+                tx,
+                read_pump: None,
+            },
+        );
         Some(rx)
     }
 
@@ -224,6 +261,7 @@ impl Mux {
     /// resize sender for this sid (H-1: no resizer outlives its stream).
     async fn drop_stream(&self, sid: u32) {
         self.resizers.lock().await.remove(&sid);
+        self.open_ack_tx.lock().await.remove(&sid);
         if let Some(s) = self.streams.lock().await.remove(&sid) {
             if let Some(h) = s.read_pump {
                 h.abort();
@@ -257,7 +295,11 @@ impl Mux {
     pub async fn on_frame(&self, sid: u32, payload: Bytes) {
         let tx = self.streams.lock().await.get(&sid).map(|s| s.tx.clone());
         if let Some(tx) = tx {
-            let msg = if payload.is_empty() { None } else { Some(payload) };
+            let msg = if payload.is_empty() {
+                None
+            } else {
+                Some(payload)
+            };
             let _ = tx.send(msg).await; // receiver gone => stream already torn down
         }
     }
@@ -283,24 +325,51 @@ impl Mux {
     /// no `err` = the peer is done, also a drop (its data direction already
     /// EOF'd via the empty frame). Either way: abort pumps, close the socket.
     async fn on_close(&self, sid: u32, err: Option<&str>) {
-        // Deliver any pending mount-open waiter its denial: an l2-close is the
-        // peer saying NO (authorization, ceiling, stream cap), and the reason it
-        // carries must reach the caller as a denial, not as a mystery timeout.
-        // #206: the acceptor already sends `l2-close{err: not authorized: mount
-        // capability required}` on a ceiling refusal; before this, the reason
-        // was dropped here and the initiator read a generic channel-closed.
-        if let Some(tx) = self.mount_ack_tx.lock().await.remove(&sid) {
-            let reason = err.unwrap_or("connection closed by the peer").to_string();
-            let _ = tx.send(Err(reason));
+        // Deliver any pending open waiter its answer: an l2-close is the peer
+        // saying NO (authorization, ceiling, stream cap, acceptor off), and the
+        // reason it carries must reach the caller as a denial, not as a mystery
+        // timeout. #206: the acceptor sends `l2-close{err: ...}` on a refusal;
+        // before this, the reason was dropped here and the initiator read a
+        // generic channel-closed. A close WITHOUT an err is a different fact
+        // (we never established the peer opened anything) and is delivered as
+        // `ClosedWithoutAck` so the caller can say that instead of inventing a
+        // cause.
+        if let Some(tx) = self.open_ack_tx.lock().await.remove(&sid) {
+            let outcome = match err {
+                Some(reason) => OpenOutcome::Refused(reason.to_string()),
+                None => OpenOutcome::ClosedWithoutAck,
+            };
+            let _ = tx.send(outcome);
+        } else if let Some(reason) = err {
+            // Mid-session close: the open waiter is already consumed, so record
+            // the reason where the caller (the pty IO loop) can read it. A revoked
+            // peer loses a live session this way; the reason must surface as a
+            // denial, never a clean exit.
+            //
+            // Why this needs no buffer: this insert happens BEFORE drop_stream,
+            // and dropping the stream is what closes the pipe the consumer awaits,
+            // so the write happens-before the close the reader keys on, in program
+            // order. Do NOT "simplify" this by re-arming the open_ack_tx one-shot
+            // here: a one-shot slot can be empty at the instant on_close fires, and
+            // a denial delivered into that gap is silently lost. The always-present
+            // map, written before the close, cannot lose it.
+            self.close_err.lock().await.insert(sid, reason.to_string());
         }
         self.drop_stream(sid).await;
+    }
+
+    /// Take the mid-session close reason for a stream, if one was recorded, so the
+    /// caller can distinguish "the peer revoked us" from "the shell exited".
+    pub async fn take_close_err(&self, sid: u32) -> Option<String> {
+        self.close_err.lock().await.remove(&sid)
     }
 
     /// Data-channel died (or a send errored): tear down EVERY live stream so no
     /// pump hangs forever waiting on a peer that will never speak again.
     pub async fn shutdown_all(&self) {
         self.resizers.lock().await.clear(); // H-1: no resizer outlives the mux
-        self.mount_ack_tx.lock().await.clear();
+        self.open_ack_tx.lock().await.clear();
+        self.close_err.lock().await.clear();
         let mut map = self.streams.lock().await;
         for (_, s) in map.drain() {
             if let Some(h) = s.read_pump {
@@ -381,6 +450,10 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     rx: mpsc::Receiver<PipeItem>,
     send_close: bool,
     first: Option<PipeItem>,
+    // The peer's device key, for the acceptor's live-stream revocation re-check.
+    // `None` for the warm/initiator bridges, which do not gate the peer's
+    // liveness.
+    idev: Option<[u8; 32]>,
 ) {
     // Caller sets TCP_NODELAY where applicable (a unix socket has none); split
     // generically so the same plumbing serves a TcpStream OR a local UnixStream
@@ -415,6 +488,12 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     ticker.tick().await; // consume the immediate tick
     let mut reader_done = false;
     let mut read_result = None;
+    // #235-shape: a dedicated recheck ticker at the shared interval, so the
+    // revoke bound is not floored by the 2s liveness tick. The tick IS the
+    // cadence; the verdict is re-asked directly.
+    let mut revoke_ticker = tokio::time::interval(crate::revoke_recheck_interval());
+    revoke_ticker.tick().await; // consume the immediate first tick
+    let mut revoked_reason: Option<&'static str> = None;
     loop {
         tokio::select! {
             r = async { reader.as_mut().unwrap().await }, if !reader_done => {
@@ -442,18 +521,35 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     break;
                 }
             }
+            _ = revoke_ticker.tick() => {
+                // Re-ask the gate. A revoked peer loses the live forward; the
+                // denial is a close-with-reason so the client's connection breaks
+                // instead of hanging.
+                if crate::cert_revoked_for(idev.as_ref()) {
+                    crate::ui::critical("l2: peer revoked, closing the live stream");
+                    revoked_reason = Some(crate::capability::REVOKED_REASON);
+                    if let Some(r) = reader.take() { r.abort(); }
+                    writer.abort();
+                    read_result = None;
+                    break;
+                }
+            }
         }
     }
     // The stream may already be gone (teardown). Remove if still present.
     mux.streams.lock().await.remove(&sid);
     if send_close {
-        let close = match read_result {
-            Some(Ok(Ok(()))) => json!({ "type": "l2-close", "sid": sid }), // clean FIN
-            Some(Ok(Err(e))) => json!({ "type": "l2-close", "sid": sid, "err": e.to_string() }),
-            Some(Err(_aborted)) => return, // teardown owns the close; don't double-send
-            // Peer FIN or link death: ack a close so the peer reaps its half (a
-            // no-op if the transport is already gone).
-            None => json!({ "type": "l2-close", "sid": sid }),
+        let close = if let Some(reason) = revoked_reason {
+            json!({ "type": "l2-close", "sid": sid, "err": reason })
+        } else {
+            match read_result {
+                Some(Ok(Ok(()))) => json!({ "type": "l2-close", "sid": sid }), // clean FIN
+                Some(Ok(Err(e))) => json!({ "type": "l2-close", "sid": sid, "err": e.to_string() }),
+                Some(Err(_aborted)) => return, // teardown owns the close; don't double-send
+                // Peer FIN or link death: ack a close so the peer reaps its half (a
+                // no-op if the transport is already gone).
+                None => json!({ "type": "l2-close", "sid": sid }),
+            }
         };
         let _ = mux.transport.send_control(&close).await;
     }
@@ -521,9 +617,13 @@ fn mouse_mode_changes(data: &[u8]) -> (Vec<u16>, Vec<u16>) {
                 if let Ok(n) = part.parse::<u16>() {
                     if matches!(n, 1000 | 1002 | 1003 | 1006 | 1015) {
                         if set {
-                            if !sets.contains(&n) { sets.push(n); }
+                            if !sets.contains(&n) {
+                                sets.push(n);
+                            }
                         } else {
-                            if !resets.contains(&n) { resets.push(n); }
+                            if !resets.contains(&n) {
+                                resets.push(n);
+                            }
                         }
                     }
                 }
@@ -552,7 +652,10 @@ struct OutBind {
 
 /// Commands to a session's task: (re)bind output to a new link, detach, or end.
 enum SessionCmd {
-    Attach { transport: Arc<dyn Transport>, sid: u32 },
+    Attach {
+        transport: Arc<dyn Transport>,
+        sid: u32,
+    },
     Detach,
     End,
 }
@@ -651,15 +754,27 @@ pub async fn spawn_pty_session(
     term: &str,
     argv: Vec<String>,
     pty_guard: PtyGuard,
+    // The peer's device key, for the live session's revocation re-check. `None`
+    // (no resolved identity) is treated as not-revoked by `cert_revoked_for`.
+    idev: Option<[u8; 32]>,
 ) -> Option<PtySessionHandle> {
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::io::{Read as _, Write as _};
 
-    let size = PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 };
+    let size = PtySize {
+        rows: rows.max(1),
+        cols: cols.max(1),
+        pixel_width: 0,
+        pixel_height: 0,
+    };
     let pair = match native_pty_system().openpty(size) {
         Ok(p) => p,
         Err(e) => {
-            let _ = transport.send_control(&json!({ "type": "l2-close", "sid": sid, "err": format!("pty: {e}") })).await;
+            let _ = transport
+                .send_control(
+                    &json!({ "type": "l2-close", "sid": sid, "err": format!("pty: {e}") }),
+                )
+                .await;
             return None;
         }
     };
@@ -667,7 +782,14 @@ pub async fn spawn_pty_session(
     for a in &argv[1..] {
         cmd.arg(a);
     }
-    cmd.env("TERM", if term.is_empty() { "xterm-256color" } else { term });
+    cmd.env(
+        "TERM",
+        if term.is_empty() {
+            "xterm-256color"
+        } else {
+            term
+        },
+    );
     // Advertise 24-bit color. opentui-based TUIs (e.g. opencode) downgrade to a
     // 256-color palette when COLORTERM is unset; the web-shell xterm.js renders
     // truecolor fine, so set this to get full-color output (verified: opencode
@@ -677,7 +799,11 @@ pub async fn spawn_pty_session(
     let mut child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
         Err(e) => {
-            let _ = transport.send_control(&json!({ "type": "l2-close", "sid": sid, "err": format!("spawn: {e}") })).await;
+            let _ = transport
+                .send_control(
+                    &json!({ "type": "l2-close", "sid": sid, "err": format!("spawn: {e}") }),
+                )
+                .await;
             return None;
         }
     };
@@ -743,6 +869,13 @@ pub async fn spawn_pty_session(
         // 5s tick to enforce the idle/lifetime caps without busy-waiting.
         let mut reaper = tokio::time::interval(Duration::from_secs(5));
         reaper.tick().await; // consume the immediate first tick
+        // #235-shape: a dedicated recheck ticker at the shared interval, so the
+        // revoke bound is NOT floored by the 5s reaper. The tick IS the cadence;
+        // the verdict is re-asked directly. The denial must reach the initiator
+        // as a denial (a reason + nonzero exit), never as a clean shell exit.
+        let mut revoke_ticker = tokio::time::interval(crate::revoke_recheck_interval());
+        revoke_ticker.tick().await; // consume the immediate first tick
+        let mut revoked_reason: Option<&'static str> = None;
 
         loop {
             tokio::select! {
@@ -827,16 +960,35 @@ pub async fn spawn_pty_session(
                         break;
                     }
                 }
+                _ = revoke_ticker.tick() => {
+                    // Re-ask the gate. A revoked peer loses the live shell: tell
+                    // the terminal, then close with a reason so the initiator
+                    // surfaces a nonzero exit rather than a clean one (#223).
+                    if crate::cert_revoked_for(idev.as_ref()) {
+                        crate::ui::critical("pty: peer revoked, closing the live session");
+                        revoked_reason = Some(crate::capability::REVOKED_REASON);
+                        if let Some(b) = &bind {
+                            let msg = format!("\r\n[filament: {}]\r\n", crate::capability::REVOKED_REASON);
+                            let _ = b.transport.send_frame(b.sid, 0, msg.as_bytes()).await;
+                        }
+                        break;
+                    }
+                }
             }
         }
 
-        // Teardown (shell exit, reap, or store removal): kill the shell, tell the
-        // currently-attached link (if any) the session ended, drop from the store.
+        // Teardown (shell exit, reap, revoke, or store removal): kill the shell,
+        // tell the currently-attached link (if any) the session ended, drop from
+        // the store.
         let _ = child.kill();
         let _ = child.wait();
         dead.store(true, Ordering::Release);
         if let Some(b) = &bind {
-            let _ = b.transport.send_control(&json!({ "type": "l2-close", "sid": b.sid })).await;
+            let close = match revoked_reason {
+                Some(reason) => json!({ "type": "l2-close", "sid": b.sid, "err": reason }),
+                None => json!({ "type": "l2-close", "sid": b.sid }),
+            };
+            let _ = b.transport.send_control(&close).await;
         }
         sessions_for_task.remove(&session_id_for_task).await;
     });
@@ -868,7 +1020,12 @@ fn push_ring(ring: &mut VecDeque<u8>, bytes: &[u8], cap: usize) {
 pub enum OpenVerdict {
     /// Accepted: dial this localhost target and relay. Carries the pre-registered
     /// inbound pipe.
-    Accept { sid: u32, host: String, port: u16, rx: mpsc::Receiver<PipeItem> },
+    Accept {
+        sid: u32,
+        host: String,
+        port: u16,
+        rx: mpsc::Receiver<PipeItem>,
+    },
     /// Refused: send l2-close{err} and forget it.
     Deny { sid: u32, err: &'static str },
     /// Not an l2-open / malformed, ignore.
@@ -885,7 +1042,12 @@ impl Mux {
     /// known) decided this specific non-loopback target is permitted by the
     /// operator's opt-in `l2-allow.json` allowlist. Loopback is always allowed; a
     /// non-loopback host is refused UNLESS this is set, keeping the SSRF default.
-    pub async fn accept_control(&self, v: &Value, trusted: bool, allow_nonloopback: bool) -> OpenVerdict {
+    pub async fn accept_control(
+        &self,
+        v: &Value,
+        trusted: bool,
+        allow_nonloopback: bool,
+    ) -> OpenVerdict {
         match v["type"].as_str() {
             Some("l2-open") => {
                 // Reject a missing OR out-of-range sid (wire_sid never truncates)
@@ -919,9 +1081,15 @@ impl Mux {
                 // The whole L2 acceptor stays OFF unless FILAMENT_L2=1 (opt-in).
 
                 let host = v["host"].as_str().unwrap_or("127.0.0.1").to_string();
-                let port = v["rport"].as_u64().or_else(|| v["port"].as_u64()).unwrap_or(0) as u16;
+                let port = v["rport"]
+                    .as_u64()
+                    .or_else(|| v["port"].as_u64())
+                    .unwrap_or(0) as u16;
                 if port == 0 {
-                    return OpenVerdict::Deny { sid, err: "bad port" };
+                    return OpenVerdict::Deny {
+                        sid,
+                        err: "bad port",
+                    };
                 }
                 // ---- SSRF defense: localhost-only by default ----
                 // Stricter than is_private_addr (which ALLOWS LAN/RFC1918): the
@@ -929,7 +1097,10 @@ impl Mux {
                 // refused UNLESS the caller's opt-in per-device allowlist
                 // (l2-allow.json) authorized this exact target (`allow_nonloopback`).
                 if !host_is_loopback(&host) && !allow_nonloopback {
-                    return OpenVerdict::Deny { sid, err: "non-loopback denied (not in l2-allow.json)" };
+                    return OpenVerdict::Deny {
+                        sid,
+                        err: "non-loopback denied (not in l2-allow.json)",
+                    };
                 }
                 // H-1 (DoS): cap concurrent streams per link. A flaky/hostile
                 // paired device can otherwise flood `l2-open` and exhaust
@@ -937,16 +1108,27 @@ impl Mux {
                 // can be retried once others free up.
                 if self.at_stream_cap().await {
                     self.accepted.lock().await.remove(&sid);
-                    return OpenVerdict::Deny { sid, err: "too many streams" };
+                    return OpenVerdict::Deny {
+                        sid,
+                        err: "too many streams",
+                    };
                 }
                 // Collision-safe register: if the peer named a sid already live
                 // on this link (its own forward/pty/mount), REFUSE rather than
                 // overwrite. Drop the `accepted` marker so the sid isn't wedged.
                 let Some(rx) = self.register(sid).await else {
                     self.accepted.lock().await.remove(&sid);
-                    return OpenVerdict::Deny { sid, err: "sid in use" };
+                    return OpenVerdict::Deny {
+                        sid,
+                        err: "sid in use",
+                    };
                 };
-                OpenVerdict::Accept { sid, host, port, rx }
+                OpenVerdict::Accept {
+                    sid,
+                    host,
+                    port,
+                    rx,
+                }
             }
             Some("l2-close") => {
                 // wire_sid (not `as u32`): a wrapped/oversized close sid must not
@@ -963,7 +1145,14 @@ impl Mux {
     /// Acceptor: dial the localhost target for an accepted open and relay. Sends
     /// l2-open-ack on success, l2-close{err} on dial failure. Runs as its own
     /// task (the event loop spawns it) so the dial never blocks routing.
-    pub async fn dial_and_serve(self: Arc<Self>, sid: u32, host: String, port: u16, rx: mpsc::Receiver<PipeItem>) {
+    pub async fn dial_and_serve(
+        self: Arc<Self>,
+        sid: u32,
+        host: String,
+        port: u16,
+        rx: mpsc::Receiver<PipeItem>,
+        idev: Option<[u8; 32]>,
+    ) {
         match TcpStream::connect((host.as_str(), port)).await {
             Ok(sock) => {
                 let _ = sock.set_nodelay(true);
@@ -974,7 +1163,7 @@ impl Mux {
                     .transport
                     .send_control(&json!({ "type": "l2-open-ack", "sid": sid, "credit": 0 }))
                     .await;
-                serve_stream(self.clone(), sid, sock, rx, true, None).await;
+                serve_stream(self.clone(), sid, sock, rx, true, None, idev).await;
                 self.accepted.lock().await.remove(&sid);
             }
             Err(e) => {
@@ -997,7 +1186,9 @@ fn host_is_loopback(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    host.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 // ------------------------------------------------------------ INITIATOR side --
@@ -1091,7 +1282,12 @@ async fn bring_up_to_known(
     peer_name: &str,
     relay: bool,
     role: &'static str,
-) -> Result<(Arc<dyn Transport>, mpsc::UnboundedReceiver<Ev>, LinkGuard, crate::diag::Attempt)> {
+) -> Result<(
+    Arc<dyn Transport>,
+    mpsc::UnboundedReceiver<Ev>,
+    LinkGuard,
+    crate::diag::Attempt,
+)> {
     // A paired device has its own secret. A FLEET sibling is indexed WITHOUT one
     // (design-fleet-automesh.md), so fall back to the fleet secret, which is what
     // the daemon dials such peers with. `fleet_mode` matters at the return sites:
@@ -1114,7 +1310,8 @@ async fn bring_up_to_known(
     // the petname). The Attempt is returned to the caller so it can record the
     // L2Open round trip and the final `up`. We start in Signaling (socket + the
     // first `welcome`); the loop drives the phase transitions below.
-    let mut diag = crate::diag::Attempt::new(server, &crate::diag::peer_hash_from_secret(&secret), role);
+    let mut diag =
+        crate::diag::Attempt::new(server, &crate::diag::peer_hash_from_secret(&secret), role);
     // Latch so we record the Presence->Establishing transition exactly once
     // (the loop dequeues a candidate every time `peer` is idle, but the connect
     // lifecycle's "establishing" begins at the FIRST candidate).
@@ -1140,7 +1337,7 @@ async fn bring_up_to_known(
     // `connect_signaling` returns, it can land before the socket.io connection is
     // fully ready and be silently dropped, the server then never runs `_do_join`,
     // never emits `welcome`, and this loop waits for a Welcome that never comes,
-    // stranding `filament ssh` in "waiting for known device" (~30% of attempts in
+    // stranding `filament shell --ssh` in "waiting for known device" (~30% of attempts in
     // the isolated repro). So we RE-EMIT join on the same cadence as the
     // re-subscribe below until Welcome lands (idempotent: a repeat join to the
     // same solo room is a no-op server-side once it took).
@@ -1182,14 +1379,14 @@ async fn bring_up_to_known(
     // `start_direct` in main.rs); when the peer's transport-offer arrives we
     // consume this endpoint into the race. UNCONDITIONAL here: `bring_up_to_known`
     // only ever serves L2 (netcat/ssh/forward), which always wants direct, and
-    // `filament ssh`/`netcat` do NOT set FILAMENT_L2 in their own env, so gating
+    // `filament shell --ssh`/`netcat` do NOT set FILAMENT_L2 in their own env, so gating
     // on `direct_enabled()` would kill the direct dial on the live path. main.rs
     // gates because it ALSO serves file transfer; this function never does.
     let mut endpoint: Option<quinn::Endpoint> = None;
     // Candidates gathered once at first bind; re-advertised to each new
     // candidate peer we rotate to (the endpoint accepts from any of them,
     // the QUIC race is pair-secret-authenticated either way).
-    let mut direct_cands: Option<Vec<String>> = None;
+    let mut direct_cands: Option<(Vec<String>, Option<String>)> = None;
     // The acceptor re-sends its transport-offer (a late initiator can miss the
     // first). Race only the FIRST offer we get; later re-sends are duplicates.
     let mut direct_racing = false;
@@ -1203,7 +1400,7 @@ async fn bring_up_to_known(
     };
 
     // Distinct wording for the shell-auth pre-flight so the two sequential
-    // bring-ups of `filament ssh` (the bootstrap link, then the netcat data link)
+    // bring-ups of `filament shell --ssh` (the bootstrap link, then the netcat data link)
     // do not read as a flap/retry of one connection. "bootstrap" has its own
     // wording; "reconnect" is silent (post-warm resume check — the link was
     // already up; re-reporting it after a clean logout is noise).
@@ -1262,15 +1459,25 @@ async fn bring_up_to_known(
                 let polite = match uid.as_deref() {
                     Some(peer_uid) => net::polite_role(&my_uid, peer_uid, &mine, &pid)?,
                     None => {
-                        let source = if peer_present { "presence" } else { "absent-roster" };
+                        let source = if peer_present {
+                            "presence"
+                        } else {
+                            "absent-roster"
+                        };
                         net::polite_role_legacy(&my_uid, None, &mine, &pid, source, peer_present)?
-                    },
+                    }
                 };
                 generation += 1;
                 spawn_timer(pid.clone(), generation);
                 let p = Peer::connect(
-                    pid.clone(), my_uid.clone(), polite, cfg.ice_servers.clone(), relay,
-                    sio.clone(), tx.clone(), generation,
+                    pid.clone(),
+                    my_uid.clone(),
+                    polite,
+                    cfg.ice_servers.clone(),
+                    relay,
+                    sio.clone(),
+                    tx.clone(),
+                    generation,
                 )
                 .await?;
                 peer_uid = uid;
@@ -1292,18 +1499,30 @@ async fn bring_up_to_known(
                                     Some(crate::direct::gather_candidates(server, port).await);
                                 endpoint = Some(ep);
                                 // TRACE, direct-offer detail.
-                                crate::ui::trace(&format!("filament: DIRECT-OFFER sent to '{peer_name}', port {port}"));
+                                crate::ui::trace(&format!(
+                                    "filament: DIRECT-OFFER sent to '{peer_name}', port {port}"
+                                ));
                             }
                             Err(e) => {
-                                crate::ui::trace(&format!("filament: direct disabled (endpoint bind failed: {e}), WebRTC only"));
+                                crate::ui::trace(&format!(
+                                    "filament: direct disabled (endpoint bind failed: {e}), WebRTC only"
+                                ));
                             }
                         }
                     }
                     if endpoint.is_some() {
-                        if let Some(c) = &direct_cands {
-                            let offer =
-                                json!({ "type": "transport-offer", "v": 1, "addrs": c });
-                            sio.emit("signal", json!({ "to": pid, "data": offer })).await.ok();
+                        if let Some((c, server_public)) = &direct_cands {
+                            // #237: advertise the address adopted on the server's
+                            // say-so (the peer dials it and may have to name it)
+                            // and our protocol version (gates the observed-address
+                            // exchange on both sides).
+                            let mut offer = json!({ "type": "transport-offer", "v": 1, "proto": 2, "addrs": c });
+                            if let Some(s) = server_public {
+                                offer["server_public"] = json!(s);
+                            }
+                            sio.emit("signal", json!({ "to": pid, "data": offer }))
+                                .await
+                                .ok();
                         }
                     }
                 }
@@ -1414,8 +1633,23 @@ async fn bring_up_to_known(
                         direct_racing = true;
                         let peer_cands: Vec<String> = data["addrs"]
                             .as_array()
-                            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default();
+                        // #237: the initiated race only runs the observed-address
+                        // exchange when the PEER's offer says it speaks it; the
+                        // peer makes the same decision from OUR offer (we always
+                        // advertise proto 2), so both ends skip or both run.
+                        let peer_proto = data["proto"].as_u64().unwrap_or(1).clamp(1, 255) as u8;
+                        let exchange = peer_proto >= 2;
+                        // The L2 initiator has no fallback to attribute, and
+                        // does not track the peer's claimed server-asserted
+                        // address (dial-tracking is unused here, held so the
+                        // shared race keeps a single signature).
+                        let l2_dialed = Arc::new(AtomicBool::new(false));
                         // DEBUG, resilience/direct internal (racing a direct path).
                         crate::ui::debug(&format!(
                             "filament: got transport-offer ({} cand), racing direct-quic",
@@ -1432,14 +1666,26 @@ async fn bring_up_to_known(
                         };
                         let my_uid_for_race = my_uid.clone();
                         let Some(my_id_for_race) = my_id.clone() else {
-                            eprintln!("direct role election deferred for {pid}: local session ID unavailable");
+                            eprintln!(
+                                "direct role election deferred for {pid}: local session ID unavailable"
+                            );
                             continue;
                         };
                         let tx = tx.clone();
                         tokio::spawn(async move {
                             if let Some(t) = crate::direct::race_connect_labeled(
-                                ep, peer_cands, &secret, pid.clone(), my_uid_for_race,
-                                peer_uid_for_race, my_id_for_race, tx.clone(), "direct-quic",
+                                ep,
+                                peer_cands,
+                                &secret,
+                                pid.clone(),
+                                my_uid_for_race,
+                                peer_uid_for_race,
+                                my_id_for_race,
+                                tx.clone(),
+                                "direct-quic",
+                                exchange,
+                                None,
+                                l2_dialed,
                             )
                             .await
                             {
@@ -1470,8 +1716,14 @@ async fn bring_up_to_known(
                         generation += 1;
                         spawn_timer(pid.clone(), generation);
                         let p = Peer::connect(
-                            pid, my_uid.clone(), true, cfg.ice_servers.clone(), relay,
-                            sio.clone(), tx.clone(), generation,
+                            pid,
+                            my_uid.clone(),
+                            true,
+                            cfg.ice_servers.clone(),
+                            relay,
+                            sio.clone(),
+                            tx.clone(),
+                            generation,
                         )
                         .await?;
                         if let Err(e) = p.handle_signal(offer).await {
@@ -1496,14 +1748,19 @@ async fn bring_up_to_known(
                 // bootstrap pre-flight (internal; the data link reports the route)
                 // and for reconnect roles (post-warm resume noise suppression).
                 if !role.starts_with("reconnect") && role != "bootstrap" {
-                    crate::ui::debug(&format!("\rfilament: tunnel up to '{peer_name}' (route: {route})"));
+                    crate::ui::debug(&format!(
+                        "\rfilament: tunnel up to '{peer_name}' (route: {route})"
+                    ));
                 }
                 // Transport is up: the Establishing race is won. Record Ready;
                 // the caller records the L2Open round trip and the final `up`.
                 diag.enter(crate::diag::Phase::Ready);
                 // The WebRTC `peer` is now superfluous; the guard owns it (its
                 // teardown/forget semantics are unchanged, no extra teardown).
-                let guard = LinkGuard { sio: Some(sio), peer: peer.take() };
+                let guard = LinkGuard {
+                    sio: Some(sio),
+                    peer: peer.take(),
+                };
                 // The fleet secret got us CONNECTED to a fleet member. It does not
                 // say WHICH one: every sibling sits on the same channel, so a peer
                 // answering to this name merely ASSERTED it. Prove it with the
@@ -1539,10 +1796,15 @@ async fn bring_up_to_known(
                 if let Some(p) = &peer {
                     if let Some((my_fp, their_fp)) = p.fingerprints().await {
                         let mac = crate::proof_for(
-                            &secret, &my_uid, &my_uid,
-                            peer_uid.as_deref().unwrap_or(""), &my_fp, &their_fp,
+                            &secret,
+                            &my_uid,
+                            &my_uid,
+                            peer_uid.as_deref().unwrap_or(""),
+                            &my_fp,
+                            &their_fp,
                         );
-                        t.send_control(&json!({ "type": "pair-proof", "mac": mac })).await?;
+                        t.send_control(&json!({ "type": "pair-proof", "mac": mac }))
+                            .await?;
                     }
                 }
                 // Hand sio + peer to the caller via a guard: a long-lived tunnel
@@ -1554,7 +1816,10 @@ async fn bring_up_to_known(
                 // Transport is up via WebRTC: Establishing race won. Record Ready;
                 // the caller records the L2Open round trip and the final `up`.
                 diag.enter(crate::diag::Phase::Ready);
-                let guard = LinkGuard { sio: Some(sio), peer: peer.take() };
+                let guard = LinkGuard {
+                    sio: Some(sio),
+                    peer: peer.take(),
+                };
                 // The fleet secret got us CONNECTED to a fleet member. It does not
                 // say WHICH one: every sibling sits on the same channel, so a peer
                 // answering to this name merely ASSERTED it. Prove it with the
@@ -1611,7 +1876,7 @@ pub struct ProbeOutcome {
     pub error: Option<String>,
     /// On success, the path the probe link actually took (interface, address
     /// class, endpoints) - so `filament doctor` shows the route in the same fine
-    /// detail as `filament ping`. `None` when the link never came up.
+    /// detail as `filament reach`. `None` when the link never came up.
     pub path: Option<crate::net::PathInfo>,
 }
 
@@ -1729,12 +1994,11 @@ async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
                         mux.on_open_ack(sid).await;
                     }
                 }
-                Some("mount-open-ack") => {
+                Some("mount-open-ack") | Some("pty-open-ack") => {
                     if let Some(sid) = wire_sid(&v) {
-                        let mut ack_map = mux.mount_ack_tx.lock().await;
+                        let mut ack_map = mux.open_ack_tx.lock().await;
                         if let Some(tx) = ack_map.remove(&sid) {
-                            let caps = v.get("caps").cloned().unwrap_or(serde_json::Value::Null);
-                            let _ = tx.send(Ok(caps));
+                            let _ = tx.send(OpenOutcome::Opened(v.clone()));
                         }
                     }
                 }
@@ -1757,7 +2021,10 @@ async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
 /// the inbound pipe is wired. Returns the registered receiver. The initiator
 /// registers its OWN pipe up front so a server-speaks-first protocol (ssh
 /// banner) can't lose bytes.
-pub(crate) async fn open_stream(mux: &Arc<Mux>, rport: u16) -> Result<(u32, mpsc::Receiver<PipeItem>)> {
+pub(crate) async fn open_stream(
+    mux: &Arc<Mux>,
+    rport: u16,
+) -> Result<(u32, mpsc::Receiver<PipeItem>)> {
     let sid = mux.alloc_sid();
     // alloc_sid hands out a fresh sid, so register never collides here; guard
     // anyway so a refusal can never be silently ignored (which would re-open the
@@ -1819,7 +2086,10 @@ async fn verify_first_frame(
                 .transport
                 .send_control(&json!({ "type": "l2-close", "sid": sid }))
                 .await;
-            Err(anyhow!("warm link unresponsive after {}ms (zombie)", verify.as_millis()))
+            Err(anyhow!(
+                "warm link unresponsive after {}ms (zombie)",
+                verify.as_millis()
+            ))
         }
     }
 }
@@ -1848,7 +2118,7 @@ pub(crate) async fn serve_verified_stream<S: AsyncRead + AsyncWrite + Unpin + Se
     first: PipeItem,
     rx: mpsc::Receiver<PipeItem>,
 ) {
-    serve_stream(mux, sid, sock, rx, true, Some(first)).await;
+    serve_stream(mux, sid, sock, rx, true, Some(first), None).await;
 }
 
 /// Open a mesh-native mount stream to the peer, sending `mount-open` with the
@@ -1865,30 +2135,36 @@ pub(crate) async fn open_mount_stream(
         .register(sid)
         .await
         .ok_or_else(|| anyhow!("mount open: sid {sid:#x} already in use"))?;
-    let (tx, caps_rx) = tokio::sync::oneshot::channel();
-    mux.mount_ack_tx.lock().await.insert(sid, tx);
+    let (tx, outcome_rx) = tokio::sync::oneshot::channel();
+    mux.open_ack_tx.lock().await.insert(sid, tx);
     let encoded = crate::mount_proto::path_encode(std::path::Path::new(root));
     mux.transport
         .send_control(&json!({ "type": "mount-open", "sid": sid, "root": encoded }))
         .await?;
-    let caps_value = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        caps_rx,
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("mount-open-ack not received (timed out)"))?
-    .map_err(|_| anyhow::anyhow!("mount-open-ack channel closed"))?;
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), outcome_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("mount-open-ack not received (timed out)"))?
+        .map_err(|_| anyhow::anyhow!("mount-open-ack channel closed"))?;
     // #206: an l2-close from the acceptor is a DENIAL (authorization, ceiling,
     // stream cap) carrying a reason. It must surface as a denial, never as a
     // transport-shaped timeout. Silence still means timeout; a refusal is never
     // silent.
-    let caps_value = caps_value.map_err(|reason| anyhow::anyhow!("mount denied by {reason}"))?;
+    let caps_value = match outcome {
+        OpenOutcome::Opened(v) => v.get("caps").cloned().unwrap_or(serde_json::Value::Null),
+        OpenOutcome::Refused(reason) => return Err(anyhow!("mount denied by {reason}")),
+        OpenOutcome::ClosedWithoutAck => {
+            return Err(anyhow!("mount denied by connection closed by the peer"));
+        }
+    };
     let caps = crate::mount_proto::parse_mount_caps(caps_value)?;
     // Send mount-cap-ack: the client confirms it accepts the server's caps.
-    let _ = mux.transport.send_control(&json!({
-        "type": "mount-cap-ack", "sid": sid,
-        "binary_frames": caps.protocol_version >= 2
-    })).await;
+    let _ = mux
+        .transport
+        .send_control(&json!({
+            "type": "mount-cap-ack", "sid": sid,
+            "binary_frames": caps.protocol_version >= 2
+        }))
+        .await;
     Ok((sid, rx, caps))
 }
 
@@ -1951,7 +2227,7 @@ pub(crate) async fn serve_opened_stream<S: AsyncRead + AsyncWrite + Unpin + Send
     stream: S,
     rx: mpsc::Receiver<PipeItem>,
 ) {
-    serve_stream(mux, sid, stream, rx, true, None).await;
+    serve_stream(mux, sid, stream, rx, true, None, None).await;
 }
 
 /// Pump this process's stdio over a connected warm-reuse socket: stdin -> sock,
@@ -2019,7 +2295,7 @@ async fn pump_warm_pty_stdio(
 
 /// Pump a one-shot warm pty: stream output to stdout until the command exits.
 /// No raw mode, no SIGWINCH, no interactive features. Forwards stdin to match
-/// cold path parity (supports `echo hi | filament pty peer -- cat`).
+/// cold path parity (supports `echo hi | filament shell peer -- cat`).
 #[cfg(unix)]
 async fn pump_warm_pty_one_shot(
     sock: tokio::net::UnixStream,
@@ -2082,7 +2358,7 @@ async fn pump_warm_pty_one_shot(
     Ok(())
 }
 
-/// `filament dial <peer> <port>`: wire this process's stdio to a service the peer
+/// `filament forward <peer> <port>`: wire this process's stdio to a service the peer
 /// EXPOSED on its overlay address, over L3 (the overlay-port counterpart of
 /// `netcat`; also an ssh ProxyCommand for an overlay-exposed sshd). Goes through the
 /// local daemon, which resolves the peer to its verified overlay address and dials
@@ -2099,7 +2375,7 @@ pub async fn dial_cmd(peer: &str, port: u16) -> Result<()> {
 
 #[cfg(not(unix))]
 pub async fn dial_cmd(_peer: &str, _port: u16) -> Result<()> {
-    bail!("filament dial needs the local daemon's control socket (unix only)")
+    bail!("filament forward needs the local daemon's control socket (unix only)")
 }
 
 /// `filament netcat <peer> <rport>`: wire this process's stdio to one L2 stream.
@@ -2113,7 +2389,9 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
     #[cfg(unix)]
     if !relay {
         if let Some(sock) = crate::ctl::try_open(peer, rport).await {
-            crate::ui::trace(&format!("filament: reusing warm link to '{peer}' (no establish)"));
+            crate::ui::trace(&format!(
+                "filament: reusing warm link to '{peer}' (no establish)"
+            ));
             return pump_stdio_over(sock).await;
         }
     }
@@ -2138,8 +2416,17 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
                     "couldn't establish a link to '{peer}' in {connect_secs}s - it may be offline or unreachable from here."
                 ),
                 &[
-                    format!("check it's reachable: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament ping {peer}"))),
-                    format!("diagnose the connect: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament doctor {peer}"))),
+                    format!(
+                        "check it's reachable: {}",
+                        crate::ui::paint(crate::ui::Tone::Brand, &format!("filament reach {peer}"))
+                    ),
+                    format!(
+                        "diagnose the connect: {}",
+                        crate::ui::paint(
+                            crate::ui::Tone::Brand,
+                            &format!("filament doctor {peer}")
+                        )
+                    ),
                 ],
             );
             std::process::exit(1);
@@ -2234,6 +2521,13 @@ enum PtyOutcome {
     /// The link died under us (transport not alive) - the remote PTY session may
     /// still be alive on the acceptor; reconnect and REATTACH the same session.
     Dropped,
+    /// The acceptor refused the open with an explicit reason (no shell cap,
+    /// acceptor off, stream cap, ...). Nonzero, print the reason.
+    Refused(String),
+    /// The stream closed (or never answered) before we could confirm the peer
+    /// opened a shell. Nonzero, with a weaker sentence rather than a confident
+    /// wrong one.
+    Unconfirmed(String),
 }
 
 /// A single, process-lifetime reader of fd0 for the resumable pty client.
@@ -2276,7 +2570,11 @@ fn spawn_stdin_reader() -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
 /// Send `data` to the peer over one L2 stream, split into transport-sized frames.
 /// `Err(())` means a frame was rejected (the link is gone); the caller stashes the
 /// unsent input for the next attach so a keystroke typed at the drop is not lost.
-async fn send_frames_chunked(t: &Arc<dyn Transport>, sid: u32, data: &[u8]) -> std::result::Result<(), ()> {
+async fn send_frames_chunked(
+    t: &Arc<dyn Transport>,
+    sid: u32,
+    data: &[u8],
+) -> std::result::Result<(), ()> {
     let cap = t.max_payload().max(1);
     for chunk in data.chunks(cap) {
         if t.send_frame(sid, 0, chunk).await.is_err() {
@@ -2336,6 +2634,18 @@ async fn pty_attach_once(
         .await
         .ok_or_else(|| anyhow!("pty open: sid {sid:#x} already in use"))?;
 
+    // Register the open waiter BEFORE the pty-open goes out, so an ack/close that
+    // races back cannot be lost. Only the FIRST attach needs this: a resume that
+    // finds no session is a clean end (the acceptor says "no such session"), not a
+    // denial, and exit 0 is correct there.
+    let ack_rx = if resume {
+        None
+    } else {
+        let (tx, rx) = tokio::sync::oneshot::channel::<OpenOutcome>();
+        mux.open_ack_tx.lock().await.insert(sid, tx);
+        Some(rx)
+    };
+
     // Real terminal: query the ACTUAL tty size (crossterm asks the tty via
     // ioctl), NOT the COLUMNS/LINES shell vars which are usually unexported and
     // leave a TUI rendering at a stale size. Fall back to env/defaults for a pipe.
@@ -2343,12 +2653,18 @@ async fn pty_attach_once(
         crossterm::terminal::size().unwrap_or((80, 24))
     } else {
         (
-            std::env::var("COLUMNS").ok().and_then(|s| s.parse().ok()).unwrap_or(80u16),
-            std::env::var("LINES").ok().and_then(|s| s.parse().ok()).unwrap_or(24u16),
+            std::env::var("COLUMNS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(80u16),
+            std::env::var("LINES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(24u16),
         )
     };
     // `session` makes reconnects REATTACH the same shell (acceptor keys it per
-    // verified device); a fresh per-invocation id means two `filament pty` runs
+    // verified device); a fresh per-invocation id means two `filament shell` runs
     // never collide. `term` is forwarded so the remote matches THIS terminal.
     mux.transport()
         .send_control(&{
@@ -2364,6 +2680,43 @@ async fn pty_attach_once(
         .await?;
     diag.up("tunnel", "datachannel-or-direct");
 
+    // Exit 0 must mean "the peer told me it opened". Wait (bounded) for the
+    // pty-open-ack before committing to the session, so a refusal, a silent
+    // close, or a black hole all become nonzero instead of an empty-success.
+    // `-- true` stays exit 0: the ack arrives, then the clean l2-close follows.
+    if let Some(ack_rx) = ack_rx {
+        let outcome = tokio::time::timeout(Duration::from_secs(10), ack_rx).await;
+        match outcome {
+            Ok(Ok(OpenOutcome::Opened(_))) => {}
+            Ok(Ok(OpenOutcome::Refused(reason))) => {
+                mux.drop_stream(sid).await;
+                pump.abort();
+                return Ok(PtyOutcome::Refused(reason));
+            }
+            Ok(Ok(OpenOutcome::ClosedWithoutAck)) => {
+                mux.drop_stream(sid).await;
+                pump.abort();
+                return Ok(PtyOutcome::Unconfirmed(format!(
+                    "could not confirm '{peer}' opened a shell (the connection closed before it answered)"
+                )));
+            }
+            Ok(Err(_)) => {
+                mux.drop_stream(sid).await;
+                pump.abort();
+                return Ok(PtyOutcome::Unconfirmed(format!(
+                    "could not confirm '{peer}' opened a shell (the link closed)"
+                )));
+            }
+            Err(_) => {
+                mux.drop_stream(sid).await;
+                pump.abort();
+                return Ok(PtyOutcome::Unconfirmed(format!(
+                    "no answer from '{peer}' - it may be unresponsive or running a build that does not ack shell opens"
+                )));
+            }
+        }
+    }
+
     // Enable raw mode LAZILY, AFTER the establishment status lines have printed in
     // cooked mode (so `\n` still does CR+LF and they don't "staircase"). Held in
     // the caller's scope so it persists across reconnects and is restored on exit.
@@ -2378,7 +2731,7 @@ async fn pty_attach_once(
     let winch = if interactive {
         let t_resize = mux.transport();
         Some(tokio::spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             let mut sig = match signal(SignalKind::window_change()) {
                 Ok(s) => s,
                 Err(_) => return,
@@ -2386,7 +2739,9 @@ async fn pty_attach_once(
             while sig.recv().await.is_some() {
                 if let Ok((c, r)) = crossterm::terminal::size() {
                     let _ = t_resize
-                        .send_control(&json!({ "type": "pty-resize", "sid": sid, "cols": c, "rows": r }))
+                        .send_control(
+                            &json!({ "type": "pty-resize", "sid": sid, "cols": c, "rows": r }),
+                        )
                         .await;
                 }
             }
@@ -2422,6 +2777,7 @@ async fn pty_attach_once(
     ticker.tick().await; // consume the immediate tick
     let mut stdin_done = false; // fd0 hit EOF: stop reading it, keep pumping stdout
     let dropped;
+    let mut close_reason: Option<String> = None;
     loop {
         tokio::select! {
             item = rx_pipe.recv() => match item {
@@ -2429,8 +2785,13 @@ async fn pty_attach_once(
                     stdout.write_all(&bytes).await?;
                     stdout.flush().await?;
                 }
-                // Pipe closed: clean exit (l2-close, link still alive) vs drop.
-                _ => { dropped = !mux.transport().is_alive(); break; }
+                // Pipe closed: clean exit (l2-close, link still alive), a mid-session
+                // denial (l2-close{err}, the revoke case), or a drop.
+                _ => {
+                    dropped = !mux.transport().is_alive();
+                    close_reason = mux.take_close_err(sid).await;
+                    break;
+                }
             },
             chunk = stdin_rx.recv(), if !stdin_done => match chunk {
                 // Empty Vec = fd0 EOF: send the FIN once, then stop reading stdin but
@@ -2462,13 +2823,22 @@ async fn pty_attach_once(
     // crucially, an l2-close would tell the acceptor to END the session we want
     // to reattach - so we stay silent and let it buffer for the reattach.
     if !dropped {
-        let _ = mux.transport().send_control(&json!({ "type": "l2-close", "sid": sid })).await;
+        let _ = mux
+            .transport()
+            .send_control(&json!({ "type": "l2-close", "sid": sid }))
+            .await;
     }
     pump.abort();
-    Ok(if dropped { PtyOutcome::Dropped } else { PtyOutcome::Exited })
+    match close_reason {
+        // A mid-session denial (revoke): nonzero with the reason, never a clean
+        // exit that would carry a `&&` pipeline forward (#223).
+        Some(reason) => Ok(PtyOutcome::Refused(reason)),
+        None if dropped => Ok(PtyOutcome::Dropped),
+        None => Ok(PtyOutcome::Exited),
+    }
 }
 
-/// Warm fast path for `filament pty`: if the local daemon already holds a link to
+/// Warm fast path for `filament shell`: if the local daemon already holds a link to
 /// `peer`, open the PTY over it (via the control socket) and bridge this process's
 /// stdio to it - raw mode + SIGWINCH forwarded as a `resize` op. Returns
 /// `Some(result)` once it has handled the session (stdio EOF = shell exit or a
@@ -2499,7 +2869,9 @@ async fn try_warm_pty(
         Err(_) => return None, // no warm path; the cold path is the right answer
     };
     if interactive {
-        crate::ui::trace(&format!("filament: reusing warm link to '{peer}' for pty (no establish)"));
+        crate::ui::trace(&format!(
+            "filament: reusing warm link to '{peer}' for pty (no establish)"
+        ));
         if raw.is_none() {
             match RawGuard::enable() {
                 Ok(g) => *raw = Some(g),
@@ -2509,7 +2881,7 @@ async fn try_warm_pty(
         // Forward SIGWINCH as a `resize` control op (a fresh short connection each time).
         let session_owned = session.to_string();
         let winch = tokio::spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             let mut sig = match signal(SignalKind::window_change()) {
                 Ok(s) => s,
                 Err(_) => return,
@@ -2525,7 +2897,9 @@ async fn try_warm_pty(
         Some(r)
     } else {
         // One-shot (scripted): no raw mode, no SIGWINCH, just stream output.
-        crate::ui::trace(&format!("filament: reusing warm link to '{peer}' for one-shot pty"));
+        crate::ui::trace(&format!(
+            "filament: reusing warm link to '{peer}' for one-shot pty"
+        ));
         // NOTE: neither the cold path nor this warm path propagates the remote
         // command's exit status - both return Ok(()) regardless. This is a known
         // limitation / future enhancement.
@@ -2533,14 +2907,14 @@ async fn try_warm_pty(
     }
 }
 
-/// `filament pty <peer>`: open a PTY shell on the peer and bridge it to this
+/// `filament shell <peer>`: open a PTY shell on the peer and bridge it to this
 /// terminal (the CLI sibling of the browser web-shell). On a real terminal it is
 /// a FULL interactive client - real tty size, raw mode, SIGWINCH, $TERM - AND
 /// RESUMABLE: a per-invocation random session id lets a dropped link reconnect
 /// and reattach the SAME live shell (mosh/tmux-style, the acceptor replays its
 /// output buffer), so a flaky link (e.g. a Coder workspace reconnecting every
 /// ~90s) no longer loses the session. The session id lives only in THIS process,
-/// so a separate `filament pty` run always gets a fresh shell, never this one.
+/// so a separate `filament shell` run always gets a fresh shell, never this one.
 /// A non-tty stdio (a pipe) keeps the plain cooked, non-resuming bridge.
 pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) -> Result<()> {
     let one_shot = cmd.join(" ");
@@ -2549,7 +2923,10 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     // Random, per-invocation, in-memory only: distinct runs never collide; only
     // THIS process's reconnects reattach (see the user's "same client" concern).
     let session_id = crate::fresh_secret();
-    let term = std::env::var("TERM").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "xterm-256color".into());
+    let term = std::env::var("TERM")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "xterm-256color".into());
 
     // Raw mode is held for the WHOLE invocation (enabled lazily inside the first
     // attach, AFTER its status lines, so they don't staircase), persists across
@@ -2588,7 +2965,18 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
 
     #[cfg(unix)]
     if !relay && (interactive || !one_shot.is_empty()) {
-        match try_warm_pty(peer, &session_id, &term, &one_shot, interactive, &mut raw, &mut stdin_rx, &mut pending).await {
+        match try_warm_pty(
+            peer,
+            &session_id,
+            &term,
+            &one_shot,
+            interactive,
+            &mut raw,
+            &mut stdin_rx,
+            &mut pending,
+        )
+        .await
+        {
             Some(Err(e)) => return Err(e),
             Some(Ok(())) => {
                 // For one-shot exec: the warm bridge already streamed the command's
@@ -2609,8 +2997,70 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
         // is gone (shell exited cleanly on a prior drop), the acceptor returns
         // "no such session" and we exit cleanly instead of spawning a fresh shell.
         let resume = ever_connected || warm_ended;
-        match pty_attach_once(server, peer, relay, role, &session_id, &term, &one_shot, interactive, resume, &mut raw, &mut stdin_rx, &mut pending).await {
+        match pty_attach_once(
+            server,
+            peer,
+            relay,
+            role,
+            &session_id,
+            &term,
+            &one_shot,
+            interactive,
+            resume,
+            &mut raw,
+            &mut stdin_rx,
+            &mut pending,
+        )
+        .await
+        {
             Ok(PtyOutcome::Exited) => return Ok(()),
+            Ok(PtyOutcome::Refused(reason)) => {
+                // The peer is up and said no. Nonzero with the reason; never a
+                // false success that would carry a `&&` pipeline forward.
+                // The remedy depends on WHICH refusal: a revoked certificate is
+                // not repaired by a grant, so the hint must not say "grant".
+                let hint = if reason == crate::capability::REVOKED_REASON {
+                    format!(
+                        "the peer's certificate was revoked; restore it with {}",
+                        crate::ui::paint(
+                            crate::ui::Tone::Brand,
+                            "filament devices restore <this-device>"
+                        )
+                    )
+                } else if reason == crate::capability::CEILING_REASON {
+                    // A grant cannot widen an enrolment ceiling, and `filament
+                    // grant` says so when you run it. Prescribing it here sent
+                    // the owner to a command that refuses, and the refusal named
+                    // the real fix. Name it here instead, one step earlier.
+                    format!(
+                        "shell is outside this device's invitation ceiling, and a grant cannot widen one. Re-invite with shell: {}",
+                        crate::ui::paint(
+                            crate::ui::Tone::Brand,
+                            "filament add --for <this-device> --allow shell"
+                        )
+                    )
+                } else {
+                    format!(
+                        "grant shell on the peer: {}",
+                        crate::ui::paint(
+                            crate::ui::Tone::Brand,
+                            &format!("filament grant <this-device> shell")
+                        )
+                    )
+                };
+                crate::ui::problem(&format!("shell refused by '{peer}'"), &reason, &[hint]);
+                std::process::exit(1);
+            }
+            Ok(PtyOutcome::Unconfirmed(reason)) => {
+                // We could not establish that the peer opened a shell. Say the
+                // weaker true sentence rather than a confident wrong one.
+                crate::ui::problem(
+                    &format!("shell could not be confirmed on '{peer}'"),
+                    &reason,
+                    &[],
+                );
+                std::process::exit(1);
+            }
             Ok(PtyOutcome::Dropped) => {
                 // Non-tty (scripted) sessions don't resume; a drop is the end.
                 if !interactive {
@@ -2643,16 +3093,26 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                         .then_some(msg)
                     };
                     if let Some(reason) = refused {
+                        // Both verbs here used to be invented: `filament pty` and
+                        // `filament request`. Neither exists, so the hint sent the
+                        // user to a command that would not run. main's
+                        // printed_hints_name_verbs_that_exist gate caught it on
+                        // merge, which is exactly what that gate is for.
+                        //
+                        // The real shape: the attempt already queues a consent
+                        // request on the PEER, so there is nothing to type here.
+                        // What helps is knowing it was queued and how the other
+                        // side answers it.
                         crate::ui::problem(
-                            &format!("filament pty: '{peer}' refused the shell"),
+                            &format!("filament shell: '{peer}' refused the shell"),
                             &reason,
                             &[
                                 format!(
-                                    "ask for it: {}",
-                                    crate::ui::paint(crate::ui::Tone::Brand, &format!("filament request shell --to {peer}"))
+                                    "on {peer}, approve it: {}",
+                                    crate::ui::paint(crate::ui::Tone::Brand, "filament requests")
                                 ),
                                 format!(
-                                    "or on {peer}: {}",
+                                    "or on {peer}, grant it outright: {}",
                                     crate::ui::paint(crate::ui::Tone::Brand, "filament grant <this device> shell")
                                 ),
                             ],
@@ -2665,13 +3125,25 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                         .filter(|n| *n > 0)
                         .unwrap_or(45);
                     crate::ui::problem(
-                        &format!("filament pty: can't reach '{peer}'"),
+                        &format!("filament shell: can't reach '{peer}'"),
                         &format!(
                             "couldn't establish a link to '{peer}' in {connect_secs}s - it may be offline or unreachable from here."
                         ),
                         &[
-                            format!("check it's reachable: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament ping {peer}"))),
-                            format!("diagnose the connect: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament doctor {peer}"))),
+                            format!(
+                                "check it's reachable: {}",
+                                crate::ui::paint(
+                                    crate::ui::Tone::Brand,
+                                    &format!("filament reach {peer}")
+                                )
+                            ),
+                            format!(
+                                "diagnose the connect: {}",
+                                crate::ui::paint(
+                                    crate::ui::Tone::Brand,
+                                    &format!("filament doctor {peer}")
+                                )
+                            ),
                         ],
                     );
                     std::process::exit(1);
@@ -2680,7 +3152,9 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                 // have reaped the detached session (SESSION_DETACHED_IDLE = 180s);
                 // stop a bit under that so we don't reattach into a fresh shell.
                 if last_up.elapsed() > Duration::from_secs(150) {
-                    eprint!("\r\n\x1b[2m[filament: session expired, reconnect window passed]\x1b[0m\r\n");
+                    eprint!(
+                        "\r\n\x1b[2m[filament: session expired, reconnect window passed]\x1b[0m\r\n"
+                    );
                     return Ok(());
                 }
                 tokio::time::sleep(backoff).await;
@@ -2709,8 +3183,13 @@ fn port_in_use_msg(lport: u16, peer: &str, rport: u16) -> String {
 /// socket (the daemon bridges the unix socket to an L2 stream over its existing
 /// link). One copy per direction; either side's EOF ends the pair. Unix-only.
 #[cfg(unix)]
-async fn bridge_streams(mut tcp: TcpStream, mut unix: tokio::net::UnixStream) -> std::io::Result<()> {
-    tokio::io::copy_bidirectional(&mut tcp, &mut unix).await.map(|_| ())
+async fn bridge_streams(
+    mut tcp: TcpStream,
+    mut unix: tokio::net::UnixStream,
+) -> std::io::Result<()> {
+    tokio::io::copy_bidirectional(&mut tcp, &mut unix)
+        .await
+        .map(|_| ())
 }
 
 /// `filament forward <lport> <peer> <rport>`: local TCP listener; every accepted
@@ -2725,7 +3204,10 @@ async fn bridge_streams(mut tcp: TcpStream, mut unix: tokio::net::UnixStream) ->
 /// Normalize a device name for self-comparison: lowercase, alphanumerics only, so
 /// "pop-os", "popos", and "Pop_OS" all compare equal.
 fn norm_device_name(s: &str) -> String {
-    s.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_lowercase()).collect()
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 /// True when `peer` names THIS device (its configured name, that name's host part,
@@ -2752,6 +3234,10 @@ struct ForwardActivity {
     active: std::sync::Arc<std::sync::atomic::AtomicU64>,
     total: std::sync::Arc<std::sync::atomic::AtomicU64>,
     first: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// #232/#268: report a peer refusal ONCE. A browser retrying a dead port
+    /// would otherwise repeat the same line per connection, and a reason
+    /// printed twenty times reads as a storm rather than an explanation.
+    refused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     peer: String,
     rport: u16,
 }
@@ -2762,6 +3248,7 @@ impl ForwardActivity {
             active: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             first: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            refused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             peer: peer.to_string(),
             rport,
         }
@@ -2776,14 +3263,59 @@ impl ForwardActivity {
             self.total.load(Relaxed)
         ));
     }
+    /// A handle sharing the same counters, for the per-connection tasks.
+    fn handle(&self) -> ForwardActivity {
+        ForwardActivity {
+            active: self.active.clone(),
+            total: self.total.clone(),
+            first: self.first.clone(),
+            refused: self.refused.clone(),
+            peer: self.peer.clone(),
+            rport: self.rport,
+        }
+    }
+
+    /// #232/#268: the peer said no, and said why. Surface it.
+    ///
+    /// Before this, `forward` printed an accept-time line and then nothing: a
+    /// refusal reached `Mux::on_close`, which recorded the reason in `close_err`
+    /// exactly so a caller could read it, and forward was the one caller that
+    /// never did. pty already reads it via `take_close_err`. So this is wiring a
+    /// channel that existed, not building one, which is the correction the
+    /// reviewer made to my first description of this work.
+    fn refused_once(&self, reason: &str) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.refused.swap(true, Relaxed) {
+            return;
+        }
+        crate::ui::critical(&format!(
+            "filament: {}:{} refused the connection: {reason}",
+            self.peer, self.rport
+        ));
+    }
+
     /// Register a newly accepted connection; the returned guard decrements on drop.
     fn begin(&self) -> ConnGuard {
         use std::sync::atomic::Ordering::Relaxed;
         self.total.fetch_add(1, Relaxed);
         self.active.fetch_add(1, Relaxed);
         if !self.first.swap(true, Relaxed) {
+            // #232: this used to read "first connection forwarded to X:Y", and it
+            // fires on `listener.accept()`, before any l2-open has been sent. On
+            // the cold path the peer has not been asked yet; on either path
+            // `open_stream` returns as soon as the l2-open frame is WRITTEN, so
+            // even that is not proof the peer accepted. The reporter saw
+            // "the link is live" printed while curl got an empty reply.
+            //
+            // Accepting a local connection is true and narrower than the peer
+            // forwarding it, so the line now claims only what is known here.
+            // Proof of delivery is the first inbound frame, which lives behind
+            // `verify_first_frame` on the warm path and behind `serve_stream`'s
+            // shared plumbing on the cold one; reporting from there needs an
+            // outcome channel that several other callers must NOT inherit, so it
+            // is a follow-up rather than a claim made loosely here.
             crate::ui::say(&format!(
-                "filament: first connection forwarded to {}:{} - the link is live",
+                "filament: first connection accepted, opening to {}:{}",
                 self.peer, self.rport
             ));
         }
@@ -2839,7 +3371,13 @@ pub async fn mount_cmd(
     Ok(client)
 }
 
-pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay: bool) -> Result<()> {
+pub async fn forward_cmd(
+    server: &str,
+    lport: u16,
+    peer: &str,
+    rport: u16,
+    relay: bool,
+) -> Result<()> {
     // Refuse a forward to THIS device before doing anything: it would just loop back,
     // and the generic "no known device" error hides what actually happened.
     if forward_target_is_self(peer) {
@@ -2852,7 +3390,10 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
     // Resolve the peer against the paired devices UP FRONT, so an unknown/typo'd
     // target fails immediately with a clear message instead of after a premature
     // "ready" (the warm path used to announce success before ever reaching the peer).
-    if !crate::devices_load().iter().any(|(n, _)| n.eq_ignore_ascii_case(peer)) {
+    if !crate::devices_load()
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case(peer))
+    {
         bail!(
             "filament: no known device named '{peer}'. Add it first with `filament add`, \
              then `filament devices` shows who you can reach."
@@ -2877,7 +3418,9 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
             )));
         }
     };
-    crate::ui::say(&format!("filament: forwarding 127.0.0.1:{lport} -> {peer}:127.0.0.1:{rport}"));
+    crate::ui::say(&format!(
+        "filament: forwarding 127.0.0.1:{lport} -> {peer}:127.0.0.1:{rport}"
+    ));
 
     // Ride a local `up` daemon's warm link when one exists (unix control socket):
     // connections are then instant and open NO new presence on the peer (the
@@ -2908,7 +3451,7 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
             }
             None => {
                 crate::ui::say(&format!(
-                    "filament: listening on 127.0.0.1:{lport} -> {peer}:{rport} via the local daemon; no live link to {peer} yet - it opens on the first connection (check with `filament ping {peer}`)"
+                    "filament: listening on 127.0.0.1:{lport} -> {peer}:{rport} via the local daemon; no live link to {peer} yet - it opens on the first connection (check with `filament reach {peer}`)"
                 ));
             }
         }
@@ -2923,7 +3466,9 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
         // Wait for the first link so "ready" is honest.
         while rx.borrow().is_none() {
             if rx.changed().await.is_err() {
-                bail!("filament: could not establish the link to {peer}; is it online? check with `filament ping {peer}` (or `filament devices`)");
+                bail!(
+                    "filament: could not establish the link to {peer}; is it online? check with `filament reach {peer}` (or `filament devices`)"
+                );
             }
         }
         crate::ui::say(&format!(
@@ -2974,6 +3519,9 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
         }
         let rx = cold_rx.clone().unwrap();
         let guard = activity.begin();
+        // #232/#268: a handle sharing the same counters, so the spawned task can
+        // report a refusal against this forward's once-only flag.
+        let act = activity.handle();
         let peer_c = peer.to_string();
         // Serve this connection, retrying across a reconnect: a link that died in
         // the poll window is skipped (is_alive) and open_stream failures re-wait
@@ -2982,7 +3530,7 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
         // kill the whole forward (the beta.28/29 regression class).
         tokio::spawn(async move {
             let _guard = guard; // decrements + refreshes the activity line on close
-            serve_cold_connection(rx, sock, rport, peer_c).await;
+            serve_cold_connection(rx, sock, rport, peer_c, Some(act)).await;
         });
     }
 }
@@ -2996,22 +3544,34 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
 ///
 /// When `--http-port` is set, also runs an HTTP CONNECT proxy + PAC file endpoint
 /// on that port for browser/OS proxy config (Tailscale parity).
-pub async fn proxy_cmd(server: &str, bind: &str, port: u16, http_port: u16, relay: bool) -> Result<()> {
+pub async fn proxy_cmd(
+    server: &str,
+    bind: &str,
+    port: u16,
+    http_port: u16,
+    relay: bool,
+) -> Result<()> {
     let listener = match TcpListener::bind((bind, port)).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             bail!("filament: {bind}:{port} is already in use; pick another with --port");
         }
         Err(e) => {
-            return Err(anyhow::Error::new(e).context(format!("filament: failed to bind {bind}:{port}")));
+            return Err(
+                anyhow::Error::new(e).context(format!("filament: failed to bind {bind}:{port}"))
+            );
         }
     };
-    crate::ui::say(&format!("filament: SOCKS5 proxy on {bind}:{port} (no TUN, no sudo)"));
+    crate::ui::say(&format!(
+        "filament: SOCKS5 proxy on {bind}:{port} (no TUN, no sudo)"
+    ));
     crate::ui::say(&format!(
         "  point apps here; {}.mesh rides the mesh, everything else connects directly",
         "<peer>"
     ));
-    crate::ui::say(&format!("  e.g.  curl --socks5-hostname {bind}:{port} http://<peer>.mesh:8080/"));
+    crate::ui::say(&format!(
+        "  e.g.  curl --socks5-hostname {bind}:{port} http://<peer>.mesh:8080/"
+    ));
     #[cfg(unix)]
     if !crate::ctl::daemon_present().await {
         crate::ui::say(&crate::ui::paint(
@@ -3028,13 +3588,18 @@ pub async fn proxy_cmd(server: &str, bind: &str, port: u16, http_port: u16, rela
         let http_listener = match TcpListener::bind((bind, http_port)).await {
             Ok(l) => l,
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                bail!("filament: {bind}:{http_port} is already in use; pick another with --http-port");
+                bail!(
+                    "filament: {bind}:{http_port} is already in use; pick another with --http-port"
+                );
             }
             Err(e) => {
-                return Err(anyhow::Error::new(e).context(format!("filament: failed to bind {bind}:{http_port}")));
+                return Err(anyhow::Error::new(e)
+                    .context(format!("filament: failed to bind {bind}:{http_port}")));
             }
         };
-        crate::ui::say(&format!("filament: HTTP CONNECT proxy on {bind}:{http_port}"));
+        crate::ui::say(&format!(
+            "filament: HTTP CONNECT proxy on {bind}:{http_port}"
+        ));
         crate::ui::say(&format!(
             "  PAC file: http://127.0.0.1:{http_port}/proxy.pac"
         ));
@@ -3048,7 +3613,9 @@ pub async fn proxy_cmd(server: &str, bind: &str, port: u16, http_port: u16, rela
                 let sock = match http_listener.accept().await {
                     Ok((s, _)) => s,
                     Err(e) => {
-                        crate::ui::status(&format!("filament: HTTP accept paused ({e}), retrying..."));
+                        crate::ui::status(&format!(
+                            "filament: HTTP accept paused ({e}), retrying..."
+                        ));
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         continue;
                     }
@@ -3084,7 +3651,8 @@ pub async fn proxy_cmd(server: &str, bind: &str, port: u16, http_port: u16, rela
 
 /// Write a minimal SOCKS5 reply (`code` 0x00 = success) with a zero BND.ADDR/PORT.
 async fn socks_reply(sock: &mut TcpStream, code: u8) -> std::io::Result<()> {
-    sock.write_all(&[0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await
+    sock.write_all(&[0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
 }
 
 /// Handle one SOCKS5 client: no-auth handshake, parse the CONNECT target, then
@@ -3180,7 +3748,7 @@ async fn handle_socks(
                 }
             };
             socks_reply(&mut sock, 0x00).await?;
-            serve_cold_connection(rx, sock, dport, peer).await;
+            serve_cold_connection(rx, sock, dport, peer, None).await;
             Ok(())
         }
         None => {
@@ -3218,7 +3786,7 @@ async fn handle_http(
         sock.read_exact(&mut tmp).await?;
         buf.push(tmp[0]);
         // Check for \r\n\r\n (end of headers).
-        if buf.len() >= 4 && &buf[buf.len()-4..] == b"\r\n\r\n" {
+        if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
             break;
         }
         if buf.len() > 8192 {
@@ -3238,7 +3806,7 @@ async fn handle_http(
         let host_port = path;
         let (host, dport) = if let Some(colon) = host_port.rfind(':') {
             let h = &host_port[..colon];
-            let p: u16 = host_port[colon+1..].parse().unwrap_or(0);
+            let p: u16 = host_port[colon + 1..].parse().unwrap_or(0);
             (h.to_string(), p)
         } else {
             (host_port.to_string(), 80)
@@ -3251,11 +3819,15 @@ async fn handle_http(
                 #[cfg(unix)]
                 if crate::ctl::daemon_present().await {
                     if let Some(usock) = crate::ctl::try_open(&peer, dport).await {
-                        let _ = sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                            .await;
                         return bridge_streams(sock, usock).await.map_err(Into::into);
                     }
                     if let Some(usock) = crate::ctl::try_dial(&peer, dport).await {
-                        let _ = sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                            .await;
                         return bridge_streams(sock, usock).await.map_err(Into::into);
                     }
                 }
@@ -3272,8 +3844,10 @@ async fn handle_http(
                         rx
                     }
                 };
-                let _ = sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
-                serve_cold_connection(rx, sock, dport, peer).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await;
+                serve_cold_connection(rx, sock, dport, peer, None).await;
                 Ok(())
             }
             None => {
@@ -3281,7 +3855,9 @@ async fn handle_http(
                 match TcpStream::connect((host.as_str(), dport)).await {
                     Ok(mut up) => {
                         let _ = up.set_nodelay(true);
-                        let _ = sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                            .await;
                         let _ = tokio::io::copy_bidirectional(&mut sock, &mut up).await;
                         Ok(())
                     }
@@ -3336,6 +3912,10 @@ async fn serve_cold_connection(
     sock: TcpStream,
     rport: u16,
     peer: String,
+    // #232/#268: Some for `forward`, whose user is watching a terminal and needs
+    // to know the peer refused. None for the proxy paths, which serve many
+    // callers and have no single console to narrate to.
+    activity: Option<ForwardActivity>,
 ) {
     let mut tries = 0u32;
     loop {
@@ -3354,14 +3934,25 @@ async fn serve_cold_connection(
         };
         match open_stream(&mux, rport).await {
             Ok((sid, rx_pipe)) => {
-                serve_stream(mux, sid, sock, rx_pipe, true, None).await;
+                serve_stream(mux.clone(), sid, sock, rx_pipe, true, None, None).await;
+                // The acceptor's `l2-close{err}` landed in `close_err` before the
+                // pipe was dropped (on_close orders it that way deliberately), so
+                // by the time serve_stream returns the reason is already there if
+                // there is one. A clean end leaves None and prints nothing.
+                if let (Some(a), Some(reason)) = (&activity, mux.take_close_err(sid).await) {
+                    a.refused_once(&reason);
+                }
                 return;
             }
             Err(_) => {
                 tries += 1;
                 if tries >= 3 {
-                    crate::ui::debug(&format!(
-                        "filament: dropping a connection to {peer} (link recovering); the forward stays up"
+                    // #232: the client is staring at an empty reply, so this is
+                    // not a debug detail. It was invisible at the default level,
+                    // which is why the only thing the user saw was the premature
+                    // success line above.
+                    crate::ui::critical(&format!(
+                        "filament: could not open a stream to {peer} after 3 tries; this connection was dropped (the forward stays up)"
                     ));
                     return; // drop sock; accept loop keeps running
                 }
@@ -3398,7 +3989,9 @@ async fn manage_cold_link(
                 m
             }
             Err(e) => {
-                crate::ui::status(&format!("filament: reaching {peer} failed ({e}), retrying..."));
+                crate::ui::status(&format!(
+                    "filament: reaching {peer} failed ({e}), retrying..."
+                ));
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms * 2).min(8000);
                 continue;
@@ -3438,7 +4031,7 @@ async fn manage_cold_link(
 /// fall through to a key-less ssh attempt (that would be a muddy auth failure
 /// instead of a clear "zero shell" denial).
 /// Result of installing our managed key on a peer (warm or cold path). `sshd` is
-/// the peer's report of whether an sshd is listening on the port `filament ssh`
+/// the peer's report of whether an sshd is listening on the port `filament shell --ssh`
 /// will dial: `Some(true)` reachable, `Some(false)` nothing there (so ssh would
 /// fail blindly - caller bails with a clear message), `None` when the peer is an
 /// older build that didn't report it (caller proceeds, status unknown).
@@ -3448,7 +4041,12 @@ struct BootstrapInfo {
     sshd: Option<bool>,
 }
 
-async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -> Result<BootstrapInfo> {
+async fn shell_bootstrap(
+    server: &str,
+    peer: &str,
+    relay: bool,
+    ssh_port: u16,
+) -> Result<BootstrapInfo> {
     // Managed keypair lives under the filament config dir, NEVER ~/.ssh.
     let pubkey = crate::sshkeys::ensure_managed_key()?;
 
@@ -3469,13 +4067,22 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -
         Ok(inner) => inner?,
         Err(_) => {
             crate::ui::problem(
-                &format!("filament ssh: can't reach '{peer}'"),
+                &format!("filament shell --ssh: can't reach '{peer}'"),
                 &format!(
                     "couldn't establish a link to '{peer}' in {connect_secs}s - it may be offline or unreachable from here."
                 ),
                 &[
-                    format!("check it's reachable: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament ping {peer}"))),
-                    format!("diagnose the connect: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament doctor {peer}"))),
+                    format!(
+                        "check it's reachable: {}",
+                        crate::ui::paint(crate::ui::Tone::Brand, &format!("filament reach {peer}"))
+                    ),
+                    format!(
+                        "diagnose the connect: {}",
+                        crate::ui::paint(
+                            crate::ui::Tone::Brand,
+                            &format!("filament doctor {peer}")
+                        )
+                    ),
                 ],
             );
             std::process::exit(1);
@@ -3485,7 +4092,10 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -
     // mux), so the link being usable IS the end of this span. Record `up`; the
     // ssh data link is a SEPARATE netcat span instrumented in its own right.
     diag.up("tunnel", "datachannel-or-direct");
-    t.send_control(&json!({ "type": "shell-bootstrap", "v": 1, "pubkey": pubkey, "ssh_port": ssh_port })).await?;
+    t.send_control(
+        &json!({ "type": "shell-bootstrap", "v": 1, "pubkey": pubkey, "ssh_port": ssh_port }),
+    )
+    .await?;
 
     // Await the verdict (bounded, a daemon without FILAMENT_L2 / without the cap
     // must not hang us forever). Capture it, then ALWAYS tear this link down
@@ -3496,7 +4106,8 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             break Err(anyhow!(
-                "shell bootstrap timed out, is '{peer}' running `filament up` with shell access granted?"
+                "shell bootstrap timed out with no answer from '{peer}'. If it is running \
+                 `filament up`, the shell acceptor may be off there (`filament up --shell`)."
             ));
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
@@ -3509,23 +4120,63 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -
                     crate::respond_to_identity_challenge(&t, &v).await;
                     continue;
                 }
+                // The acceptor SAYS why it refused, in an l2-close `err`. This
+                // arm used to fall through to `_ => continue`, so `--ssh` threw
+                // that sentence away, spun for the full 20s, and then guessed
+                // at a cause: "is '<peer>' running `filament up` with shell
+                // access granted?" The plain `filament shell` path surfaces the
+                // same message immediately. Same refusal, same wire, two very
+                // different errors, and the useless one was on the path a user
+                // reaches for when the first attempt fails.
+                Some("l2-close") => {
+                    if let Some(why) = v["err"].as_str() {
+                        break Err(anyhow!("shell refused by '{peer}': {why}"));
+                    }
+                    continue;
+                }
                 Some("shell-bootstrap-ack") => {
                     let hostkeys: Vec<String> = v["hostkeys"]
                         .as_array()
-                        .map(|a| a.iter().filter_map(|k| k.as_str().map(String::from)).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|k| k.as_str().map(String::from))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     // The acceptor reports the account it installed our key into,
                     // authoritative for the ssh login (see ssh_cmd).
                     let user = v["user"].as_str().map(String::from);
                     // Older acceptors omit `sshd` -> None (unknown, proceed).
                     let sshd = v["sshd"].as_bool();
-                    break Ok(BootstrapInfo { hostkeys, user, sshd });
+                    break Ok(BootstrapInfo {
+                        hostkeys,
+                        user,
+                        sshd,
+                    });
                 }
                 Some("shell-bootstrap-deny") => {
-                    let why = v["reason"].as_str().unwrap_or("shell capability not granted");
-                    break Err(anyhow!(
-                        "shell refused by '{peer}': {why}. Run `filament grant <this-device> shell` on '{peer}'."
-                    ));
+                    let why = v["reason"]
+                        .as_str()
+                        .unwrap_or("shell capability not granted");
+                    // Same trap as the non-ssh path: a grant cannot widen an
+                    // enrolment ceiling, so do not prescribe one when the
+                    // ceiling is the reason.
+                    // One reason, one remedy. Appending a grant hint to every
+                    // refusal produced "shell serving is off there; run
+                    // `filament up --shell` on that device. Run `filament grant
+                    // <this-device> shell`" — two instructions, the second
+                    // irrelevant to the stated cause. A reason that already
+                    // carries its own fix gets no second one bolted on.
+                    let fix = if why == crate::capability::CEILING_REASON {
+                        format!(
+                            " shell is outside this device's invitation ceiling, and a grant cannot widen one. Re-invite with shell: `filament add --for <this-device> --allow shell` on '{peer}'."
+                        )
+                    } else if why == crate::capability::SHELL_OFF_REASON {
+                        String::new()
+                    } else {
+                        format!(" Run `filament grant <this-device> shell` on '{peer}'.")
+                    };
+                    break Err(anyhow!("shell refused by '{peer}': {why}.{fix}"));
                 }
                 _ => continue,
             },
@@ -3545,16 +4196,25 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -
 /// run the `shell-bootstrap` over its already-established link (instant, no cold
 /// establish), and fall back to a fresh `shell_bootstrap` on a miss/deny/timeout,
 /// under `--relay`, or off-unix. This is what closes the last gap that left
-/// `filament ssh` slow while `pty` was already warm: the bootstrap was the only
+/// `filament shell --ssh` slow while `pty` was already warm: the bootstrap was the only
 /// remaining cold establish in the ssh path.
-async fn bootstrap_key(server: &str, peer: &str, relay: bool, ssh_port: u16) -> Result<BootstrapInfo> {
+async fn bootstrap_key(
+    server: &str,
+    peer: &str,
+    relay: bool,
+    ssh_port: u16,
+) -> Result<BootstrapInfo> {
     #[cfg(unix)]
     if !relay {
         let pubkey = crate::sshkeys::ensure_managed_key()?;
         if let Some(v) = crate::ctl::try_bootstrap(peer, &pubkey, ssh_port).await {
             let hostkeys: Vec<String> = v["hostkeys"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|k| k.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|k| k.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             if !hostkeys.is_empty() {
                 crate::ui::trace(&format!(
@@ -3648,14 +4308,22 @@ fn spawn_ssh_direct(login: &str, mesh_host: &str, extra: &[String]) -> Result<i3
     let kh = crate::sshkeys::known_hosts_path();
     let dest_token = format!("{login}@{mesh_host}");
     let mut cmd = std::process::Command::new("ssh");
-    cmd.arg("-o").arg(format!("IdentityFile={}", key.display()))
-        .arg("-o").arg("IdentitiesOnly=yes")
-        .arg("-o").arg(format!("UserKnownHostsFile={}", kh.display()))
-        .arg("-o").arg("GlobalKnownHostsFile=/dev/null")
-        .arg("-o").arg("StrictHostKeyChecking=accept-new")
-        .arg("-o").arg("ConnectTimeout=10")
-        .arg("-o").arg("ServerAliveInterval=15")
-        .arg("-o").arg("ServerAliveCountMax=4");
+    cmd.arg("-o")
+        .arg(format!("IdentityFile={}", key.display()))
+        .arg("-o")
+        .arg("IdentitiesOnly=yes")
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", kh.display()))
+        .arg("-o")
+        .arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=4");
     let mut split = extra.len();
     for (i, a) in extra.iter().enumerate() {
         if !a.starts_with('-') {
@@ -3694,17 +4362,26 @@ fn spawn_ssh(
     let kh = crate::sshkeys::known_hosts_path();
     let dest_token = format!("{login}@{host}");
     let mut cmd = std::process::Command::new("ssh");
-    cmd.arg("-o").arg(format!("ProxyCommand={proxy}"))
-        .arg("-o").arg(format!("IdentityFile={}", key.display()))
-        .arg("-o").arg("IdentitiesOnly=yes")
-        .arg("-o").arg(format!("UserKnownHostsFile={}", kh.display()))
-        .arg("-o").arg("GlobalKnownHostsFile=/dev/null")
-        .arg("-o").arg("StrictHostKeyChecking=accept-new")
+    cmd.arg("-o")
+        .arg(format!("ProxyCommand={proxy}"))
+        .arg("-o")
+        .arg(format!("IdentityFile={}", key.display()))
+        .arg("-o")
+        .arg("IdentitiesOnly=yes")
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", kh.display()))
+        .arg("-o")
+        .arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
         // Bound the ssh-side connect and detect a dead session, so the data link
         // (the filament netcat ProxyCommand) can't hang ssh indefinitely either.
-        .arg("-o").arg("ConnectTimeout=25")
-        .arg("-o").arg("ServerAliveInterval=15")
-        .arg("-o").arg("ServerAliveCountMax=3");
+        .arg("-o")
+        .arg("ConnectTimeout=25")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3");
     // Split passthrough args into ssh OPTIONS (leading flags) and the remote
     // COMMAND (from the first non-flag token on). The destination is ALWAYS our
     // managed token, inserted BETWEEN options and command, or ssh would mistake
@@ -3726,7 +4403,7 @@ fn spawn_ssh(
     Ok(cmd.status()?.code().unwrap_or(1))
 }
 
-/// `filament ssh <peer> [args...]`: seamless shell over the trusted channel.
+/// `filament shell --ssh <peer> [args...]`: seamless shell over the trusted channel.
 ///
 /// With zero pre-existing ssh setup: bootstrap our managed key + the peer's host
 /// key over the authenticated filament channel, pin them, then run ssh pointed
@@ -3762,7 +4439,11 @@ fn probe_sshd(addr: std::net::SocketAddr, to: std::time::Duration) -> bool {
 /// nudge. Bounded (ctl's open has no internal timeout).
 #[cfg(target_os = "linux")]
 async fn revive_l3(peer: &str, rport: u16) {
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), crate::ctl::try_open(peer, rport)).await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        crate::ctl::try_open(peer, rport),
+    )
+    .await;
 }
 
 /// How long to wait for the overlay to come back after a revive nudge (default 15s;
@@ -3780,17 +4461,28 @@ pub(crate) struct PeerSshInfo {
 
 /// Ensure our managed key is installed on the peer and host keys are pinned.
 /// Returns `PeerSshInfo` with everything needed to spawn sshfs/rsync/ssh.
-pub(crate) async fn ensure_peer_bootstrap(server: &str, peer: &str, relay: bool) -> Result<PeerSshInfo> {
+pub(crate) async fn ensure_peer_bootstrap(
+    server: &str,
+    peer: &str,
+    relay: bool,
+) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
     let _host = format!("filament-{peer}");
-    let rport: u16 =
-        std::env::var("FILAMENT_SSH_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22);
+    let rport: u16 = std::env::var("FILAMENT_SSH_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(22);
 
     ensure_peer_bootstrap_port(server, peer, relay, rport).await
 }
 
 /// Ensure our managed key is installed on the peer with a specific port.
-pub(crate) async fn ensure_peer_bootstrap_port(server: &str, peer: &str, relay: bool, rport: u16) -> Result<PeerSshInfo> {
+pub(crate) async fn ensure_peer_bootstrap_port(
+    server: &str,
+    peer: &str,
+    relay: bool,
+    rport: u16,
+) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
     let host = format!("filament-{peer}");
 
@@ -3825,8 +4517,10 @@ pub(crate) async fn ensure_peer_bootstrap_port(server: &str, peer: &str, relay: 
 pub(crate) async fn rebootstrap_peer(server: &str, peer: &str, relay: bool) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
     let host = format!("filament-{peer}");
-    let rport: u16 =
-        std::env::var("FILAMENT_SSH_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22);
+    let rport: u16 = std::env::var("FILAMENT_SSH_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(22);
 
     crate::sshkeys::bootstrap_cache_clear(peer);
     let info = shell_bootstrap(server, peer, relay, rport).await?;
@@ -3845,16 +4539,29 @@ pub(crate) async fn rebootstrap_peer(server: &str, peer: &str, relay: bool) -> R
 }
 
 /// Build ssh option args for use with sshfs/rsync (identity, known_hosts, etc).
-pub(crate) fn ssh_transport_args(info: &PeerSshInfo, server: &str, peer: &str, relay: bool) -> Vec<String> {
+pub(crate) fn ssh_transport_args(
+    info: &PeerSshInfo,
+    server: &str,
+    peer: &str,
+    relay: bool,
+) -> Vec<String> {
     let mut args = vec![
-        "-o".into(), format!("IdentityFile={}", info.key_path.display()),
-        "-o".into(), "IdentitiesOnly=yes".into(),
-        "-o".into(), format!("UserKnownHostsFile={}", info.known_hosts_path.display()),
-        "-o".into(), "GlobalKnownHostsFile=/dev/null".into(),
-        "-o".into(), "StrictHostKeyChecking=accept-new".into(),
-        "-o".into(), "ConnectTimeout=10".into(),
-        "-o".into(), "ServerAliveInterval=15".into(),
-        "-o".into(), "ServerAliveCountMax=4".into(),
+        "-o".into(),
+        format!("IdentityFile={}", info.key_path.display()),
+        "-o".into(),
+        "IdentitiesOnly=yes".into(),
+        "-o".into(),
+        format!("UserKnownHostsFile={}", info.known_hosts_path.display()),
+        "-o".into(),
+        "GlobalKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+        "-o".into(),
+        "ServerAliveInterval=15".into(),
+        "-o".into(),
+        "ServerAliveCountMax=4".into(),
     ];
     let exe = std::env::current_exe().unwrap();
     let exe = exe.to_string_lossy();
@@ -3882,7 +4589,7 @@ pub(crate) fn l3_dest(_info: &PeerSshInfo) -> Option<String> {
 pub(crate) fn l3_dest(info: &PeerSshInfo) -> Option<String> {
     let peer = info.host.strip_prefix("filament-").unwrap_or(&info.host);
     let (mesh_host, addr) = l3_mesh_addr(peer, info.rport)?;
-    
+
     // Retry with increasing timeouts (like run_ssh does with revive+poll).
     // A single 600ms probe is too aggressive - overlay may be temporarily slow.
     for attempt in 0..3 {
@@ -3901,7 +4608,17 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
 
     let info = ensure_peer_bootstrap(server, peer, relay).await?;
 
-    let code = run_ssh(server, peer, relay, &info.host, &info.login, info.rport, extra, true).await?;
+    let code = run_ssh(
+        server,
+        peer,
+        relay,
+        &info.host,
+        &info.login,
+        info.rport,
+        extra,
+        true,
+    )
+    .await?;
 
     // A cached skip that failed at the ssh layer (connect/auth, exit 255) may mean
     // the device rotated its key/host-key or revoked the cap. Invalidate, run a
@@ -3910,7 +4627,17 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
         crate::ui::say(&format!("filament: re-authenticating with '{peer}'..."));
         let retry = rebootstrap_peer(server, peer, relay).await?;
         // revive=false: don't pay the L3 revive-wait twice on the same invocation.
-        let code = run_ssh(server, peer, relay, &retry.host, &retry.login, retry.rport, extra, false).await?;
+        let code = run_ssh(
+            server,
+            peer,
+            relay,
+            &retry.host,
+            &retry.login,
+            retry.rport,
+            extra,
+            false,
+        )
+        .await?;
         ssh_failed_hint(peer, code);
         std::process::exit(code);
     }
@@ -3925,7 +4652,9 @@ fn ssh_failed_hint(peer: &str, code: i32) {
     if code == 255 {
         crate::ui::say(&crate::ui::paint(
             crate::ui::Tone::Dim,
-            &format!("  tip: `filament {peer}` opens a filament shell instead (no sshd needed, survives link repairs)"),
+            &format!(
+                "  tip: `filament {peer}` opens a filament shell instead (no sshd needed, survives link repairs)"
+            ),
         ));
     }
 }
@@ -3948,18 +4677,21 @@ async fn ensure_sshd(peer: &str, rport: u16, reported: Option<bool>) {
         return;
     }
     crate::ui::problem(
-        &format!("filament ssh: no sshd on '{peer}'"),
+        &format!("filament shell --ssh: no sshd on '{peer}'"),
         &format!(
             "'{peer}' is reachable, but nothing is listening on localhost:{rport} for ssh. \
              (sshd may be bound to a non-localhost address like the mesh ULA — \
-             `filament ssh` connects to localhost:{rport} on the peer.)",
+             `filament shell --ssh` connects to localhost:{rport} on the peer.)",
         ),
         &[
             format!("start an sshd on '{peer}' listening on localhost (or all interfaces)"),
-            format!("set {} to a different port", crate::ui::paint(crate::ui::Tone::Brand, "FILAMENT_SSH_PORT")),
+            format!(
+                "set {} to a different port",
+                crate::ui::paint(crate::ui::Tone::Brand, "FILAMENT_SSH_PORT")
+            ),
             format!(
                 "use {} for a shell that needs no sshd",
-                crate::ui::paint(crate::ui::Tone::Brand, &format!("filament pty {peer}"))
+                crate::ui::paint(crate::ui::Tone::Brand, &format!("filament shell {peer}"))
             ),
         ],
     );
@@ -4005,7 +4737,11 @@ mod h1_tests {
             Self::new_with_state(alive, u64::MAX)
         }
         fn new_with_state(alive: bool, idle: u64) -> Arc<Self> {
-            Arc::new(MockTransport { controls: StdMutex::new(Vec::new()), alive, idle })
+            Arc::new(MockTransport {
+                controls: StdMutex::new(Vec::new()),
+                alive,
+                idle,
+            })
         }
     }
     #[async_trait]
@@ -4040,9 +4776,14 @@ mod h1_tests {
     #[test]
     fn stall_observation_reports_dead_transport_down() {
         let dead = MockTransport::new_with_alive(false);
-        let (transport_up, _flowed, idle_ms) = crate::Conn::stall_observation(Some(dead.as_ref()), &[]);
+        let (transport_up, _flowed, idle_ms) =
+            crate::Conn::stall_observation(Some(dead.as_ref()), &[]);
         assert!(!transport_up, "a dead transport must not be observed as up");
-        assert_eq!(idle_ms, u64::MAX, "dead transport must not contribute activity");
+        assert_eq!(
+            idle_ms,
+            u64::MAX,
+            "dead transport must not contribute activity"
+        );
     }
 
     #[test]
@@ -4054,7 +4795,10 @@ mod h1_tests {
             crate::Conn::stall_observation(Some(primary.as_ref()), &workers);
         assert!(transport_up);
         assert!(flowed);
-        assert_eq!(idle_ms, 9_000, "a recently active worker must not mask a stalled primary");
+        assert_eq!(
+            idle_ms, 9_000,
+            "a recently active worker must not mask a stalled primary"
+        );
     }
 
     fn open_msg(sid: u32) -> Value {
@@ -4083,7 +4827,11 @@ mod h1_tests {
             mux.on_close(sid, None).await;
             drop(guard); // session task ending frees the global slot
             assert_eq!(mux.live_streams().await, 0, "stream not freed on l2-close");
-            assert_eq!(mux.resizers.lock().await.len(), 0, "resizer leaked on l2-close");
+            assert_eq!(
+                mux.resizers.lock().await.len(),
+                0,
+                "resizer leaked on l2-close"
+            );
         }
 
         // Path B: session task exit (drop_pty) frees stream + resizer.
@@ -4096,7 +4844,11 @@ mod h1_tests {
             mux.drop_pty(sid).await; // a session task own exit path
             drop(guard);
             assert_eq!(mux.live_streams().await, 0, "stream not freed on drop_pty");
-            assert_eq!(mux.resizers.lock().await.len(), 0, "resizer leaked on drop_pty");
+            assert_eq!(
+                mux.resizers.lock().await.len(),
+                0,
+                "resizer leaked on drop_pty"
+            );
         }
 
         // Path C: link/mux death (shutdown_all) frees everything.
@@ -4111,10 +4863,22 @@ mod h1_tests {
         assert_eq!(mux.live_streams().await, n as usize);
         mux.shutdown_all().await;
         drop(guards);
-        assert_eq!(mux.live_streams().await, 0, "streams leaked past shutdown_all");
-        assert_eq!(mux.resizers.lock().await.len(), 0, "resizers leaked past shutdown_all");
+        assert_eq!(
+            mux.live_streams().await,
+            0,
+            "streams leaked past shutdown_all"
+        );
+        assert_eq!(
+            mux.resizers.lock().await.len(),
+            0,
+            "resizers leaked past shutdown_all"
+        );
 
-        assert_eq!(LIVE_PTYS.load(Ordering::SeqCst), start, "global PTY count must return to baseline");
+        assert_eq!(
+            LIVE_PTYS.load(Ordering::SeqCst),
+            start,
+            "global PTY count must return to baseline"
+        );
     }
 
     /// H-1: the per-link stream cap refuses opens beyond MAX_STREAMS_PER_LINK with
@@ -4127,7 +4891,10 @@ mod h1_tests {
             let sid = L2_SID_BASE | (i + 1);
             match mux.accept_control(&open_msg(sid), true, false).await {
                 OpenVerdict::Accept { .. } => {}
-                other => panic!("expected Accept under cap, got {:?}", std::mem::discriminant(&other)),
+                other => panic!(
+                    "expected Accept under cap, got {:?}",
+                    std::mem::discriminant(&other)
+                ),
             }
         }
         assert_eq!(mux.live_streams().await, MAX_STREAMS_PER_LINK);
@@ -4138,9 +4905,16 @@ mod h1_tests {
                 assert_eq!(sid, over);
                 assert_eq!(err, "too many streams");
             }
-            other => panic!("expected Deny over cap, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Deny over cap, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
-        assert_eq!(mux.live_streams().await, MAX_STREAMS_PER_LINK, "over-cap open must not register");
+        assert_eq!(
+            mux.live_streams().await,
+            MAX_STREAMS_PER_LINK,
+            "over-cap open must not register"
+        );
         // The denied sid is not stuck in `accepted` (can retry once room frees).
         assert!(!mux.accepted.lock().await.contains_key(&over));
     }
@@ -4165,7 +4939,11 @@ mod h1_tests {
             "duplicate register on a live sid must be refused, not overwrite"
         );
         // Table unchanged: still exactly one stream for S.
-        assert_eq!(mux.live_streams().await, 1, "refused register must not change the table");
+        assert_eq!(
+            mux.live_streams().await,
+            1,
+            "refused register must not change the table"
+        );
 
         // The ORIGINAL handle is intact: an inbound frame for S still reaches rx1,
         // proving its tx was NOT replaced by a second register's fresh channel.
@@ -4187,7 +4965,10 @@ mod h1_tests {
         let sid = L2_SID_BASE | 7;
         // A pty/mount claims S via register_stream (a path that never touches the
         // `accepted` map, so the l2-open acceptor cannot see it there).
-        let mut rx_orig = mux.register_stream(sid).await.expect("first claim succeeds");
+        let mut rx_orig = mux
+            .register_stream(sid)
+            .await
+            .expect("first claim succeeds");
         assert_eq!(mux.live_streams().await, 1);
 
         // A peer now opens an l2 forward naming the SAME sid.
@@ -4196,11 +4977,21 @@ mod h1_tests {
                 assert_eq!(dsid, sid);
                 assert_eq!(err, "sid in use");
             }
-            other => panic!("expected Deny on live-sid reuse, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Deny on live-sid reuse, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
         // Still exactly one stream, and the colliding open left no `accepted` wedge.
-        assert_eq!(mux.live_streams().await, 1, "collision must not add or replace a stream");
-        assert!(!mux.accepted.lock().await.contains_key(&sid), "denied open must not wedge `accepted`");
+        assert_eq!(
+            mux.live_streams().await,
+            1,
+            "collision must not add or replace a stream"
+        );
+        assert!(
+            !mux.accepted.lock().await.contains_key(&sid),
+            "denied open must not wedge `accepted`"
+        );
         // The surviving stream is the ORIGINAL: an inbound frame still reaches rx_orig.
         mux.on_frame(sid, Bytes::from_static(b"orig")).await;
         match rx_orig.recv().await {
@@ -4216,13 +5007,23 @@ mod h1_tests {
     #[test]
     fn wire_sid_rejects_out_of_range_and_missing() {
         // In range: parsed exactly.
-        assert_eq!(wire_sid(&json!({ "sid": 0x8000_0000u64 })), Some(0x8000_0000));
+        assert_eq!(
+            wire_sid(&json!({ "sid": 0x8000_0000u64 })),
+            Some(0x8000_0000)
+        );
         assert_eq!(wire_sid(&json!({ "sid": 0u64 })), Some(0));
         assert_eq!(wire_sid(&json!({ "sid": u32::MAX as u64 })), Some(u32::MAX));
         // The aliasing attack value: 0x1_8000_0000 must NOT become 0x8000_0000.
         let attack = 0x1_8000_0000u64;
-        assert_eq!(attack as u32, 0x8000_0000, "precondition: a bare cast truncates");
-        assert_eq!(wire_sid(&json!({ "sid": attack })), None, "oversized sid must be refused, not wrapped");
+        assert_eq!(
+            attack as u32, 0x8000_0000,
+            "precondition: a bare cast truncates"
+        );
+        assert_eq!(
+            wire_sid(&json!({ "sid": attack })),
+            None,
+            "oversized sid must be refused, not wrapped"
+        );
         // Just past the boundary is rejected, not wrapped to 0.
         assert_eq!(wire_sid(&json!({ "sid": (u32::MAX as u64) + 1 })), None);
         // Missing sid: rejected, NOT defaulted to 0.
@@ -4243,7 +5044,10 @@ mod h1_tests {
             }
         }
         assert_eq!(LIVE_PTYS.load(Ordering::SeqCst), MAX_PTYS_GLOBAL);
-        assert!(PtyGuard::try_acquire().is_none(), "must refuse at global cap");
+        assert!(
+            PtyGuard::try_acquire().is_none(),
+            "must refuse at global cap"
+        );
         let before = held.len();
         drop(held);
         assert!(LIVE_PTYS.load(Ordering::SeqCst) <= MAX_PTYS_GLOBAL - before.min(1));
@@ -4259,7 +5063,10 @@ mod h1_tests {
     }
     impl CapTransport {
         fn new() -> Arc<Self> {
-            Arc::new(CapTransport { frames: StdMutex::new(Vec::new()), controls: StdMutex::new(Vec::new()) })
+            Arc::new(CapTransport {
+                frames: StdMutex::new(Vec::new()),
+                controls: StdMutex::new(Vec::new()),
+            })
         }
         /// All bytes ever sent to `sid`, concatenated in order.
         fn bytes_for(&self, sid: u32) -> Vec<u8> {
@@ -4303,7 +5110,9 @@ mod h1_tests {
     }
     impl KillableTransport {
         fn new() -> Arc<Self> {
-            Arc::new(KillableTransport { alive: std::sync::atomic::AtomicBool::new(true) })
+            Arc::new(KillableTransport {
+                alive: std::sync::atomic::AtomicBool::new(true),
+            })
         }
         fn kill(&self) {
             self.alive.store(false, Ordering::SeqCst);
@@ -4350,11 +5159,22 @@ mod h1_tests {
         // A duplex pair: one half is the bridge's "client socket", the other we keep
         // and NEVER write to, so the reader stays parked (the deadlock precondition).
         let (client, server_side) = tokio::io::duplex(1024);
-        let bridge = tokio::spawn(serve_stream(mux.clone(), sid, server_side, rx, true, None));
+        let bridge = tokio::spawn(serve_stream(
+            mux.clone(),
+            sid,
+            server_side,
+            rx,
+            true,
+            None,
+            None,
+        ));
         tokio::time::sleep(Duration::from_millis(50)).await; // let the reader park
         t.kill(); // transport dies with no clean FIN and no client input
         let r = tokio::time::timeout(Duration::from_secs(4), bridge).await;
-        assert!(r.is_ok(), "serve_stream deadlocked on an idle client after transport death");
+        assert!(
+            r.is_ok(),
+            "serve_stream deadlocked on an idle client after transport death"
+        );
         drop(client);
     }
 
@@ -4405,6 +5225,7 @@ mod h1_tests {
             "xterm-256color",
             vec!["/bin/cat".to_string()],
             guard,
+            None,
         )
         .await
         .expect("spawn");
@@ -4414,7 +5235,10 @@ mod h1_tests {
         // Give the PTY threads + task a moment to echo and buffer.
         tokio::time::sleep(Duration::from_millis(200)).await;
         let a_out = String::from_utf8_lossy(&ta.bytes_for(sid_a)).to_string();
-        assert!(a_out.contains("before-drop"), "link A never saw the echo: {a_out:?}");
+        assert!(
+            a_out.contains("before-drop"),
+            "link A never saw the echo: {a_out:?}"
+        );
 
         // Link A drops: detach (the shell MUST keep running).
         sess.detach();
@@ -4425,22 +5249,34 @@ mod h1_tests {
         // (including "before-drop") replays to sid_b.
         let tb = CapTransport::new();
         let sid_b = L2_SID_BASE | 2;
-        let live = sessions.get_live("sess-x").await.expect("session still live for reattach");
+        let live = sessions
+            .get_live("sess-x")
+            .await
+            .expect("session still live for reattach");
         live.attach(tb.clone(), sid_b);
         tokio::time::sleep(Duration::from_millis(150)).await;
         let b_replay = String::from_utf8_lossy(&tb.bytes_for(sid_b)).to_string();
-        assert!(b_replay.contains("before-drop"), "reattach did not replay buffered output: {b_replay:?}");
+        assert!(
+            b_replay.contains("before-drop"),
+            "reattach did not replay buffered output: {b_replay:?}"
+        );
 
         // The SAME shell still works: type after reattach, see it on link B.
         live.feed_input(b"after-reconnect\n".to_vec());
         tokio::time::sleep(Duration::from_millis(200)).await;
         let b_out = String::from_utf8_lossy(&tb.bytes_for(sid_b)).to_string();
-        assert!(b_out.contains("after-reconnect"), "post-reattach input did not echo: {b_out:?}");
+        assert!(
+            b_out.contains("after-reconnect"),
+            "post-reattach input did not echo: {b_out:?}"
+        );
 
         // Explicit end kills the shell and removes the session.
         live.end();
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(sessions.get_live("sess-x").await.is_none(), "ended session must leave the store");
+        assert!(
+            sessions.get_live("sess-x").await.is_none(),
+            "ended session must leave the store"
+        );
     }
 
     /// The `port_in_use_msg` helper must surface the conflicting port and a
@@ -4449,11 +5285,26 @@ mod h1_tests {
     #[test]
     fn port_in_use_msg_names_port_and_suggests_forward() {
         let msg = port_in_use_msg(8080, "laptop", 22);
-        assert!(msg.contains("8080"), "message must name the conflicting port: {msg}");
-        assert!(msg.contains("filament forward"), "message must suggest a filament forward retry: {msg}");
-        assert!(msg.contains("8081"), "suggested port should be lport+1: {msg}");
-        assert!(msg.contains("laptop"), "message should reference the peer: {msg}");
-        assert!(msg.contains("22"), "message should reference the rport: {msg}");
+        assert!(
+            msg.contains("8080"),
+            "message must name the conflicting port: {msg}"
+        );
+        assert!(
+            msg.contains("filament forward"),
+            "message must suggest a filament forward retry: {msg}"
+        );
+        assert!(
+            msg.contains("8081"),
+            "suggested port should be lport+1: {msg}"
+        );
+        assert!(
+            msg.contains("laptop"),
+            "message should reference the peer: {msg}"
+        );
+        assert!(
+            msg.contains("22"),
+            "message should reference the rport: {msg}"
+        );
     }
 
     /// The helper's `saturating_add` must not wrap when lport is u16::MAX, so
@@ -4462,9 +5313,15 @@ mod h1_tests {
     #[test]
     fn port_in_use_msg_saturates_at_u16_max() {
         let msg = port_in_use_msg(u16::MAX, "laptop", 22);
-        assert!(msg.contains(&format!("{}", u16::MAX)), "must name the conflicting port: {msg}");
+        assert!(
+            msg.contains(&format!("{}", u16::MAX)),
+            "must name the conflicting port: {msg}"
+        );
         // u16::MAX.saturating_add(1) == u16::MAX, NOT 0.
-        assert!(!msg.contains("0 "), "saturating add must not wrap to 0: {msg}");
+        assert!(
+            !msg.contains("0 "),
+            "saturating add must not wrap to 0: {msg}"
+        );
     }
 
     // ---- warm-reuse zombie self-heal (the popos pty/ssh hang) ----------------
@@ -4484,11 +5341,17 @@ mod h1_tests {
         let t = CapTransport::new();
         let mux = Mux::new(t.clone());
 
-        let verdict =
-            open_stream_verified(&mux, 22, std::time::Duration::from_millis(50)).await;
+        let verdict = open_stream_verified(&mux, 22, std::time::Duration::from_millis(50)).await;
 
-        assert!(verdict.is_err(), "a link that delivers no inbound frame must be a zombie Err");
-        assert_eq!(mux.live_streams().await, 0, "zombie stream must be removed, not leaked");
+        assert!(
+            verdict.is_err(),
+            "a link that delivers no inbound frame must be a zombie Err"
+        );
+        assert_eq!(
+            mux.live_streams().await,
+            0,
+            "zombie stream must be removed, not leaked"
+        );
         let ctrls = t.controls.lock().unwrap();
         assert!(
             ctrls.iter().any(|c| c["type"] == "l2-open"),
@@ -4524,17 +5387,30 @@ mod h1_tests {
         };
         mux.on_frame(sid, Bytes::from_static(b"BANNER")).await;
 
-        let (got_sid, first, rx) = h.await.expect("task panicked").expect("healthy link must be Ok");
+        let (got_sid, first, rx) = h
+            .await
+            .expect("task panicked")
+            .expect("healthy link must be Ok");
         assert_eq!(got_sid, sid);
-        assert_eq!(first, Some(Bytes::from_static(b"BANNER")), "first frame must be preserved for replay");
+        assert_eq!(
+            first,
+            Some(Bytes::from_static(b"BANNER")),
+            "first frame must be preserved for replay"
+        );
 
         // serve_verified_stream replays `first` to the client verbatim.
         let (mut client, srv) = tokio::io::duplex(1024);
         let mux3 = mux.clone();
         let s = tokio::spawn(async move { serve_verified_stream(mux3, sid, srv, first, rx).await });
         let mut buf = [0u8; 6];
-        client.read_exact(&mut buf).await.expect("replayed frame must reach the client");
-        assert_eq!(&buf, b"BANNER", "the verified first frame must be replayed verbatim");
+        client
+            .read_exact(&mut buf)
+            .await
+            .expect("replayed frame must reach the client");
+        assert_eq!(
+            &buf, b"BANNER",
+            "the verified first frame must be replayed verbatim"
+        );
 
         mux.on_frame(sid, Bytes::new()).await; // peer FIN closes the writer pump
         drop(client); // client EOF closes the reader pump
@@ -4566,23 +5442,33 @@ mod h1_tests {
         // Only the acceptor's connect confirmation arrives - no app data yet.
         mux.on_open_ack(sid).await;
 
-        let (got_sid, first, rx) =
-            h.await.expect("task panicked").expect("open-ack must prove the link live");
+        let (got_sid, first, rx) = h
+            .await
+            .expect("task panicked")
+            .expect("open-ack must prove the link live");
         assert_eq!(got_sid, sid);
-        assert_eq!(first, Some(Bytes::new()), "the ack is an empty liveness marker");
+        assert_eq!(
+            first,
+            Some(Bytes::new()),
+            "the ack is an empty liveness marker"
+        );
 
         // Replaying the empty ack writes nothing; real app data (sent only after the
         // client would have spoken) still reaches the client intact.
         let (mut client, srv) = tokio::io::duplex(1024);
         let mux3 = mux.clone();
         let s = tokio::spawn(async move { serve_verified_stream(mux3, sid, srv, first, rx).await });
-        mux.on_frame(sid, Bytes::from_static(b"HTTP/1.1 200 OK")).await;
+        mux.on_frame(sid, Bytes::from_static(b"HTTP/1.1 200 OK"))
+            .await;
         let mut buf = [0u8; 15];
         client
             .read_exact(&mut buf)
             .await
             .expect("real data must reach the client after the empty ack");
-        assert_eq!(&buf, b"HTTP/1.1 200 OK", "the empty ack must not corrupt the stream");
+        assert_eq!(
+            &buf, b"HTTP/1.1 200 OK",
+            "the empty ack must not corrupt the stream"
+        );
 
         mux.on_frame(sid, Bytes::new()).await;
         drop(client);

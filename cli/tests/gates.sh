@@ -33,7 +33,19 @@ if [ -n "${FILAMENT_GATE_RELEASE:-}" ]; then
 else
   GATE_PROFILE_DIR=debug; GATE_BUILD_FLAG=
 fi
-BIN="$CLI_DIR/target/$GATE_PROFILE_DIR/filament"
+# #249: this assumed cargo writes to cli/target, which is false on any machine
+# that sets `target-dir` (this one shares /root/.cargo-target across worktrees,
+# see ~/.cargo/config.toml). The build step below then SUCCEEDED while every gate
+# tried to exec a path that does not exist: "1 passed, 31 failed", each failure
+# reading `No such file or directory` rather than naming the cause. Ask cargo
+# where it actually writes instead of assuming.
+_target_dir() {
+    ( cd "$CLI_DIR" && cargo metadata --format-version 1 --no-deps 2>/dev/null ) \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null \
+      || echo "$CLI_DIR/target"
+}
+GATE_TARGET_DIR="${CARGO_TARGET_DIR:-$(_target_dir)}"
+BIN="$GATE_TARGET_DIR/$GATE_PROFILE_DIR/filament"
 SERVER="${FILAMENT_TEST_SERVER:-http://127.0.0.1:8077}"
 WORK="${FILAMENT_TEST_WORK:-$(mktemp -d /tmp/filament-gates.XXXXXX)}"
 WITH_RELAY=0
@@ -49,6 +61,35 @@ say()  { printf '\n\033[1m== gate %s ==\033[0m\n' "$*"; }
 ok()   { echo "PASS: $1"; PASS=$((PASS+1)); }
 bad()  { echo "FAIL: $1"; FAIL=$((FAIL+1)); FAILED_GATES="$FAILED_GATES $1"; }
 hashof() { sha256sum "$1" | cut -d' ' -f1; }
+# `kill -9 <pid>` on a `timeout`-wrapped background job kills only the wrapper.
+# SIGKILL cannot be caught, so timeout never forwards it and the real process is
+# ORPHANED. Measured: gate 11b's second receiver survived every run and was
+# still resident hours later, twice. Send TERM first, which timeout DOES
+# forward, give it a moment, then SIGKILL the wrapper and any surviving child.
+kill_tree() {
+  local pid
+  for pid in "$@"; do
+    [ -n "$pid" ] || continue
+    kill -TERM "$pid" 2>/dev/null
+  done
+  sleep 0.5
+  for pid in "$@"; do
+    [ -n "$pid" ] || continue
+    pkill -9 -P "$pid" 2>/dev/null
+    kill -9 "$pid" 2>/dev/null
+  done
+}
+
+wait_for_exit() {
+  local pid="$1" seconds="$2" i
+  for i in $(seq 1 $((seconds * 2))); do
+    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return; }
+    sleep 0.5
+  done
+  kill "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  return 124
+}
 # L1-a: a `send --word <phrase>` now mints its OWN numeric nameplate (the phrase
 # is only the SPAKE2 password), so the receiver must claim the FULL minted code,
 # not the spoken phrase. CODE_WORD is a valid 2-word phrase (clears the >=2-word
@@ -74,7 +115,22 @@ trap cleanup EXIT
 # a timing-window lottery ('slow-down' flakes). Pinning it makes the claim
 # path deterministic. (Set FILAMENT_TEST_SERVER to point at an external
 # server and skip the autostart — but then you own the claim limit.)
-PYV0="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+# #249: this used to default to a hardcoded venv inside a job directory
+# (/root/.claude/jobs/330c2366/...) that no longer exists. The autostart below is
+# gated on `-x "$PYV0"`, so a missing interpreter SKIPPED the backend silently
+# and the run died two lines later on "no backend at ...", which reads as an
+# environment problem rather than a stale path in this script. That is a large
+# part of why the deterministic core has not been runnable, let alone wired into
+# CI. Prefer the override, then a venv if one is present, then whatever python3
+# is on PATH; the backend's deps are ordinary (flask, flask-socketio, eventlet).
+_pick_python() {
+    if [ -n "${FILAMENT_TEST_VENV:-}" ]; then echo "$FILAMENT_TEST_VENV"; return; fi
+    for c in "$CLI_DIR/../backend/.venv/bin/python" "$CLI_DIR/../.venv/bin/python"; do
+        [ -x "$c" ] && { echo "$c"; return; }
+    done
+    command -v python3 2>/dev/null || echo python3
+}
+PYV0="$(_pick_python)"
 OWN_BACKEND=""
 if [ -z "${FILAMENT_TEST_SERVER:-}" ] && [ -x "$PYV0" ]; then
   for pid in $(ss -tlnp 2>/dev/null | grep ":8077 " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
@@ -86,10 +142,26 @@ if [ -z "${FILAMENT_TEST_SERVER:-}" ] && [ -x "$PYV0" ]; then
   OWN_BACKEND=$!
   for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
 fi
-curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; exit 2; }
+curl -fsS "$SERVER/api/health" >/dev/null || {
+  echo "no backend at $SERVER"
+  echo "  interpreter tried: $PYV0"
+  [ -n "$OWN_BACKEND" ] && { echo "  it was started; its log:"; sed 's/^/    /' "$WORK/fixture-backend.log" 2>/dev/null | tail -8; } \
+                        || echo "  autostart was SKIPPED: that interpreter is not executable"
+  exit 2
+}
 # These gates drive env-gated test hooks (FILAMENT_TEST_*), which now ship ONLY
 # in a `--features test-hooks` build (stripped from default/release).
 ( cd "$CLI_DIR" && cargo build $GATE_BUILD_FLAG --features test-hooks -q ) || { echo "build failed"; exit 2; }
+# Assert the binary the gates will EXEC exists, rather than discovering it 31
+# failures later. A build that succeeded says nothing about where this script
+# then looks.
+[ -x "$BIN" ] || {
+  echo "built, but no executable at the path the gates use:"
+  echo "  BIN=$BIN"
+  echo "  target dir resolved to: $GATE_TARGET_DIR"
+  exit 2
+}
+echo "gates: using $BIN"
 
 # The browser gates load frontend/dist via the LOCAL backend, so the bundle
 # must be SAME-ORIGIN. `npm run build` bakes frontend/.env.production
@@ -112,7 +184,7 @@ H_SMALL=$(hashof "$SMALL"); H_BIG=$(hashof "$BIG")
 # ---------------------------------------------------------------- gate 0 ----
 say "0: unit tests"
 if ( cd "$CLI_DIR" && cargo test -q ) >"$WORK/g0.log" 2>&1; then ok "unit tests"; else bad "unit tests"; tail -n 5 "$WORK/g0.log"; fi
-PYV="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+PYV="$PYV0"
 if [ -x "$PYV" ]; then
   if ( cd "$CLI_DIR/.." && "$PYV" -m unittest backend.tests.test_pair_codes ) >"$WORK/g0b.log" 2>&1; then
     ok "pair-code variance/security tests"
@@ -125,7 +197,7 @@ D="$WORK/g1"; mkdir -p "$D"
 "$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g1-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g1-send.log") || { bad "code transfer (no code minted)"; tail -n 3 "$WORK/g1-send.log"; }
-if [ -n "${W:-}" ] && timeout 90 "$BIN" recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g1-recv.log" 2>&1 \
+if [ -n "${W:-}" ] && timeout 90 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g1-recv.log" 2>&1 \
    && wait $SP && [ "$(hashof "$D/small.bin")" = "$H_SMALL" ]; then
   ok "code transfer, hashes match, clean exits"
 else bad "code transfer"; tail -n 3 "$WORK/g1-send.log" "$WORK/g1-recv.log"; fi
@@ -135,7 +207,7 @@ if [ "$(grep -hc 'route: local' "$WORK/g1-send.log" "$WORK/g1-recv.log" | paste 
    && ! grep -hq "route: relayed" "$WORK/g1-send.log" "$WORK/g1-recv.log"; then
   ok "route detection: local on both ends, no false relayed"
 else bad "route detection"; grep -h "route:" "$WORK/g1-send.log" "$WORK/g1-recv.log"; fi
-if timeout 30 "$BIN" recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g1-burn.log" 2>&1; then
+if timeout 30 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g1-burn.log" 2>&1; then
   bad "code burn (second claim was accepted!)"
 else
   grep -q "code rejected" "$WORK/g1-burn.log" && ok "code burns on first use" || { bad "code burn (wrong error)"; tail -n 2 "$WORK/g1-burn.log"; }
@@ -147,21 +219,39 @@ D="$WORK/g2"; mkdir -p "$D"
 "$BIN" send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g2-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g2-send.log") || { bad "kill-resume (no code minted)"; tail -n 3 "$WORK/g2-send.log"; }
-"$BIN" recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv1.log" 2>&1 &
+"$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv1.log" 2>&1 &
 R1=$!; pids+=($R1)
 for _ in $(seq 1 60); do
   sz=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
   [ "$sz" -gt $((10 * 1024 * 1024)) ] && break
   sleep 0.5
 done
+# NOT kill_tree: this receiver is started WITHOUT a timeout wrapper, so $R1 is
+# the real process and SIGKILL reaches it. kill_tree sends SIGTERM first, which
+# `filament receive` handles gracefully and uses to clean up its partial file,
+# leaving nothing for the resume half of this gate to resume from. The gate
+# needs an abrupt death, which is the whole premise of "receiver killed
+# mid-transfer". Regression from #287, whose commit message claimed it touched
+# only timeout-wrapped sites; this one is not, and I did not check before
+# changing it.
 kill -9 $R1 2>/dev/null; wait $R1 2>/dev/null
-echo "(killed receiver at $(stat -c %s "$D/big.bin.part" 2>/dev/null || echo '?') bytes)"
+# This used to render a missing .part as a bare `?` inside a success-path echo,
+# and it fired for five consecutive runs while reading as cosmetic. If there is
+# no partial file at the instant we have just killed a receiver mid-transfer,
+# the gate's PREMISE has already failed and everything after it measures
+# nothing. Fail here, loudly, instead of resuming from a file that is not there.
+G2SZ=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
+echo "(killed receiver at ${G2SZ} bytes)"
+if [ "$G2SZ" -eq 0 ]; then
+  bad "kill-resume: no partial file to resume from (receiver wrote nothing, or cleaned up on exit)"
+  tail -n 3 "$WORK/g2-recv1.log" 2>/dev/null
+fi
 sleep 2
 # The "resuming at" line is a DEBUG (resilience-internal) message, so the
 # replacement receiver runs with -v to surface it for the assertion below. The
 # resume itself is verbosity-independent (the sender re-offers from the saved
 # offset); -v only makes the proof visible.
-timeout 180 "$BIN" -v recv -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv2.log" 2>&1
+timeout 180 "$BIN" -v receive -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv2.log" 2>&1
 RC2=$?
 wait $SP; RCS=$?
 if [ $RC2 -eq 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ] \
@@ -178,7 +268,7 @@ printf '{"size":%s,"head":"00deadbeef"}' "$(stat -c %s "$SMALL")" > "$D/small.bi
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g3-send.log") || { bad "corruption guard (no code minted)"; tail -n 3 "$WORK/g3-send.log"; }
 # "different content" is a DEBUG (resilience-internal) line, so -v surfaces it.
-if [ -n "${W:-}" ] && timeout 90 "$BIN" -v recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g3-recv.log" 2>&1 \
+if [ -n "${W:-}" ] && timeout 90 "$BIN" -v receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g3-recv.log" 2>&1 \
    && wait $SP && [ "$(hashof "$D/small.bin")" = "$H_SMALL" ] \
    && grep -q "different content" "$WORK/g3-recv.log"; then
   ok "head mismatch detected, restarted from 0, hash matches"
@@ -188,16 +278,17 @@ else bad "corruption guard"; tail -n 3 "$WORK/g3-recv.log"; fi
 say "4: directory tar + stdin pipe"
 D="$WORK/g4"; mkdir -p "$D" "$WORK/srcdir/sub"
 echo "hello" > "$WORK/srcdir/a.txt"; head -c 1048576 /dev/urandom > "$WORK/srcdir/sub/b.bin"
-"$BIN" recv -y --dir "$D" --server "$SERVER" >"$WORK/g4-recv.log" 2>&1 &
+R4="g4room$$"
+"$BIN" receive -y --dir "$D" --room "$R4" --server "$SERVER" >"$WORK/g4-recv.log" 2>&1 &
 R=$!; pids+=($R); sleep 3
 G4=0
-timeout 60 "$BIN" send "$WORK/srcdir" --server "$SERVER" >"$WORK/g4-send.log" 2>&1 || G4=1
-wait $R 2>/dev/null
+timeout 60 "$BIN" send "$WORK/srcdir" --room "$R4" --server "$SERVER" >"$WORK/g4-send.log" 2>&1 || G4=1
+wait_for_exit $R 30 || G4=1
 tar tf "$D/srcdir.tar" >/dev/null 2>&1 || G4=1
-"$BIN" recv -y --dir "$D" --server "$SERVER" >"$WORK/g4b-recv.log" 2>&1 &
+"$BIN" receive -y --dir "$D" --room "$R4" --server "$SERVER" >"$WORK/g4b-recv.log" 2>&1 &
 R=$!; pids+=($R); sleep 3
-echo "pipe payload" | timeout 60 "$BIN" send - --name note.txt --server "$SERVER" >"$WORK/g4b-send.log" 2>&1 || G4=1
-wait $R 2>/dev/null
+echo "pipe payload" | timeout 60 "$BIN" send - --name note.txt --room "$R4" --server "$SERVER" >"$WORK/g4b-send.log" 2>&1 || G4=1
+wait_for_exit $R 30
 [ "$(cat "$D/note.txt" 2>/dev/null)" = "pipe payload" ] || G4=1
 [ $G4 -eq 0 ] && ok "dir tar + stdin round-trip" || bad "dir/stdin"
 
@@ -225,7 +316,7 @@ if [ -z "${SKIP_BROWSER:-}" ] && [ -d "$HERE/node_modules/playwright" ]; then
   head -c $((4 * 1024 * 1024)) /dev/urandom > "$FA"
   head -c $((1024 * 1024)) /dev/urandom > "$FB"
   RM6="g6room$$"
-  timeout 240 "$BIN" recv -y --dir "$D" --room "$RM6" --server "$SERVER" >"$WORK/g6-recv.log" 2>&1 &
+  timeout 240 "$BIN" receive -y --dir "$D" --room "$RM6" --server "$SERVER" >"$WORK/g6-recv.log" 2>&1 &
   R=$!; pids+=($R); sleep 2
   G6=0
   ( cd "$HERE" && timeout 200 node browser-sender.js "$SERVER/rooms/$RM6" "$FA" "$FB" >"$WORK/g6-pw.log" 2>&1 ) || G6=1
@@ -242,9 +333,9 @@ fi
 # ---------------------------------------------------------------- gate 7 ----
 say "7: --to peer selection (C13)"
 DA="$WORK/g7-alice"; DB="$WORK/g7-bob"; mkdir -p "$DA" "$DB"
-USER=alice "$BIN" recv -y --to charlie --dir "$DA" --server "$SERVER" >"$WORK/g7-alice.log" 2>&1 &
+USER=alice "$BIN" receive -y --to charlie --dir "$DA" --server "$SERVER" >"$WORK/g7-alice.log" 2>&1 &
 RA=$!; pids+=($RA)
-USER=bob timeout 120 "$BIN" recv -y --dir "$DB" --server "$SERVER" >"$WORK/g7-bob.log" 2>&1 &
+USER=bob timeout 120 "$BIN" receive -y --dir "$DB" --server "$SERVER" >"$WORK/g7-bob.log" 2>&1 &
 RB=$!; pids+=($RB); sleep 3
 G7=0
 timeout 60 "$BIN" send "$SMALL" --to bob --server "$SERVER" >"$WORK/g7-send.log" 2>&1 || G7=1
@@ -256,13 +347,20 @@ else bad "--to selection"; tail -n 3 "$WORK/g7-send.log"; fi
 # ---------------------------------------------------------------- gate 8 ----
 say "8: consent — no tty, no -y declines (C14)"
 D="$WORK/g8"; mkdir -p "$D"
-"$BIN" recv --dir "$D" --server "$SERVER" </dev/null >"$WORK/g8-recv.log" 2>&1 &
+R8="g8room$$"
+"$BIN" receive --dir "$D" --room "$R8" --server "$SERVER" </dev/null >"$WORK/g8-recv.log" 2>&1 &
 R=$!; pids+=($R); sleep 3
 G8=0
-timeout 60 "$BIN" send "$SMALL" --server "$SERVER" >"$WORK/g8-send.log" 2>&1 || G8=1
+timeout 60 "$BIN" send "$SMALL" --room "$R8" --server "$SERVER" >"$WORK/g8-send.log" 2>&1; G8=$?
 kill $R 2>/dev/null
-if [ $G8 -eq 0 ] && grep -q "declined" "$WORK/g8-send.log" && [ ! -e "$D/small.bin" ]; then
-  ok "offer declined without consent; sender exited cleanly"
+# #274: a send whose every file was declined now exits NONZERO and suppresses
+# the completion line. This gate used to require exit 0 while printing
+# "declined", which is precisely the contract #274 called a bug: a script could
+# not tell a delivered transfer from a refused one. Asserting 1 specifically,
+# not merely nonzero, so a `timeout` kill (124) cannot satisfy this gate.
+if [ $G8 -eq 1 ] && grep -q "declined" "$WORK/g8-send.log" \
+   && grep -q "no files delivered" "$WORK/g8-send.log" && [ ! -e "$D/small.bin" ]; then
+  ok "offer declined without consent; sender reported the decline and exited 1"
 else bad "consent decline"; tail -n 3 "$WORK/g8-send.log" "$WORK/g8-recv.log"; fi
 
 # ---------------------------------------------------------------- gate 9 ----
@@ -273,13 +371,14 @@ say "9: bulk transfer completes (C8a backpressure regression guard)"
 # = ~0.33 MB/s; a working transfer beats that by 20-50x even under heavy
 # load). Speed is logged, never asserted.
 D="$WORK/g9"; mkdir -p "$D"
-"$BIN" recv -y --dir "$D" --server "$SERVER" >"$WORK/g9-recv.log" 2>&1 &
+R9="g9room$$"
+"$BIN" receive -y --dir "$D" --room "$R9" --server "$SERVER" >"$WORK/g9-recv.log" 2>&1 &
 R=$!; pids+=($R); sleep 3
 T0=$(date +%s.%N)
-timeout 240 "$BIN" send "$BIG" --server "$SERVER" >"$WORK/g9-send.log" 2>&1
+timeout 240 "$BIN" send "$BIG" --room "$R9" --server "$SERVER" >"$WORK/g9-send.log" 2>&1
 RC=$?
 T1=$(date +%s.%N)
-wait $R 2>/dev/null
+wait_for_exit $R 30
 RATE=$(python3 -c "print(f'{80/max(($T1-$T0)-4.5,0.1):.1f}')")
 echo "(~${RATE} MB/s effective — informational, not asserted)"
 if [ $RC -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ]; then
@@ -293,7 +392,7 @@ kill_port() { # fixture backends (werkzeug reloader forks; kill by port)
   done
 }
 kill_8078() { kill_port 8078; }
-VENV_PY="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+VENV_PY="$PYV0"
 
 # --------------------------------------------------------------- gate 12 ----
 # C1 against PRODUCTION's config: a backend serving chunkSize 65536 makes the
@@ -311,7 +410,7 @@ if [ -z "${SKIP_BROWSER:-}" ] && [ -d "$HERE/node_modules/playwright" ] && [ -x 
   FA="$WORK/g12-a.bin"; FB="$WORK/g12-b.bin"
   head -c $((4 * 1024 * 1024)) /dev/urandom > "$FA"; head -c $((1024 * 1024)) /dev/urandom > "$FB"
   RM="g12room$$"
-  timeout 240 "$BIN" recv -y --dir "$D" --room "$RM" --server http://127.0.0.1:8079 >"$WORK/g12-recv.log" 2>&1 &
+  timeout 240 "$BIN" receive -y --dir "$D" --room "$RM" --server http://127.0.0.1:8079 >"$WORK/g12-recv.log" 2>&1 &
   R=$!; pids+=($R); sleep 2
   G12=0
   ( cd "$HERE" && timeout 200 node browser-sender.js "http://127.0.0.1:8079/rooms/$RM" "$FA" "$FB" >"$WORK/g12-pw.log" 2>&1 ) || G12=1
@@ -325,7 +424,7 @@ else
   echo "SKIP (needs playwright + backend venv)"
 fi
 
-if [ $WITH_RELAY -eq 1 ]; then
+if [ $WITH_RELAY -eq 1 ] && [ -x "$PYV0" ] && command -v docker >/dev/null 2>&1; then
   say "10: TURN relay path + route detection (C2/C17, docker coturn)"
   kill_8078; sleep 1
   TS=testsecret$RANDOM
@@ -335,7 +434,7 @@ if [ $WITH_RELAY -eq 1 ]; then
         --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 --listening-port=3478 \
         --static-auth-secret="$TS" --realm=filament.test --no-tls --no-dtls \
         --allow-loopback-peers --cli-password=x 2>/dev/null)
-  VENV_PY="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+  VENV_PY="$PYV0"
   ( cd "$CLI_DIR/../backend" && PORT=8078 FIL_TURN_HOST="turn:127.0.0.1:3478" FIL_TURN_SECRET="$TS" \
       "$VENV_PY" app.py >"$WORK/g10-backend.log" 2>&1 ) &
   BK=$!; pids+=($BK); sleep 4
@@ -344,7 +443,7 @@ if [ $WITH_RELAY -eq 1 ]; then
   SP=$!; pids+=($SP)
   W=$(wait_code "$WORK/g10-send.log") || { bad "relay (no code minted)"; tail -n 3 "$WORK/g10-send.log"; }
   G10=0
-  timeout 120 "$BIN" recv "$W" -y --relay --dir "$D" --server http://127.0.0.1:8078 >"$WORK/g10-recv.log" 2>&1 || G10=1
+  timeout 120 "$BIN" receive "$W" -y --relay --dir "$D" --server http://127.0.0.1:8078 >"$WORK/g10-recv.log" 2>&1 || G10=1
   wait $SP || G10=1
   kill $BK 2>/dev/null; kill_8078; docker stop "$CT" >/dev/null 2>&1
   # relay-only ICE policy guarantees the path; the route line is reporting.
@@ -354,6 +453,15 @@ if [ $WITH_RELAY -eq 1 ]; then
      && grep -hq "route: relayed" "$WORK/g10-send.log" "$WORK/g10-recv.log"; then
     ok "relayed transfer via coturn; route: relayed reported"
   else bad "relay"; tail -n 3 "$WORK/g10-send.log" "$WORK/g10-recv.log"; fi
+elif [ $WITH_RELAY -eq 1 ]; then
+  # Was a FAILURE, not a skip. The gate launched its backend with a hardcoded
+  # interpreter path from a job directory that no longer exists, so it reported
+  # "relay (no code minted)" and "relay" when the truth was that no python ever
+  # ran. Gate 12 guarded on -x and skipped cleanly; this one did not, and three
+  # of the fourteen failures in the first complete run were that one missing
+  # file. A gate that cannot run must say so, not invent a product failure.
+  say "10: TURN relay path + route detection (C2/C17, docker coturn)"
+  echo "SKIP (needs a usable python and docker; set FILAMENT_TEST_VENV to point at one)"
 fi
 
 # --------------------------------------------------------------- gate 11 ----
@@ -368,7 +476,7 @@ D="$WORK/g11"; mkdir -p "$D"
 FILAMENT_ADOPT_ACTIVE_MS=500 "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g11-send.log") || { bad "uid supersede (no code minted)"; tail -n 3 "$WORK/g11-send.log"; }
-FILAMENT_UID="samedevice$$" "$BIN" recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv1.log" 2>&1 &
+FILAMENT_UID="samedevice$$" "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv1.log" 2>&1 &
 R1=$!; pids+=($R1)
 for _ in $(seq 1 60); do
   sz=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
@@ -381,7 +489,7 @@ done
 kill -STOP $R1 2>/dev/null
 sleep 3   # > FILAMENT_ADOPT_ACTIVE_MS so the frozen link reads as idle (#28)
 # -v on the replacement: "resuming at" is a DEBUG (resilience-internal) line.
-FILAMENT_UID="samedevice$$" timeout 180 "$BIN" -v recv -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv2.log" 2>&1
+FILAMENT_UID="samedevice$$" timeout 180 "$BIN" -v receive -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv2.log" 2>&1
 RC2=$?
 # bounded wait: a hung sender must fail the gate, not the whole suite
 RCS=99
@@ -408,7 +516,7 @@ D1B="$WORK/g11b1"; D2B="$WORK/g11b2"; mkdir -p "$D1B" "$D2B"
 "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11b-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W2=$(wait_code "$WORK/g11b-send.log") || { bad "flow-preserve (no code minted)"; tail -n 3 "$WORK/g11b-send.log"; }
-FILAMENT_UID="livedev$$" "$BIN" recv "$W2" -y --dir "$D1B" --server "$SERVER" >"$WORK/g11b-recv1.log" 2>&1 &
+FILAMENT_UID="livedev$$" "$BIN" receive "$W2" -y --dir "$D1B" --server "$SERVER" >"$WORK/g11b-recv1.log" 2>&1 &
 R1=$!; pids+=($R1)
 for _ in $(seq 1 60); do
   sz=$(stat -c %s "$D1B/big.bin.part" 2>/dev/null || echo 0)
@@ -417,11 +525,18 @@ for _ in $(seq 1 60); do
 done
 # Same device rejoins (same uid, new sid) while R1 keeps flowing — must NOT
 # supersede. R1 is left running; R2 is a never-adopted bystander we reap.
-FILAMENT_UID="livedev$$" timeout 120 "$BIN" recv -y --dir "$D2B" --server "$SERVER" >"$WORK/g11b-recv2.log" 2>&1 &
+FILAMENT_UID="livedev$$" timeout 120 "$BIN" receive -y --dir "$D2B" --server "$SERVER" >"$WORK/g11b-recv2.log" 2>&1 &
 R2B=$!; pids+=($R2B)
 RCS=99
 for _ in $(seq 1 120); do kill -0 $SP 2>/dev/null || { wait $SP; RCS=$?; break; }; sleep 1; done
-kill -9 $R1 $R2B 2>/dev/null
+# MIXED PAIR, deliberately. $R1 is unwrapped and $R2B is timeout-wrapped, so
+# only the second needs kill_tree's TERM-first forwarding. SIGTERM on $R1 is
+# safe HERE because this is teardown after the assertion loop has already waited
+# out $SP: R1 is deliberately left running as the surviving link and R2 is a
+# never-adopted bystander, so neither death is load-bearing. That is the fact
+# that makes it safe, and it was unwritten until now. Contrast gate 2, where an
+# abrupt kill IS the premise and TERM-first broke it.
+kill_tree $R1 $R2B
 # True positive: assert the sender SAW the reconnect and DELIBERATELY kept the
 # link ("keeping active link") — not merely the absence of a supersede line,
 # which a never-arriving R2 would also produce.
@@ -462,7 +577,7 @@ FILAMENT_TEST_INJECT_PEER_LEFT=$INJC FILAMENT_TEST_NO_DEFER=1 \
   "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11ca-send.log" 2>&1 &
 SPA=$!; pids+=($SPA)
 WCA=$(wait_code "$WORK/g11ca-send.log") || { bad "deferred-drop (no code minted)"; tail -n 3 "$WORK/g11ca-send.log"; }
-timeout 90 "$BIN" recv "$WCA" -y --dir "$DCA" --server "$SERVER" >"$WORK/g11ca-recv.log" 2>&1
+timeout 90 "$BIN" receive "$WCA" -y --dir "$DCA" --server "$SERVER" >"$WORK/g11ca-recv.log" 2>&1
 RCA=$?
 RCSA=99; for _ in $(seq 1 60); do kill -0 $SPA 2>/dev/null || { wait $SPA; RCSA=$?; break; }; sleep 1; done
 kill -9 $SPA 2>/dev/null
@@ -474,7 +589,7 @@ FILAMENT_TEST_INJECT_PEER_LEFT=$INJC \
   "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11c-send.log" 2>&1 &
 SPB=$!; pids+=($SPB)
 WC=$(wait_code "$WORK/g11c-send.log") || { bad "deferred-drop (no code minted)"; tail -n 3 "$WORK/g11c-send.log"; }
-timeout 120 "$BIN" recv "$WC" -y --dir "$DC" --server "$SERVER" >"$WORK/g11c-recv.log" 2>&1
+timeout 120 "$BIN" receive "$WC" -y --dir "$DC" --server "$SERVER" >"$WORK/g11c-recv.log" 2>&1
 RCB=$?
 RCSB=99; for _ in $(seq 1 150); do kill -0 $SPB 2>/dev/null || { wait $SPB; RCSB=$?; break; }; sleep 1; done
 kill -9 $SPB 2>/dev/null
@@ -508,7 +623,7 @@ DA="$WORK/g14a"; DB="$WORK/g14b"; DD="$WORK/g14drop"; mkdir -p "$DA" "$DB" "$DD"
 FILAMENT_CONFIG_DIR="$DA" "$BIN" send "$SMALL" --word "$CODE_WORD" --remember boxB --server "$SERVER" >"$WORK/g14-s1.log" 2>&1 &
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g14-s1.log") || { bad "daemon (no code minted)"; tail -n 3 "$WORK/g14-s1.log"; }
-FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/g14-r1.log" 2>&1
+FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" receive "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/g14-r1.log" 2>&1
 wait $SP
 FILAMENT_CONFIG_DIR="$DB" timeout 90 "$BIN" up --dir "$DD" --server "$SERVER" >"$WORK/g14-up.log" 2>&1 &
 UP=$!; pids+=($UP); sleep 3
@@ -530,7 +645,7 @@ W=$(wait_code "$WORK/g15-send.log") || { bad "stepped-away wait (no code minted)
 T0=$(date +%s)
 # no -y and no tty -> the offer is declined -> sender exits -> peer-left with
 # nothing received; the OLD behavior bailed instantly, C21 holds the line.
-FILAMENT_REJOIN_SECS=8 timeout 60 "$BIN" recv "$W" --dir "$D" --server "$SERVER" </dev/null >"$WORK/g15-recv.log" 2>&1
+FILAMENT_REJOIN_SECS=8 timeout 60 "$BIN" receive "$W" --dir "$D" --server "$SERVER" </dev/null >"$WORK/g15-recv.log" 2>&1
 RC=$?
 T1=$(date +%s)
 wait $SP 2>/dev/null
@@ -577,11 +692,11 @@ fi
 
 say "17: pair ceremony — no file, both stores hold the SAME secret (C29)"
 DA17="$WORK/g17a"; DB17="$WORK/g17b"; mkdir -p "$DA17" "$DB17"
-FILAMENT_CONFIG_DIR="$DA17" timeout 90 "$BIN" pair --name boxB --server "$SERVER" >"$WORK/g17-a.log" 2>&1 &
+FILAMENT_CONFIG_DIR="$DA17" timeout 90 "$BIN" add --name boxB --server "$SERVER" >"$WORK/g17-a.log" 2>&1 &
 P17=$!; pids+=($P17); sleep 4
 C17=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17-a.log" | head -1 | tr 'A-Z' 'a-z')
 G17=0
-FILAMENT_CONFIG_DIR="$DB17" timeout 90 "$BIN" pair "$C17" --name boxA --server "$SERVER" >"$WORK/g17-b.log" 2>&1 || G17=1
+FILAMENT_CONFIG_DIR="$DB17" timeout 90 "$BIN" add "$C17" --name boxA --server "$SERVER" >"$WORK/g17-b.log" 2>&1 || G17=1
 wait $P17 || G17=1
 CHA=$(FILAMENT_CONFIG_DIR="$DA17" "$BIN" devices | grep -oE 'channel [0-9a-f]+' | head -1)
 CHB=$(FILAMENT_CONFIG_DIR="$DB17" "$BIN" devices | grep -oE 'channel [0-9a-f]+' | head -1)
@@ -596,12 +711,12 @@ say "17b: pair ceremony fails FAST when it can't complete (no 10-min orphan)"
 # the budget (shortened to 5s) must bail it with a clear message — NOT the
 # 600s code TTL, and well under the 90s timeout backstop.
 DC="$WORK/g17c"; mkdir -p "$DC/a" "$DC/b"
-FILAMENT_CONFIG_DIR="$DC/a" timeout 120 "$BIN" pair --name gone --server "$SERVER" >"$WORK/g17c-a.log" 2>&1 &
+FILAMENT_CONFIG_DIR="$DC/a" timeout 120 "$BIN" add --name gone --server "$SERVER" >"$WORK/g17c-a.log" 2>&1 &
 CR=$!; pids+=($CR); sleep 4
 CX=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17c-a.log" | head -1 | tr 'A-Z' 'a-z')
 T0=$(date +%s)
 FILAMENT_TEST_PAIR_STALL=1 FILAMENT_PAIR_GRACE_SECS=5 FILAMENT_CONFIG_DIR="$DC/b" \
-  timeout 90 "$BIN" pair "$CX" --name orphan --server "$SERVER" >"$WORK/g17c-b.log" 2>&1
+  timeout 90 "$BIN" add "$CX" --name orphan --server "$SERVER" >"$WORK/g17c-b.log" 2>&1
 RC=$?; T1=$(date +%s)
 kill $CR 2>/dev/null; wait $CR 2>/dev/null
 if [ $RC -ne 0 ] && [ $((T1 - T0)) -lt 30 ] \
@@ -638,7 +753,7 @@ W=$(wait_code "$WORK/g18-send.log") || { bad "quiet-exit (G-k) (no code minted)"
   done ) &
 T0=$(date +%s)
 FILAMENT_TEST_DROP_PEER_LEFT=1 FILAMENT_QUIET_EXIT_SECS=3 \
-  timeout 120 "$BIN" recv "$W" -y --dir "$D" --server "$SERVER" </dev/null >"$WORK/g18-recv.log" 2>&1
+  timeout 120 "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" </dev/null >"$WORK/g18-recv.log" 2>&1
 RC=$?
 T1=$(date +%s)
 kill -9 $SP 2>/dev/null; wait $SP 2>/dev/null
@@ -686,7 +801,7 @@ WA=$(wait_code "$WORK/g18ba-send.log") || { bad "gate-18b Mode B (no code minted
 ( sleep 6; kill -9 $SPA 2>/dev/null ) &   # sender departs after delivering the file
 FILAMENT_TEST_DISABLE_MODEB_DROP=1 FILAMENT_TEST_CHURN_AFTER_COMPLETE=1 \
   FILAMENT_TEST_DROP_PEER_LEFT=1 FILAMENT_QUIET_EXIT_SECS=2 \
-  timeout 30 "$BIN" -v recv "$WA" -y --dir "$DA" --server "$SERVER" </dev/null >"$WORK/g18ba-recv.log" 2>&1
+  timeout 30 "$BIN" -v receive "$WA" -y --dir "$DA" --server "$SERVER" </dev/null >"$WORK/g18ba-recv.log" 2>&1
 RCA=$?
 kill -9 $SPA 2>/dev/null; wait $SPA 2>/dev/null
 # Baseline MUST hang (RC=124) yet still have the bytes on disk (it's the EXIT
@@ -703,7 +818,7 @@ WB=$(wait_code "$WORK/g18bb-send.log") || { bad "gate-18b Mode B (no code minted
 T0=$(date +%s)
 ( sleep 6; kill -9 $SPB 2>/dev/null ) &
 FILAMENT_TEST_CHURN_AFTER_COMPLETE=1 FILAMENT_TEST_DROP_PEER_LEFT=1 FILAMENT_QUIET_EXIT_SECS=2 \
-  timeout 30 "$BIN" -v recv "$WB" -y --dir "$DB" --server "$SERVER" </dev/null >"$WORK/g18bb-recv.log" 2>&1
+  timeout 30 "$BIN" -v receive "$WB" -y --dir "$DB" --server "$SERVER" </dev/null >"$WORK/g18bb-recv.log" 2>&1
 RCB=$?
 T1=$(date +%s)
 kill -9 $SPB 2>/dev/null; wait $SPB 2>/dev/null
@@ -727,11 +842,11 @@ say "19: gate L — lossy session emits still converge (C30; loss=0.5 seed=16)"
 # bugs by hand before becoming a gate (a tick starved behind a blocking
 # 600s read; see C30 in the ledger).
 DA19="$WORK/g19a"; DB19="$WORK/g19b"; D19="$WORK/g19"; mkdir -p "$DA19" "$DB19" "$D19"
-FILAMENT_CONFIG_DIR="$DA19" timeout 90 "$BIN" pair --name boxB --server "$SERVER" >"$WORK/g19-pa.log" 2>&1 &
+FILAMENT_CONFIG_DIR="$DA19" timeout 90 "$BIN" add --name boxB --server "$SERVER" >"$WORK/g19-pa.log" 2>&1 &
 P19=$!; pids+=($P19); sleep 4
 C19=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g19-pa.log" | head -1 | tr 'A-Z' 'a-z')
 G19=0
-FILAMENT_CONFIG_DIR="$DB19" timeout 90 "$BIN" pair "$C19" --name boxA --server "$SERVER" >"$WORK/g19-pb.log" 2>&1 || G19=1
+FILAMENT_CONFIG_DIR="$DB19" timeout 90 "$BIN" add "$C19" --name boxA --server "$SERVER" >"$WORK/g19-pb.log" 2>&1 || G19=1
 wait $P19 || G19=1
 FILAMENT_TEST_EMIT_LOSS=0.5 FILAMENT_TEST_EMIT_SEED=16 FILAMENT_CONFIG_DIR="$DB19" \
   timeout 120 "$BIN" up --dir "$D19" --server "$SERVER" </dev/null >"$WORK/g19-up.log" 2>&1 &

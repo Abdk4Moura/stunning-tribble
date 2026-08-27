@@ -209,7 +209,20 @@ pub struct Outgoing {
     /// one exception is a file with no `full` digest: there is nothing to
     /// verify-and-ack, so it is done on send (the legacy size-only path).
     pub acked: bool,
+    /// The receiver refused this file. Distinct from `done`: a declined transfer
+    /// has FINISHED without landing, and reporting it as success is what #274
+    /// fixed. The send exits non-zero.
+    pub declined: bool,
     pub done: bool,
+    /// When these bytes started streaming, and how many went out in THIS attempt
+    /// (`size - offset`, so a resume counts only its own share).
+    ///
+    /// Completion throughput is measured from here to the moment the
+    /// `delivery-ack` lands, because that is the only instant at which the bytes
+    /// are known to be on the far side. Timing to the end of `flush()` instead
+    /// measures how fast a socket buffer was filled.
+    pub stream_started: Option<std::time::Instant>,
+    pub stream_bytes: u64,
 }
 
 #[cfg(test)]

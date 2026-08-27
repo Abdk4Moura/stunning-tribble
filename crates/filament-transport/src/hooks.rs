@@ -37,6 +37,18 @@ pub fn debug(msg: &str) {
     }
 }
 
+/// A message meant for the person, not the log. Default: discard, because a
+/// library has no terminal to write to and should not assume one.
+static SAY: OnceLock<LogFn> = OnceLock::new();
+pub fn set_say(f: LogFn) {
+    let _ = SAY.set(f);
+}
+pub fn say(msg: &str) {
+    if let Some(f) = SAY.get() {
+        f(msg)
+    }
+}
+
 /// Classify a remote IP (private, CGNAT, public, ...). Default: "?".
 pub type IpClassFn = fn(std::net::IpAddr) -> String;
 static IP_CLASS: OnceLock<IpClassFn> = OnceLock::new();
