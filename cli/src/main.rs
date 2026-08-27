@@ -61,7 +61,9 @@ pub(crate) use filament_pair as pake;
 mod pake_ceremony;
 mod ping;
 mod sdnotify;
-mod protocol;
+// The wire vocabulary and its pure decisions now live in their own crate. Kept
+// under the `protocol::` name so every call site reads unchanged.
+use filament_proto as protocol;
 mod resilience;
 mod session;
 mod settings;

@@ -73,6 +73,7 @@ filament-id = { path = "../crates/filament-id", version = "0.1.0" }
 # flag, observability counters, DeviceCert-reading glue) stays in those modules.
 filament-cap = { path = "../crates/filament-cap", version = "0.1.1" }
 filament-transfer = { path = "../crates/filament-transfer", version = "0.1.0" }
+filament-proto = { path = "../crates/filament-proto", version = "0.1.0" }
 hex = "0.4"
 rand_core = "0.6"
 getrandom = "0.2"
