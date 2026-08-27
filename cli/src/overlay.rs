@@ -225,7 +225,7 @@ impl Identity {
         let sig = self.keypair.sign(&msg);
         let mut sig64 = [0u8; 64];
         sig64.copy_from_slice(sig.as_ref());
-        Announce { pubkey: self.pubkey, addr: self.addr, seq, sig: sig64 }
+        Announce { pubkey: self.pubkey, addr: self.addr, seq, sig: sig64, relay_datagrams: true }
     }
 
     /// Return the 32-byte Ed25519 public key (for cert signing / identity binding).
@@ -271,6 +271,15 @@ pub struct Announce {
     pub addr: Ipv6Addr,
     pub seq: u64,
     pub sig: [u8; 64],
+    /// The sender can carry L3 packets over a RELAY link, not just direct-QUIC.
+    ///
+    /// ADVISORY and deliberately outside the signature. It selects a transport,
+    /// it does not authorize anything, and the worst a tamperer achieves is
+    /// suppressing L3-over-relay, which is a denial they could cause anyway by
+    /// dropping the announce. What it must NOT do is default to true: an older
+    /// peer does not send it and cannot receive relay datagrams, so assuming
+    /// support would install a route that silently black-holes.
+    pub relay_datagrams: bool,
 }
 
 impl Announce {
@@ -295,6 +304,8 @@ impl Announce {
             "addr4": self.addr_v4().to_string(),
             "seq": self.seq,
             "sig": b64(&self.sig),
+            // Advisory capability flag; older peers ignore the unknown key.
+            "dg_relay": self.relay_datagrams,
         })
     }
 
@@ -311,7 +322,9 @@ impl Announce {
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| anyhow!("announce addr invalid"))?;
         let seq = v["seq"].as_u64().unwrap_or(0);
-        Ok(Announce { pubkey, addr, seq, sig })
+        // Absent (older peer) means NO. See the field's note.
+        let relay_datagrams = v["dg_relay"].as_bool().unwrap_or(false);
+        Ok(Announce { pubkey, addr, seq, sig, relay_datagrams })
     }
 
     /// Verify against the live link's channel binding `cb`. On success returns the
@@ -340,7 +353,7 @@ impl Announce {
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-fn b64(data: &[u8]) -> String {
+pub(crate) fn b64(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
@@ -353,7 +366,7 @@ fn b64(data: &[u8]) -> String {
     out
 }
 
-fn unb64(s: &str) -> Result<Vec<u8>> {
+pub(crate) fn unb64(s: &str) -> Result<Vec<u8>> {
     fn val(c: u8) -> Result<u32> {
         match c {
             b'A'..=b'Z' => Ok((c - b'A') as u32),

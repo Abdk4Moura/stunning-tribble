@@ -49,3 +49,5 @@ cli/target
 b200.bin
 /b*.bin
 target-ux/
+target-fleet/
+target-hooks/

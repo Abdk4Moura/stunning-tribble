@@ -414,9 +414,10 @@ pub trait Transport: Send + Sync {
         true
     }
     // --- L3 data plane (serve_tun): IP packets over unreliable datagrams ---
-    /// Whether this transport can carry L3 datagrams. Only the direct-QUIC link
-    /// does today; relay/DataChannel links return false, so the daemon simply
-    /// does not start an L3 pump over them (no L3 on relay yet).
+    /// Whether this transport can carry L3 datagrams. Direct-QUIC links use real
+    /// QUIC datagrams; relay/DataChannel links carry them on a reserved sid (see
+    /// `L3_DATAGRAM_SID`). A transport with neither returns false and the daemon
+    /// does not start an L3 pump over it.
     fn supports_datagrams(&self) -> bool {
         false
     }
@@ -515,6 +516,23 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Sid reserved for L3 IP packets on a relay/DataChannel link.
+///
+/// The channel already distinguishes text (control JSON) from binary
+/// (`[u32 sid][u64 offset][payload]`). L3 rides the binary shape with a sid no
+/// L2 stream can allocate, so the wire format is unchanged and a peer that does
+/// not know about it simply sees an unknown stream. That is exactly why the
+/// SENDER gates on the peer advertising support (`Announce::relay_datagrams`):
+/// silently shipping packets into a peer that drops them would look like a route
+/// that exists and black-holes.
+pub const L3_DATAGRAM_SID: u32 = u32::MAX;
+
+/// Bound on queued L3 packets in either direction. IP packets are droppable by
+/// definition, so both ends `try_send` and DROP on a full queue rather than
+/// applying backpressure: blocking the tunnel to wait for a stale packet is
+/// strictly worse than losing it.
+const L3_QUEUE: usize = 256;
+
 pub struct DataChannelTransport {
     raw: Arc<RawDataChannel>,
     drained: Arc<Notify>,
@@ -532,6 +550,12 @@ pub struct DataChannelTransport {
     // half of the L2 sid space this end allocates from, so the two ends never
     // collide (Transport::sid_answerer).
     answerer: bool,
+    // L3-over-relay: inbound IP packets the read loop pulled off the sentinel
+    // sid, and the outbound queue drained by a writer task. `send_datagram` is
+    // SYNCHRONOUS in the trait (quinn's is non-blocking) while the DataChannel
+    // write is async, so the queue is what bridges the two.
+    l3_in: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Bytes>>,
+    l3_out: tokio::sync::mpsc::Sender<Bytes>,
 }
 
 impl DataChannelTransport {
@@ -602,6 +626,41 @@ impl Transport for DataChannelTransport {
         self.first_data
             .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    // --- L3 over relay ---
+    // A DataChannel is reliable and ordered, which IP does not need and pays for:
+    // a lost packet head-of-line blocks the ones behind it, and the tunnel shares
+    // the channel with file transfer. It is still much better than no route at
+    // all, which is what a relayed pair had before. A direct link is always
+    // preferred and the transport ladder already races for one.
+    fn supports_datagrams(&self) -> bool {
+        !self.is_dead()
+    }
+
+    fn send_datagram(&self, packet: &[u8]) -> Result<()> {
+        if self.is_dead() {
+            return Err(anyhow!("channel closed"));
+        }
+        // Drop, never block: see L3_QUEUE. A full queue means the channel is
+        // already behind, and delaying the tunnel to deliver a stale packet is
+        // worse than losing it.
+        match self.l3_out.try_send(Bytes::copy_from_slice(packet)) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(anyhow!("datagram writer stopped"))
+            }
+        }
+    }
+
+    async fn recv_datagram(&self) -> Result<Bytes> {
+        self.l3_in
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| anyhow!("datagram channel closed"))
     }
 
     async fn flush(&self) -> Result<()> {
@@ -1821,6 +1880,10 @@ async fn wire_channel(
             // never falsely treated as idle/supersedable (#28 guard).
             let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
             let first_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // L3-over-relay queues, created BEFORE the read loop so the reader
+            // owns the inbound sender and the transport owns the receiver.
+            let (l3_in_tx, l3_in_rx) = tokio::sync::mpsc::channel::<Bytes>(L3_QUEUE);
+            let (l3_out_tx, mut l3_out_rx) = tokio::sync::mpsc::channel::<Bytes>(L3_QUEUE);
 
             // C8a: one persistent buffered-amount-low subscription wakes all
             // parked senders.
@@ -1872,6 +1935,16 @@ async fn wire_channel(
                                     first_data
                                         .store(true, std::sync::atomic::Ordering::Relaxed);
                                     let sid = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                                    if sid == L3_DATAGRAM_SID {
+                                        // An IP packet, not a transfer frame. Never
+                                        // goes to Ev::Chunk: the L2 layer would look
+                                        // up a stream that does not exist. try_send
+                                        // so a slow tunnel drops packets instead of
+                                        // stalling the whole read loop, which also
+                                        // serves file transfer.
+                                        let _ = l3_in_tx.try_send(Bytes::copy_from_slice(&buf[12..n]));
+                                        continue;
+                                    }
                                     let offset = u64::from_be_bytes([
                                         buf[4], buf[5], buf[6], buf[7],
                                         buf[8], buf[9], buf[10], buf[11],
@@ -1916,8 +1989,36 @@ async fn wire_channel(
                         }
                     });
                 }
+                // L3 outbound pump: the trait's send_datagram is sync, the
+                // channel write is async, so one task drains the queue. It exits
+                // when the channel dies or the transport (and its sender) drops.
+                {
+                    let raw_d = raw.clone();
+                    let dead_d = dead.clone();
+                    tokio::spawn(async move {
+                        while let Some(pkt) = l3_out_rx.recv().await {
+                            if dead_d.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            let mut framed = Vec::with_capacity(12 + pkt.len());
+                            framed.extend_from_slice(&L3_DATAGRAM_SID.to_be_bytes());
+                            framed.extend_from_slice(&0u64.to_be_bytes());
+                            framed.extend_from_slice(&pkt);
+                            // Deliberately NO backpressure park here: an IP packet
+                            // that cannot go now is dropped by the queue bound, and
+                            // parking would let the tunnel stall file transfer.
+                            if raw_d.write_data_channel(&Bytes::from(framed), false).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
                 let transport: Arc<dyn Transport> =
-                    Arc::new(DataChannelTransport { raw, drained, dead, last_activity, first_data, answerer: polite });
+                    Arc::new(DataChannelTransport {
+                        raw, drained, dead, last_activity, first_data, answerer: polite,
+                        l3_in: tokio::sync::Mutex::new(l3_in_rx),
+                        l3_out: l3_out_tx,
+                    });
                 let _ = tx.send(Ev::ChannelReady(peer_id.clone(), transport));
             }
         })

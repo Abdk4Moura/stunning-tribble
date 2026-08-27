@@ -1045,17 +1045,69 @@ impl LinkGuard {
 /// which is what unlocks the acceptor's capability gate. Returns the ready
 /// Transport, the event receiver, and a `LinkGuard` the caller must either
 /// `forget()` (keep alive) or `close().await` (tear down).
+/// Prove that the peer on this link is the device the caller NAMED.
+///
+/// Dialing with the fleet secret authenticates the link as "someone in this
+/// fleet". Turning that into "this is `expected`" needs the owner-signed
+/// certificate, bound to this link, and the device key it names has to resolve to
+/// the local record `expected` refers to. Anything else is refused: a same-fleet
+/// device answering to the wrong name is exactly the case this exists to stop.
+async fn verify_fleet_identity(
+    t: &Arc<dyn Transport>,
+    rx: &mut mpsc::UnboundedReceiver<Ev>,
+    expected: &str,
+) -> Result<()> {
+    let cb = t
+        .channel_binding()
+        .ok_or_else(|| anyhow!("cannot verify '{expected}': this link exposes no channel binding"))?;
+    let owner = crate::fleet::my_owner_pub()
+        .ok_or_else(|| anyhow!("cannot verify '{expected}': this device holds no owner key"))?;
+    let hello = crate::fleet::make_hello(&cb, &crate::display_name())?;
+    t.send_control(&hello).await?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let ev = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .map_err(|_| anyhow!("'{expected}' never presented a certificate"))?
+            .ok_or_else(|| anyhow!("link closed before '{expected}' presented a certificate"))?;
+        let Ev::Control(_, v) = &ev else { continue };
+        if v["type"].as_str() != Some(crate::fleet::HELLO) {
+            continue;
+        }
+        let proven = crate::fleet::verify_hello(v, &cb, &owner, crate::identity::now_secs())?;
+        let name = crate::device_name_for_pub(&proven.device_pub);
+        if name.as_deref().map(|n| n.eq_ignore_ascii_case(expected)) != Some(true) {
+            bail!(
+                "refusing: the device answering as '{expected}' proved a different identity ({}). Nothing was sent.",
+                name.as_deref().unwrap_or("unknown device")
+            );
+        }
+        return Ok(());
+    }
+}
+
 async fn bring_up_to_known(
     server: &str,
     peer_name: &str,
     relay: bool,
     role: &'static str,
 ) -> Result<(Arc<dyn Transport>, mpsc::UnboundedReceiver<Ev>, LinkGuard, crate::diag::Attempt)> {
-    let secret = crate::devices_load()
+    // A paired device has its own secret. A FLEET sibling is indexed WITHOUT one
+    // (design-fleet-automesh.md), so fall back to the fleet secret, which is what
+    // the daemon dials such peers with. `fleet_mode` matters at the return sites:
+    // that secret proves MEMBERSHIP, not identity, so the certificate has to be
+    // checked before the link is handed to the caller.
+    let (secret, fleet_mode) = match crate::devices_load()
         .into_iter()
         .find(|(n, _)| n.eq_ignore_ascii_case(peer_name))
         .map(|(_, s)| s)
-        .ok_or_else(|| anyhow!("no known device named '{peer_name}', run `filament add` first (see `filament devices`)"))?;
+    {
+        Some(s) => (s, false),
+        None => match (crate::fleet_indexed_name(peer_name), crate::fleet::rv()) {
+            (true, Some(rv)) => (rv, true),
+            _ => bail!("no known device named '{peer_name}', run `filament add` first (see `filament devices`)"),
+        },
+    };
     let channel = crate::channel_of(&secret);
 
     // Establishment telemetry: a connect span, peer tagged by SHORT HASH (never
@@ -1452,6 +1504,16 @@ async fn bring_up_to_known(
                 // The WebRTC `peer` is now superfluous; the guard owns it (its
                 // teardown/forget semantics are unchanged, no extra teardown).
                 let guard = LinkGuard { sio: Some(sio), peer: peer.take() };
+                // The fleet secret got us CONNECTED to a fleet member. It does not
+                // say WHICH one: every sibling sits on the same channel, so a peer
+                // answering to this name merely ASSERTED it. Prove it with the
+                // certificate before the caller moves any bytes, or
+                // `send --to laptop` could hand the file to whichever fleet device
+                // answered first. Fails closed on a transport with no channel
+                // binding, because there is nothing to bind the proof to.
+                if fleet_mode {
+                    verify_fleet_identity(&t, &mut rx, peer_name).await?;
+                }
                 return Ok((t, rx, guard, diag));
             }
             Ev::Stuck(pid, g) => {
@@ -1493,6 +1555,16 @@ async fn bring_up_to_known(
                 // the caller records the L2Open round trip and the final `up`.
                 diag.enter(crate::diag::Phase::Ready);
                 let guard = LinkGuard { sio: Some(sio), peer: peer.take() };
+                // The fleet secret got us CONNECTED to a fleet member. It does not
+                // say WHICH one: every sibling sits on the same channel, so a peer
+                // answering to this name merely ASSERTED it. Prove it with the
+                // certificate before the caller moves any bytes, or
+                // `send --to laptop` could hand the file to whichever fleet device
+                // answered first. Fails closed on a transport with no channel
+                // binding, because there is nothing to bind the proof to.
+                if fleet_mode {
+                    verify_fleet_identity(&t, &mut rx, peer_name).await?;
+                }
                 return Ok((t, rx, guard, diag));
             }
             Ev::PcState(pid, s) if s == "failed" || s == "closed" => {
@@ -2414,7 +2486,18 @@ async fn try_warm_pty(
     pending: &mut Option<Vec<u8>>,
 ) -> Option<Result<()>> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let sock = crate::ctl::try_pty(peer, session, cols, rows, term, cmd).await?; // None = no warm link
+    // `Err(Some(reason))` means the DAEMON answered. A `refused:` reason is the
+    // PEER's answer relayed back, and it is definitive: returning None here would
+    // send the caller down the cold path, which for a fleet peer dies at name
+    // resolution and reports "can't reach ... may be offline" for a peer that is
+    // demonstrably reachable and simply said no.
+    let sock = match crate::ctl::try_pty_reason(peer, session, cols, rows, term, cmd).await {
+        Ok(sock) => sock,
+        Err(Some(reason)) if reason.starts_with("refused:") => {
+            return Some(Err(anyhow!("{}", reason.trim_start_matches("refused:").trim())));
+        }
+        Err(_) => return None, // no warm path; the cold path is the right answer
+    };
     if interactive {
         crate::ui::trace(&format!("filament: reusing warm link to '{peer}' for pty (no establish)"));
         if raw.is_none() {
@@ -2545,6 +2628,37 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                 // warm session just ended, a failed reattach should RETRY (the mesh
                 // may be mid-repair) until the reaper window, not bail.
                 if !ever_connected && !warm_ended {
+                    // A REFUSAL is not a reachability failure, and saying it is
+                    // sends the user to `ping`/`doctor` to debug a healthy link.
+                    // The peer answers an unauthorized open with an l2-close
+                    // carrying a reason, which arrives in milliseconds; report
+                    // that instead of the connect-timeout copy.
+                    let refused = {
+                        let msg = e.to_string();
+                        (msg.contains("closed the shell request")
+                            || msg.contains("refused")
+                            || msg.contains("not authorized")
+                            || msg.contains("capability")
+                            || msg.contains("not in auth key caps"))
+                        .then_some(msg)
+                    };
+                    if let Some(reason) = refused {
+                        crate::ui::problem(
+                            &format!("filament pty: '{peer}' refused the shell"),
+                            &reason,
+                            &[
+                                format!(
+                                    "ask for it: {}",
+                                    crate::ui::paint(crate::ui::Tone::Brand, &format!("filament request shell --to {peer}"))
+                                ),
+                                format!(
+                                    "or on {peer}: {}",
+                                    crate::ui::paint(crate::ui::Tone::Brand, "filament grant <this device> shell")
+                                ),
+                            ],
+                        );
+                        std::process::exit(1);
+                    }
                     let connect_secs: u64 = std::env::var("FILAMENT_CONNECT_SECS")
                         .ok()
                         .and_then(|s| s.parse().ok())

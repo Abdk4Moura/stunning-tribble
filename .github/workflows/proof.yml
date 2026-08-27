@@ -37,5 +37,7 @@ jobs:
         run: python3 proofs/transport_lifecycle_model.py
       - name: Model-check transport upgrade (destroy-then-race vs build-alongside)
         run: python3 proofs/transport_upgrade_model.py
+      - name: Model-check fleet auto-mesh (convergence / revocation / intruder)
+        run: python3 proofs/fleet_automesh_model.py
       - name: Model-check stall ladder (calibration and recovery boundary)
         run: python3 proofs/stall_ladder_model.py

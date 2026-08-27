@@ -43,7 +43,7 @@ pub fn reuse_disabled() -> bool {
 pub use imp::{
     daemon_present, send_reply, serve, serve_at, try_approve_request, try_bootstrap,
     try_cap_status, try_deny_request, try_dial, try_list_mounts, try_list_pending, try_list_warm, try_mount,
-    try_mount_health, try_open, try_open_at, try_ping, try_pty, try_reconfigure, try_reload,
+    try_mount_health, try_open, try_open_at, try_ping, try_pty, try_pty_reason, try_reconfigure, try_reload,
     try_reload_expose, try_resize, try_unmount, Req, ReqKind,
 };
 
@@ -155,6 +155,36 @@ mod imp {
     /// PTY stream; `None` (no daemon / no warm link) means fall back to a fresh
     /// establish. `session` keys the peer's persistent PTY for reattach.
     /// `cmd` is non-empty for one-shot exec (mirrors the cold pty-open cmd field).
+    /// Like `try_pty`, but reports WHY the daemon said no.
+    ///
+    /// `Err(None)` = no daemon / reuse disabled / malformed reply, i.e. "no warm
+    /// path, go cold". `Err(Some(reason))` = the daemon answered. A reason
+    /// beginning `refused:` is DEFINITIVE and the caller must not retry cold: the
+    /// peer has already answered, and a cold retry only converts a clear refusal
+    /// into a connect timeout.
+    pub async fn try_pty_reason(
+        peer: &str, session: &str, cols: u16, rows: u16, term: &str, cmd: &str,
+    ) -> std::result::Result<UnixStream, Option<String>> {
+        if reuse_disabled() {
+            return Err(None);
+        }
+        let mut s = UnixStream::connect(control_sock_path()).await.map_err(|_| None)?;
+        let mut req = json!({ "op": "pty", "peer": peer, "session": session, "cols": cols, "rows": rows, "term": term });
+        if !cmd.is_empty() {
+            req["cmd"] = json!(cmd);
+        }
+        let mut line = serde_json::to_vec(&req).map_err(|_| None)?;
+        line.push(b'\n');
+        s.write_all(&line).await.map_err(|_| None)?;
+        s.flush().await.map_err(|_| None)?;
+        let reply = read_line(&mut s, 4096).await.map_err(|_| None)?;
+        let v: Value = serde_json::from_str(&reply).map_err(|_| None)?;
+        if v["ok"].as_bool() == Some(true) {
+            return Ok(s);
+        }
+        Err(Some(v["err"].as_str().unwrap_or("rejected").to_string()))
+    }
+
     pub async fn try_pty(peer: &str, session: &str, cols: u16, rows: u16, term: &str, cmd: &str) -> Option<UnixStream> {
         if reuse_disabled() {
             return None;

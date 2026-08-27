@@ -24,6 +24,7 @@ mod doctor;
 /// `filament ephemeral`: auth-key delegation for ephemeral devices, pre-authorized
 /// self-enrollment, and delegated principal ceiling enforcement.
 mod ephemeral;
+mod fleet;
 mod fleet_enrollment;
 /// `filament expose`: publish a local port on the L3 overlay. The CLI/config side
 /// is portable; the daemon listeners (Exposer) are Linux-gated with L3.
@@ -180,6 +181,13 @@ mod test_hooks {
     /// P1: force every WebRTC link relay-only (models a hard-NAT peer).
     pub fn webrtc_relay_only() -> bool {
         std::env::var("FILAMENT_TEST_WEBRTC_RELAY_ONLY").map(|v| v == "1").unwrap_or(false)
+    }
+    /// L3-over-relay gate: refuse the rung-1 direct-QUIC path even for a daemon.
+    /// `direct_ok_for` forces direct ON for any long-lived acceptor (anti-glare),
+    /// which is right in production and makes the DataChannel data path
+    /// unreachable on a single box, so it cannot otherwise be exercised.
+    pub fn no_direct() -> bool {
+        std::env::var("FILAMENT_TEST_NO_DIRECT").map(|v| v == "1").unwrap_or(false)
     }
     /// gate 18b: revert the mode-B post-completion drop to reconnect-always.
     pub fn disable_modeb_drop() -> bool {
@@ -1536,6 +1544,10 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
 /// One-shot `send`/`recv`/`pair` pass `daemon=false` and so keep their WebRTC
 /// default (`direct_enabled()` only): they are deliberately left unchanged.
 fn direct_ok_for(daemon: bool, l2_enabled: bool) -> bool {
+    #[cfg(feature = "test-hooks")]
+    if test_hooks::no_direct() {
+        return false;
+    }
     direct::direct_enabled() || l2_enabled || daemon
 }
 
@@ -1885,6 +1897,144 @@ fn fleet_certificate_warning_for(
 /// A revoked device whose record was deleted is NOT re-authorized: deleting
 /// the record also deletes the pair secret, so the pair-proof fails, the link
 /// is untrusted, and the gate denies it before revocation is even consulted.
+/// The local petname for a device, looked up by its PROVEN certificate key.
+///
+/// `Link::verified_name` is the capability-store key, so it may only ever be set
+/// from something the peer PROVED, never from a name it asserted. A fleet peer
+/// that could name itself could name itself after a device that holds grants.
+/// Returns None when we hold no record for that key, which is the normal case
+/// for a sibling met for the first time.
+/// May we install an overlay route for this peer over the link we hold?
+///
+/// A direct-QUIC link always can (real QUIC datagrams). A RELAY link can only if
+/// the peer said it understands relay datagrams, because the packets ride a
+/// reserved sid an older peer would silently discard. Installing a route into a
+/// peer that drops it is worse than having no route: it looks reachable and is
+/// not.
+fn fleet_route_ok(conn: &Conn, pid: &str, peer_relay_datagrams: bool) -> bool {
+    conn.link(pid).map(|l| l.direct).unwrap_or(false) || peer_relay_datagrams
+}
+
+/// Is this link one that must prove itself with a `fleet-hello`?
+///
+/// Answered from the LINK's own shape, deliberately not from `fleet_pending`.
+/// That set is populated only by the fleet-channel presence branch, but warm-hold
+/// re-establishes links BY NAME, so a re-established link was never marked, never
+/// sent a hello, and silently reverted to unverified while looking alive and
+/// correctly named. That is what made a verified sibling ineligible for the warm
+/// path after its first reconnect.
+///
+/// Fleet-shaped means: not already identity-proven by a pair secret, and either
+/// carrying no secret at all or carrying the FLEET secret (which is what
+/// `start_direct_fleet` puts there, and which proves membership, not identity).
+fn fleet_shaped_link(conn: &Conn, pid: &str) -> bool {
+    conn.link(pid)
+        .map(|l| {
+            !l.trusted
+                && match &l.expected_secret {
+                    None => true,
+                    Some((_, secret)) => fleet::rv().as_deref() == Some(secret.as_str()),
+                }
+        })
+        .unwrap_or(false)
+}
+
+/// Must L3 wait for `fleet-hello` on this link?
+///
+/// Only when the link has NOTHING else proving who the peer is. Two devices in
+/// one fleet are usually ALSO paired, so they meet on both channels and the pid
+/// lands in `fleet_pending` even though the pair-secret MAC already proved
+/// identity. Withholding a route from such a link is wrong, and it is what made
+/// L3 silently unavailable between a joined device and its owner.
+fn fleet_identity_pending(conn: &Conn, pid: &str, pending: bool, verified: bool) -> bool {
+    if !pending || verified {
+        return false;
+    }
+    // A pair secret on the link is independent proof; fleet-hello adds nothing.
+    conn.link(pid).map(|l| l.expected_secret.is_none()).unwrap_or(true)
+}
+
+/// A fresh per-link challenge nonce for transports with no RFC-5705 exporter.
+fn link_nonce() -> Vec<u8> {
+    // fresh_secret() is the same CSPRNG the pair secrets use; 32 bytes of it.
+    hex::decode(fresh_secret()).unwrap_or_else(|_| fresh_secret().into_bytes())
+}
+
+/// The binding to SIGN outgoing `l3-announce` / `fleet-hello` with.
+///
+/// A direct-QUIC link exports one (RFC 5705). A DataChannel does not, so we use
+/// the nonce the PEER chose: they will verify against what they sent. `None`
+/// means the challenge has not completed yet and the caller must simply wait,
+/// which is why every send site is inside an `if let`.
+fn out_binding(
+    t: &Arc<dyn Transport>,
+    pid: &str,
+    theirs: &HashMap<String, Vec<u8>>,
+) -> Option<Vec<u8>> {
+    t.channel_binding().or_else(|| theirs.get(pid).cloned())
+}
+
+/// The binding to VERIFY an incoming `l3-announce` / `fleet-hello` against: our
+/// own exporter value, or the nonce WE chose and sent to that peer.
+fn in_binding(
+    t: &Arc<dyn Transport>,
+    pid: &str,
+    ours: &HashMap<String, Vec<u8>>,
+) -> Option<Vec<u8>> {
+    t.channel_binding().or_else(|| ours.get(pid).cloned())
+}
+
+/// Is `name` a device we hold an INDEX entry for but no pair secret?
+///
+/// That is exactly a fleet sibling: recorded so `filament devices` can show the
+/// fleet, deliberately without a secret so it never becomes a dial target. The
+/// distinction matters for error copy, because such a name is simultaneously
+/// "listed" and "not reachable by this verb".
+/// Does a device record exist at all, secret or not?
+///
+/// `devices_load()` filter-maps on `secret`, so every check written against it
+/// silently means "devices I can DIAL", not "devices I know". A fleet sibling is
+/// indexed without a secret, so those checks answer "no device named X" while
+/// `filament devices` is listing X on the next line. For `revoke` that is worse
+/// than confusing: a device you can SEE but cannot revoke.
+fn device_record_exists(name: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(devices_path()) else { return false };
+    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return false };
+    arr.iter().any(|d| d["name"].as_str() == Some(name))
+}
+
+pub(crate) fn fleet_indexed_name(name: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(devices_path()) else { return false };
+    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return false };
+    arr.iter().any(|d| {
+        d["name"].as_str().map(|n| n.eq_ignore_ascii_case(name)).unwrap_or(false)
+            && d["secret"].as_str().is_none()
+    })
+}
+
+/// Our own signed `cap_header` for resource "self", if this device has one.
+///
+/// Only an owner device does: the header is signed with the UserKey. This is what
+/// gets handed to a joining device so its capability store can resolve which
+/// owner it answers to.
+fn owner_cap_header() -> Option<Value> {
+    crate::capability::load_cap_store(&crate::settings::config_dir())
+        .into_iter()
+        .find(|e| {
+            e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                && e["resource"].as_str() == Some("self")
+        })
+}
+
+pub(crate) fn device_name_for_pub(device_pub: &[u8; 32]) -> Option<String> {
+    let raw = std::fs::read_to_string(devices_path()).ok()?;
+    let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
+    let key = hex::encode(device_pub);
+    arr.iter()
+        .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
+        .and_then(|d| d["name"].as_str().map(str::to_string))
+}
+
 fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
     let p = devices_path();
     // A GENUINELY ABSENT store means no device records at all: every peer is
@@ -1937,6 +2087,11 @@ fn set_device_cert_revoked(name: &str, revoked: bool) -> Result<()> {
 /// Terminal principal states written to `principalState` on a device record.
 const PRINCIPAL_STATE_LAPSED: &str = "lapsed";
 const PRINCIPAL_STATE_REVOKED: &str = "revoked";
+
+/// Display name for a fleet link before its certificate names it. Contains a
+/// space and a colon so it cannot collide with a device petname, and it is never
+/// used as a capability key regardless.
+const FLEET_LINK_NAME: &str = "fleet: unverified";
 
 /// The full record for a device identified by its cert's device_pub, if any.
 /// Used by the enrollment path to decide revive (lapsed) vs refuse (revoked).
@@ -2919,8 +3074,21 @@ fn up_log() -> PathBuf {
 }
 
 fn daemon_alive() -> Option<u32> {
-    let pid: u32 = std::fs::read_to_string(pidfile()).ok()?.trim().parse().ok()?;
+    let raw = std::fs::read_to_string(pidfile()).ok()?;
+    let pid = parse_pidfile(&raw)?;
     is_filament_process(pid).then_some(pid)
+}
+
+/// Read the pid out of a pidfile, tolerating the layouts older releases wrote.
+///
+/// We write a bare pid, but 0.8.5 and earlier wrote `<pid>\n<exe path>`, and
+/// `"3906581\n/root/.local/bin/filament".trim().parse::<u32>()` fails. That
+/// failure is silent and it is NOT cosmetic: `daemon_alive()` returns None for a
+/// daemon that is very much alive, so after upgrading the CLI `status` reports
+/// "not running", `down` cannot stop it, and `up` starts a SECOND daemon against
+/// the same config. Parse the first line and stay compatible with both.
+fn parse_pidfile(raw: &str) -> Option<u32> {
+    raw.lines().next()?.trim().parse().ok()
 }
 
 /// True when the pid is a live filament process. The pidfile alone can hold a
@@ -3729,6 +3897,18 @@ async fn init_experience(
         }))?);
         return Ok(());
     }
+    // L3 is default-on (`tun-addr` defaults to "auto"), and a non-root daemon
+    // needs CAP_NET_ADMIN to open the tunnel device. Ask for the one-time grant
+    // HERE, at init, because this is the moment there is a terminal to answer a
+    // sudo prompt; the daemon has none. Declining is not fatal: the overlay
+    // falls back to the userspace netstack, which needs no privilege.
+    #[cfg(l3)]
+    if !settings::get_str("tun-addr", None).unwrap_or_default().is_empty()
+        && settings::get_str("l3-mode", None).as_deref() != Some("userspace")
+        && caps.interactive
+    {
+        crate::tun::ensure_net_admin_for_l3();
+    }
     ui::say(&format!("  {} identity created", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
     ui::say(&format!("  {} this device: {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &device_name)));
     ui::say(&format!("  {} inbox: {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), inbox.display()));
@@ -4239,11 +4419,17 @@ fn fmt_short_duration(secs: u64) -> String {
 fn delegated_device_state(name: &str, cert: Option<&identity::DeviceCert>, now: u64, records: &[Value]) -> Option<(String, ui::Tone)> {
     let cert = cert?;
     let record = records.iter().find(|d| d["name"].as_str() == Some(name))?;
-    if record["principalKind"].as_str() != Some("delegated") {
-        return None;
-    }
+    // REVOCATION FIRST, before the principal-kind gate. Revoking is a decision
+    // about a device, not about a principal kind, and it applies to any record we
+    // hold. A fleet sibling is indexed WITHOUT a delegated principal, so gating
+    // this behind "delegated" meant `devices revoke <sibling>` succeeded, wrote
+    // certRevoked, correctly denied the device on reconnect, and then listed it
+    // as perfectly healthy. A revocation you cannot see is one you cannot trust.
     if record["certRevoked"].as_bool() == Some(true) || record["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED) {
         return Some(("revoked".to_string(), ui::Tone::Err));
+    }
+    if record["principalKind"].as_str() != Some("delegated") {
+        return None;
     }
     let not_after = record["principalExpires"].as_u64();
     let last_seen = record["lastSeen"].as_u64();
@@ -4270,7 +4456,12 @@ fn delegated_device_state(name: &str, cert: Option<&identity::DeviceCert>, now: 
 
 fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
     let warm_names = warm_device_names(warm);
-    let owner = load_owner_key().map(|key| key.public_key_bytes());
+    // Which owner key do WE answer to? `load_owner_key()` asks "do I hold the
+    // owner's PRIVATE key", which is only true on the owner device itself, so on
+    // every joined device the Fleet tier could never match and its own siblings
+    // rendered as EXTERNAL. The question is which owner key we CHAIN TO, and a
+    // joined device knows that from its own certificate.
+    let owner = fleet::my_owner_pub();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -4280,9 +4471,13 @@ fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
         .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
         .unwrap_or_default();
 
-    devices_load()
-        .into_iter()
-        .map(|(name, _secret)| {
+    // Iterate the RAW records, not devices_load(): that helper requires a pair
+    // secret, and a fleet sibling is indexed without one, so listing through it
+    // would hide exactly the devices this surface exists to show.
+    records
+        .iter()
+        .filter_map(|r| r["name"].as_str().map(str::to_string))
+        .map(|name| {
             let cert = device_cert_for(&name);
             let tier = match cert.as_ref() {
                 None => fleet_ui::devices::DeviceTier::NeedsReview,
@@ -4632,6 +4827,50 @@ fn persist_join_ack(v: &Value, auth_key: &crate::ephemeral::AuthKey) -> Result<S
         None,
         None,
     )?;
+    // Fleet auto-mesh: keep the rendezvous secret the owner sent. Its ABSENCE is
+    // not a failure, it just means no auto-mesh (an older owner, or a join that
+    // was not persistent).
+    if let Some(rv) = v["fleet_rv"].as_str() {
+        if let Err(e) = fleet::store_rv(rv) {
+            ui::debug(&format!("fleet rendezvous secret not stored: {e}"));
+        }
+    }
+    // Same-owner fleet-trust: keep the owner's signed capability header so this
+    // device knows which owner its policy answers to. Absence is not a failure
+    // (an older owner simply does not send one); it just leaves the capability
+    // layer unprovisioned here, which is the previous behaviour.
+    if let Some(hdr) = v["cap_header"].as_object() {
+        let dir = crate::settings::config_dir();
+        let mut store = crate::capability::load_cap_store(&dir);
+        let already = store.iter().any(|e| {
+            e.get("type").and_then(|x| x.as_str()) == Some("cap_header")
+                && e["resource"].as_str() == Some("self")
+        });
+        if !already {
+            store.push(Value::Object(hdr.clone()));
+            // The header alone is HALF of what an owner device has:
+            // `ensure_self_genesis_header` writes a header AND a cap_ratchet, and
+            // evaluation needs both. Measured with only the header delivered:
+            // `own_user` resolved (so the header does its job) but the gate still
+            // denied. The ratchet is a LOCAL anti-rollback record keyed on
+            // owner_pub, carries no signature, and owner_pub is right here in the
+            // header, so the joined device can create its own.
+            let owner_pub = hdr
+                .get("owner_pub")
+                .and_then(|v| v.as_str())
+                .and_then(|h| hex::decode(h).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+            if let Some(owner_pub) = owner_pub {
+                let issued = hdr.get("issued_at").and_then(|v| v.as_u64()).unwrap_or(0);
+                if let Err(e) = crate::capability::update_ratchet(&mut store, &owner_pub, issued) {
+                    ui::debug(&format!("capability ratchet not initialised: {e}"));
+                }
+            }
+            if let Err(e) = crate::capability::save_cap_store(&dir, &store) {
+                ui::debug(&format!("owner capability header not stored: {e}"));
+            }
+        }
+    }
     config_set("name", assigned_name)?;
     Ok(assigned_name.to_string())
 }
@@ -4699,6 +4938,50 @@ fn persist_join_ack_v2(v: &Value, inv: &crate::ephemeral::InvitationV2) -> Resul
         None,
         None,
     )?;
+    // Fleet auto-mesh: keep the rendezvous secret the owner sent. Its ABSENCE is
+    // not a failure, it just means no auto-mesh (an older owner, or a join that
+    // was not persistent).
+    if let Some(rv) = v["fleet_rv"].as_str() {
+        if let Err(e) = fleet::store_rv(rv) {
+            ui::debug(&format!("fleet rendezvous secret not stored: {e}"));
+        }
+    }
+    // Same-owner fleet-trust: keep the owner's signed capability header so this
+    // device knows which owner its policy answers to. Absence is not a failure
+    // (an older owner simply does not send one); it just leaves the capability
+    // layer unprovisioned here, which is the previous behaviour.
+    if let Some(hdr) = v["cap_header"].as_object() {
+        let dir = crate::settings::config_dir();
+        let mut store = crate::capability::load_cap_store(&dir);
+        let already = store.iter().any(|e| {
+            e.get("type").and_then(|x| x.as_str()) == Some("cap_header")
+                && e["resource"].as_str() == Some("self")
+        });
+        if !already {
+            store.push(Value::Object(hdr.clone()));
+            // The header alone is HALF of what an owner device has:
+            // `ensure_self_genesis_header` writes a header AND a cap_ratchet, and
+            // evaluation needs both. Measured with only the header delivered:
+            // `own_user` resolved (so the header does its job) but the gate still
+            // denied. The ratchet is a LOCAL anti-rollback record keyed on
+            // owner_pub, carries no signature, and owner_pub is right here in the
+            // header, so the joined device can create its own.
+            let owner_pub = hdr
+                .get("owner_pub")
+                .and_then(|v| v.as_str())
+                .and_then(|h| hex::decode(h).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+            if let Some(owner_pub) = owner_pub {
+                let issued = hdr.get("issued_at").and_then(|v| v.as_u64()).unwrap_or(0);
+                if let Err(e) = crate::capability::update_ratchet(&mut store, &owner_pub, issued) {
+                    ui::debug(&format!("capability ratchet not initialised: {e}"));
+                }
+            }
+            if let Err(e) = crate::capability::save_cap_store(&dir, &store) {
+                ui::debug(&format!("owner capability header not stored: {e}"));
+            }
+        }
+    }
     config_set("name", assigned_name)?;
     Ok(assigned_name.to_string())
 }
@@ -6038,6 +6321,21 @@ async fn handle_auth_key_enroll_response(
                 "device_pub": hex::encode(device_pub),
                 "device_cert": device_cert.to_json(),
                 "owner_cert": local_device_cert().map(|cert| cert.to_json()),
+                // Fleet auto-mesh: a PERSISTENT enrollment is an owner-certified
+                // device, so hand it the fleet meeting point. An ephemeral
+                // borrower never gets it: it holds a certificate for one session,
+                // it is not part of the fleet's standing presence.
+                "fleet_rv": persistent.then(|| fleet::rv_load_or_create().ok()).flatten(),
+                // Same-owner fleet-trust, first increment. A joined device has no
+                // capability store, so `cap_fleet_inputs` finds no `cap_header`,
+                // `own_user` is None, and the fleet-scope path the capability layer
+                // already implements can never engage there. It cannot make its
+                // own: `ensure_self_genesis_header` SIGNS the header with the
+                // owner's UserKey, which a joined device does not hold. So the
+                // owner hands its header over, exactly as it hands over fleet_rv.
+                // The header carries no secret: it is signed, self-certifying, and
+                // names `owner_pub` and a nonce.
+                "cap_header": persistent.then(owner_cap_header).flatten(),
                 "ceiling": ak.caps,
                 "expires": ak.expires,
                 "max_offline": ak.max_offline,
@@ -7378,6 +7676,13 @@ enum DirectIntent {
     Probe,
     /// Option A: the ONLY intent permitted to replace a serving link.
     Promote,
+    /// Fleet auto-mesh: dial a same-owner device using the FLEET rendezvous
+    /// secret as the transport MAC key. Behaves like `Normal` for teardown, but
+    /// the resulting link is born UNPRIVILEGED: the fleet secret is shared by
+    /// the whole fleet, so it proves MEMBERSHIP, not identity, and definitely
+    /// not owner-equivalence. Identity arrives only with a verified
+    /// `fleet-hello` (see cli/src/fleet.rs).
+    Fleet,
 }
 
 struct Link {
@@ -8135,6 +8440,9 @@ enum Rung {
 struct DirectPending {
     /// (name, secret) for the known device, gates the attempt and keys the MAC.
     secret: (String, String),
+    /// This dial used the FLEET rendezvous secret, so the link it produces must
+    /// NOT be born trusted / owner-equivalent. See `DirectIntent::Fleet`.
+    fleet: bool,
     /// budget deadline; on expiry with no DirectReady we fall back to WebRTC.
     deadline: Instant,
     /// set once the peer's transport-offer arrived and we spawned the racer, so
@@ -8741,6 +9049,15 @@ impl Conn {
         self.start_direct_inner(pid, name, secret, DirectIntent::Normal).await
     }
 
+    /// Dial a same-owner device met on the fleet channel. There is no pair
+    /// secret for such a peer, so the fleet rendezvous secret keys the MAC. The
+    /// display name is deliberately one no petname can be, because it must never
+    /// key into the capability store; `adopt_direct` leaves `verified_name`
+    /// unset for fleet links regardless.
+    async fn start_direct_fleet(&mut self, pid: &str, secret: &str) {
+        self.start_direct_inner(pid, FLEET_LINK_NAME, secret, DirectIntent::Fleet).await
+    }
+
     /// Option A: replace the serving WebRTC link with direct after PAKE. This
     /// is the ONLY caller permitted to tear down a live link, and the teardown
     /// happens inside `start_direct_inner` AFTER `direct_pending` is registered,
@@ -8993,6 +9310,7 @@ impl Conn {
         self.direct_pending.insert(
             pid.to_string(),
             DirectPending {
+                fleet: intent == DirectIntent::Fleet,
                 secret: (name.to_string(), secret.to_string()),
                 deadline,
                 racing: false,
@@ -9165,6 +9483,34 @@ impl Conn {
     /// proved identity, at least as strong as the DTLS pair-proof it replaces).
     fn adopt_direct(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
         let pend = self.direct_pending.remove(pid);
+        // Read the fleet flag BEFORE the secret moves out of the pending.
+        //
+        // FAIL SAFE WITH NO PENDING. Only the DIALER holds a `DirectPending`, so
+        // `unwrap_or(false)` meant the ACCEPTING side of a fleet dial was born
+        // `trusted: true` + OwnerDevice, which is the exact escalation the Fleet
+        // intent exists to prevent, reachable by anyone holding the fleet secret.
+        // It was caught live: a device whose transfer grant had been REVOKED still
+        // delivered a file, because the acceptor had granted it owner-equivalence
+        // at link birth.
+        //
+        // With no pending we cannot see which secret authenticated the MAC, so we
+        // infer from what we know: a peer we hold a PAIR secret for is a paired
+        // device (only it could have produced that MAC); anything else, while we
+        // have a fleet secret at all, is treated as a fleet link and stays
+        // untrusted until `fleet-hello` names it.
+        let fleet = match pend.as_ref() {
+            Some(p) => p.fleet,
+            None => {
+                let claimed = self
+                    .roster
+                    .get(pid)
+                    .and_then(|v| v["name"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                let paired = !claimed.is_empty()
+                    && devices_load().iter().any(|(n, _)| n.eq_ignore_ascii_case(&claimed));
+                fleet::rv().is_some() && !paired
+            }
+        };
         let (name, secret) = match pend {
             Some(p) => p.secret,
             None => ("peer".to_string(), String::new()),
@@ -9216,10 +9562,18 @@ impl Conn {
                 workers: vec![],
                 generation,
                 attempts: 0,
-                trusted: true,
-                // A direct link is born identity-bound (its pair-secret MAC
-                // already proved who it is), so the petname is known up front.
-                verified_name: expected_secret.as_ref().map(|(n, _)| n.clone()),
+                // A direct link is normally born identity-bound: its PAIR-secret
+                // MAC already proved who it is. A FLEET link is not. Its MAC was
+                // keyed by a secret the whole fleet shares, which proves only
+                // that the peer is in the fleet. So it is born untrusted, with no
+                // petname and no owner-equivalence, until a verified fleet-hello
+                // names it.
+                trusted: !fleet,
+                verified_name: if fleet {
+                    None
+                } else {
+                    expected_secret.as_ref().map(|(n, _)| n.clone())
+                },
                 expected_secret,
                 presence: Presence::Ready,
                 direct: true,
@@ -9229,7 +9583,11 @@ impl Conn {
                 identity_user_pub: None,
                 identity_binding: crate::capability::BindingStrength::None,
                 identity_cert_expires: None,
-                principal_kind: crate::capability::PrincipalKind::OwnerDevice,
+                principal_kind: if fleet {
+                    crate::capability::PrincipalKind::Delegated { caps: Vec::new() }
+                } else {
+                    crate::capability::PrincipalKind::OwnerDevice
+                },
             },
         );
         }
@@ -10935,7 +11293,21 @@ fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn net::Transp
     conn.links
         .iter()
         .filter(|(_, l)| {
-            l.trusted
+            // Eligibility here is "do I know WHO this link reaches", because the
+            // caller is asking to route a request AT that peer. `l.trusted` is a
+            // narrower thing: the legacy blanket-trust flag, which a fleet link
+            // deliberately never sets (its identity comes from a verified
+            // certificate, and `admit_delegated` avoids `trusted` precisely so it
+            // cannot leak into the legacy_ok gates). Testing only `trusted` made
+            // every fleet sibling ineligible for the warm path, so `shell`/`open`
+            // fell through to a cold dial for a peer we hold no secret for and
+            // reported it as unreachable while a healthy link sat right there.
+            // A Proven identity binding answers the actual question.
+            // NOTE: this decides ROUTING, not permission. What the peer may do to
+            // us is still decided by the capability gate on the receiving side.
+            let identity_known =
+                l.trusted || l.identity_binding == crate::capability::BindingStrength::Proven;
+            identity_known
                 && l.verified_name.as_deref().map(|n| n.eq_ignore_ascii_case(peer)).unwrap_or(false)
                 && l.transport.as_ref().map(|t| {
                     // Alive, AND (direct OR a relay link that hasn't been idle long
@@ -11055,11 +11427,23 @@ async fn handle_warm_pty(
                 }
             }
             Err(e) => {
-                ui::debug(&format!(
-                    "filament: warm pty link to '{peer}' is a zombie ({e}); dropping + establishing fresh"
-                ));
-                let _ = tx.send(Ev::DropLink(pid));
-                req.reject("warm link unresponsive; establishing fresh").await;
+                let msg = e.to_string();
+                // A peer that CLOSED the stream ANSWERED us. That is not a zombie,
+                // and treating it as one does two harmful things: it tears down a
+                // perfectly healthy link, and it hides an authorization answer
+                // behind a reachability story ("unresponsive", then a 45s cold
+                // establish, then "may be offline"). Only a link that said
+                // NOTHING inside the verify window is a zombie.
+                if msg.contains("closed before any frame") {
+                    ui::debug(&format!("filament: warm pty to '{peer}' refused by the peer ({msg})"));
+                    req.reject("refused: the peer closed the shell request (capability not granted?)").await;
+                } else {
+                    ui::debug(&format!(
+                        "filament: warm pty link to '{peer}' is a zombie ({msg}); dropping + establishing fresh"
+                    ));
+                    let _ = tx.send(Ev::DropLink(pid));
+                    req.reject("warm link unresponsive; establishing fresh").await;
+                }
             }
         }
     });
@@ -11572,11 +11956,15 @@ async fn main() -> Result<()> {
                 // Show a specific device's info.
                 let all = devices_load();
                 let entry = all.iter().find(|(n, _)| n == &name);
-                let Some((_, secret)) = entry else {
+                if entry.is_none() && !device_record_exists(&name) {
                     bail!("no device named '{name}', see `filament devices`");
-                };
+                }
                 let caps = device_caps(&name).unwrap_or_else(|| vec!["transfer".to_string()]);
-                let channel = channel_of(secret);
+                // A fleet sibling has no pair secret and therefore no pair
+                // channel. Its overlay address is the thing this command exists
+                // to show, so report that and leave the channel empty rather than
+                // refusing to answer.
+                let channel = entry.map(|(_, secret)| channel_of(secret)).unwrap_or_default();
                 // Load lastSeen and overlay addresses from the device store.
                 let (last_seen, stored_v6, stored_v4) = devices_info(&name).unwrap_or((0, None, None));
                 let last_seen_str = if last_seen == 0 { "never".to_string() } else {
@@ -11794,7 +12182,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 Some(DevicesAction::Forget { name }) => {
-                    let had = devices_load().iter().any(|(n, _)| n == &name);
+                    let had = device_record_exists(&name);
                     if !had {
                         bail!("no device named '{name}', see `filament devices`");
                     }
@@ -11849,7 +12237,7 @@ async fn main() -> Result<()> {
                     introduce_cmd(&server, &a, &b, relay).await?;
                 }
                 Some(DevicesAction::Revoke { name }) => {
-                    if !devices_load().iter().any(|(n, _)| n == &name) {
+                    if !device_record_exists(&name) {
                         bail!("no device named '{name}', see `filament devices`");
                     }
                     ui_caps.confirm(&format!("durably revoke {name} (it will stop being recognized and cannot rejoin until restored)"))?;
@@ -11857,7 +12245,7 @@ async fn main() -> Result<()> {
                     println!("revoked '{name}'; it is denied on reconnect and a fresh invitation cannot revive it (only `filament devices restore {name}` can)");
                 }
                 Some(DevicesAction::Restore { name }) => {
-                    if !devices_load().iter().any(|(n, _)| n == &name) {
+                    if !device_record_exists(&name) {
                         bail!("no device named '{name}', see `filament devices`");
                     }
                     set_device_revoked(&name, false)?;
@@ -12860,8 +13248,19 @@ async fn send_cmd(
     // discoverable one, and a mistyped name cost a minute of silence before the
     // timeout. Reject up front, like mount does.
     if let Some(target) = to.as_deref() {
-        let known = devices_load().iter().any(|(n, _)| n.eq_ignore_ascii_case(target));
+        // A fleet sibling has no pair secret, so `devices_load` skips it, but it IS
+        // a valid target: the cold path dials it on the fleet secret and then
+        // PROVES its certificate before any bytes move (`verify_fleet_identity`).
+        let known = devices_load().iter().any(|(n, _)| n.eq_ignore_ascii_case(target))
+            || (fleet_indexed_name(target)
+                && std::env::var("FILAMENT_FLEET_SEND").as_deref() == Ok("1"));
         if !known {
+            if fleet_indexed_name(target) {
+                bail!(
+                    "send --to '{target}': that is a fleet device, reachable on the mesh but not yet a `send` target. \
+                     Use its mesh address ({target}.mesh) for now, or pair with it directly."
+                );
+            }
             bail!(
                 "send --to '{target}': no known device by that name; run `filament devices` to see who you can reach"
             );
@@ -13005,8 +13404,79 @@ async fn send_cmd(
 
     // C12: --to matching a remembered device switches to identity mode,
     // subscribe to its presence channel and wait for known-peer.
-    let known_target: Option<(String, String)> =
-        to.as_ref().and_then(|t| devices_load().into_iter().find(|(n, _)| n.eq_ignore_ascii_case(t)));
+    // A FLEET sibling has no pair secret, so it is dialed on the fleet secret and
+    // met on the fleet channel. That authenticates the link as "someone in this
+    // fleet" and NOTHING more, because every sibling shares both. `fleet_target`
+    // therefore gates every file-offer on the certificate: without it,
+    // `send --to laptop` would hand the file to whichever sibling answered first.
+    let mut fleet_target = false;
+    // `to` is moved into the peer filter further down; keep the name for the
+    // refusal messages, which are emitted long after that move.
+    let fleet_target_name: String = to.clone().unwrap_or_default();
+    let known_target: Option<(String, String)> = to.as_ref().and_then(|t| {
+        devices_load()
+            .into_iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(t))
+            .or_else(|| {
+                // INCOMPLETE, opt-in only. Everything up to identity proof works
+                // and is verified: the sender dials the fleet channel, skips a
+                // sibling whose certificate names a different device (measured:
+                // it correctly refused to hand a file to `owner` when asked for
+                // `laptop`), and reaches the right peer. What is NOT finished is
+                // the binding handshake on a transport with no RFC-5705 exporter:
+                // the peer's hello can arrive before the sender has established
+                // its challenge nonce, and verification then fails closed.
+                //
+                // Fails closed, so it never misdelivers, but a half-finished
+                // feature should not be the default: without the opt-in,
+                // `send --to <sibling>` keeps the clear "not yet a send target"
+                // message rather than an error that reads like a security alarm.
+                // Set FILAMENT_FLEET_SEND=1 to work on it. See WORK-STATE.md.
+                if std::env::var("FILAMENT_FLEET_SEND").as_deref() != Ok("1") {
+                    return None;
+                }
+                // EXPERIMENTAL. A misdelivery bug here (`fleet_proven` was a
+                // single bool meaning "some peer proved", read as "THIS peer
+                // proved", so one sibling verifying opened the offer guard for all
+                // of them) is FIXED and re-verified: the verified pid and the
+                // offered pid now match and nothing reaches the wrong device.
+                // Still behind a flag because it has been exercised in one
+                // topology only. See docs/design-fleet-automesh.md.
+                ui::say(&ui::paint(
+                    ui::Tone::Warn,
+                    "  FILAMENT_FLEET_SEND: experimental. The misdelivery bug is fixed and verified, but this path has only been exercised in one topology.",
+                ));
+                let rv = fleet::rv()?;
+                fleet_indexed_name(t).then(|| {
+                    fleet_target = true;
+                    (t.clone(), rv)
+                })
+            })
+    });
+    // Proven identity for a fleet target, PER PEER.
+    //
+    // This was a single bool, and that was a misdelivery bug: it meant "some peer
+    // proved itself" while every read of it meant "THIS peer proved itself". On
+    // the fleet channel several siblings are present, so once any one of them
+    // verified, the offer guard passed for all of them and the file went to
+    // whichever peer the loop reached next. Measured: verified pid=8gNe as
+    // 'laptop', then offered to pid=yNDj (the owner), which accepted.
+    let mut fleet_proven: std::collections::HashSet<String> = Default::default();
+    // Link binding for a transport with no RFC-5705 exporter (a WebRTC link).
+    // Same challenge the daemon runs: our nonce verifies what THEY send, theirs
+    // signs what we send. Without this a fleet send over a relay-class link
+    // fails closed, which is safe but useless.
+    // Created EAGERLY, not on ChannelReady. The peer's `fleet-hello` can arrive
+    // before our ChannelReady handler runs, and a nonce that does not exist yet
+    // cannot verify it: that is precisely how this failed closed with "cannot
+    // verify its certificate" on a link that was working. The nonce is ours to
+    // choose, it depends on nothing, so there is no reason to wait for an event
+    // to mint it.
+    let mut fleet_bind_ours: Option<Vec<u8>> = fleet_target.then(link_nonce);
+    let mut fleet_bind_theirs: Option<Vec<u8>> = None;
+    // One re-challenge only: a hello that arrived before our nonce is a RACE and
+    // deserves a retry; a hello that fails again is a bad certificate.
+    let mut fleet_rechallenged = false;
     let mut channel_digest_absent: HashMap<String, u8> = HashMap::new();
     // L1-a: `send --code` now mints a v2 nameplate (client-minted words, the
     // server allocates ONLY the numeric nameplate) and runs the SAME ephemeral
@@ -13564,6 +14034,30 @@ async fn send_cmd(
                 // establishment timeout, the rest of the transfer is unbounded.
                 established = true;
                 waiting.store(false, std::sync::atomic::Ordering::Relaxed);
+                // Fleet target: present our certificate and demand theirs before
+                // anything is offered. Fails closed, including on a transport with
+                // no channel binding, because there is nothing to bind a proof to.
+                if fleet_target && !fleet_proven.contains(&pid) {
+                    match t.channel_binding() {
+                        Some(cb) => match fleet::make_hello(&cb, &display_name()) {
+                            Ok(hello) => { let _ = t.send_control(&hello).await; }
+                            Err(e) => bail!(
+                                "cannot prove identity to '{fleet_target_name}': {e}"
+                            ),
+                        },
+                        None => {
+                            // No exporter: open the challenge. Our hello waits for
+                            // their nonce (handled in the Control arm).
+                            let nonce = fleet_bind_ours
+                                .get_or_insert_with(link_nonce)
+                                .clone();
+                            let _ = t.send_control(&json!({
+                                "type": "l3-nonce",
+                                "nonce": crate::overlay::b64(&nonce),
+                            })).await;
+                        }
+                    }
+                }
                 if let Some(l) = conn.link(&pid) {
                     ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, l.shown())));
                     let is_direct = l.direct;
@@ -13607,6 +14101,20 @@ async fn send_cmd(
                         ui::say(&ui::paint(ui::Tone::Dim, "  authenticating..."));
                         continue; // offers/remember wait for PAKE confirm
                     }
+                    // Same rule for a FLEET target, for the same reason: the link
+                    // is authenticated but the PEER is not yet identified, and
+                    // every sibling shares the secret that got us here. Presenting
+                    // our certificate is not enough; nothing is offered until
+                    // THEIRS has verified (the Control arm sets `fleet_proven`,
+                    // and a mismatch bails there rather than falling through).
+                    if fleet_target && !fleet_proven.contains(&pid) {
+                        ui::debug(&format!("fleet-send: deferring offer to pid={pid} (identity unproven)"));
+                        ui::say(&ui::paint(ui::Tone::Dim, "  verifying fleet identity..."));
+                        continue;
+                    }
+                    if fleet_target {
+                        ui::debug(&format!("fleet-send: OFFERING to pid={pid} (identity proven)"));
+                    }
                     // C12: prove identity to a known device (their daemon
                     // auto-accepts only after verifying); or hand over a new
                     // pair secret when the user asked to --remember. A DIRECT
@@ -13641,6 +14149,114 @@ async fn send_cmd(
                 }
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
+                // Fleet target: the peer's certificate. The fleet secret proved
+                // it is IN the fleet; this proves WHICH member. The device key it
+                // names must resolve to the local record the user typed, or we
+                // refuse and send nothing.
+                Some("l3-nonce") if fleet_target && !fleet_proven.contains(&pid) => {
+                    if let Some(Ok(nonce)) = v["nonce"].as_str().map(crate::overlay::unb64) {
+                        if nonce.len() >= 16 {
+                            fleet_bind_theirs = Some(nonce.clone());
+                            if let Some(t) = conn.transport_of(&pid) {
+                                if let Ok(hello) = fleet::make_hello(&nonce, &display_name()) {
+                                    let _ = t.send_control(&hello).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(fleet::HELLO) if fleet_target && !fleet_proven.contains(&pid) => {
+                    let cb = conn
+                        .transport_of(&pid)
+                        .and_then(|t| t.channel_binding())
+                        .or_else(|| fleet_bind_ours.clone());
+                    let owner = fleet::my_owner_pub();
+                    match (cb, owner) {
+                        (Some(cb), Some(owner)) => {
+                            match fleet::verify_hello(&v, &cb, &owner, identity::now_secs()) {
+                                Ok(ok) => {
+                                    let proven = device_name_for_pub(&ok.device_pub);
+                                    ui::debug(&format!(
+                                        "fleet-send verify: pid={pid} wanted='{fleet_target_name}' proven={:?} device_pub={}",
+                                        proven,
+                                        hex::encode(&ok.device_pub[..8])
+                                    ));
+                                    if proven
+                                        .as_deref()
+                                        .map(|n| n.eq_ignore_ascii_case(&fleet_target_name))
+                                        != Some(true)
+                                    {
+                                        // WRONG SIBLING, not an attack and not
+                                        // fatal. Every fleet member sits on this
+                                        // channel, so whoever answered first is
+                                        // simply not the one asked for. Drop it,
+                                        // free the active slot, and keep waiting
+                                        // for the device whose certificate names
+                                        // it. Bailing here would make `send --to`
+                                        // fail whenever a sibling answered sooner.
+                                        ui::debug(&format!(
+                                            "fleet: '{}' answered for '{fleet_target_name}'; not the target, waiting",
+                                            proven.as_deref().unwrap_or("an unknown device")
+                                        ));
+                                        if conn.is_active(&pid) {
+                                            conn.active = None;
+                                        }
+                                        conn.drop_link(&pid);
+                                        established = false;
+                                        continue;
+                                    }
+                                    fleet_proven.insert(pid.clone());
+                                    ui::debug(&format!("fleet target '{fleet_target_name}' proved its certificate on pid={pid}"));
+                                    // RE-EMIT ChannelReady, exactly as the PAKE
+                                    // path does on confirm. The offer lives in the
+                                    // ChannelReady handler, which already ran and
+                                    // deferred (identity was unproven then).
+                                    // Setting the flag without re-entering that
+                                    // handler means the offer is never emitted at
+                                    // all: the sender sits until its timeout and
+                                    // the receiver's gate never even sees a
+                                    // request. Measured exactly that way, with a
+                                    // `transfer-gate:` probe on the receiver that
+                                    // never fired.
+                                    if let Some(t) = conn.transport_of(&pid) {
+                                        let _ = tx.send(Ev::ChannelReady(pid.clone(), t));
+                                    }
+                                }
+                                Err(e) => {
+                                    // The peer signed against a binding we cannot
+                                    // reproduce, which happens when its hello was
+                                    // sent before our challenge reached it. Our
+                                    // nonce is the binding WE can verify, so send
+                                    // it and let the peer re-present: its daemon
+                                    // answers an `l3-nonce` with a fresh hello
+                                    // bound to it. Retry ONCE, then refuse, so a
+                                    // genuinely bad certificate cannot loop.
+                                    if !fleet_rechallenged {
+                                        fleet_rechallenged = true;
+                                        ui::debug(&format!(
+                                            "fleet: '{fleet_target_name}' hello did not verify ({e}); re-challenging"
+                                        ));
+                                        if let (Some(t), Some(nonce)) =
+                                            (conn.transport_of(&pid), fleet_bind_ours.clone())
+                                        {
+                                            let _ = t.send_control(&json!({
+                                                "type": "l3-nonce",
+                                                "nonce": crate::overlay::b64(&nonce),
+                                            })).await;
+                                        }
+                                        continue;
+                                    }
+                                    bail!(
+                                        "refusing to send to '{fleet_target_name}': its certificate did not verify ({e})"
+                                    )
+                                }
+                            }
+                        }
+                        _ => bail!(
+                            "refusing to send to '{fleet_target_name}': cannot verify its certificate (no channel binding or no owner key)"
+                        ),
+                    }
+                }
                 Some("worker-ports") => {
                     let pid = v["for"].as_str().unwrap_or_default();
                     ui::trace(&format!("[T:SERVE] worker-ports handler: looking up key={pid}"));
@@ -14794,6 +15410,15 @@ async fn recv_cmd(
     // stay as the fast path (and old-server compat); the session is truth.
     let mut sess = session::Session::new(&display_name(), &my_uid);
     sess.channels = devices.iter().map(|(_, s)| channel_of(s)).collect();
+    // Fleet auto-mesh: one more meeting point, where devices certified by the
+    // SAME owner key find each other with no pairwise pairing. Presence there
+    // authorizes NOTHING; admission runs on the certificate. See cli/src/fleet.rs
+    // and docs/design-fleet-automesh.md.
+    if let Some(fc) = fleet::channel() {
+        if !sess.channels.contains(&fc) {
+            sess.channels.push(fc);
+        }
+    }
     // L1-a: the ephemeral SPAKE2 ceremony for a `recv <code>` claim. The typed
     // code is split CLIENT-SIDE; only the numeric nameplate is sent (pair-claim
     // {nameplate, v:2}). The words feed SPAKE2 and never reach the server. After
@@ -14933,6 +15558,15 @@ async fn recv_cmd(
                     let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
                     if !c.contains(&ek) { c.push(ek); }
                 }
+            }
+            // Fleet auto-mesh: the meeting point for same-owner devices goes in
+            // the SAME list, because this is the subscribe the daemon actually
+            // emits. (It rebuilds `c` from scratch and then overwrites
+            // sess.channels, so anything pushed onto sess.channels before this
+            // point is discarded.) Presence here authorizes nothing; admission
+            // runs on the certificate. See cli/src/fleet.rs.
+            if let Some(fc) = fleet::channel() {
+                if !c.contains(&fc) { c.push(fc); }
             }
             sess.emit(&sio, "subscribe", json!({ "channels": c })).await;
             sess.channels = c;
@@ -15330,7 +15964,30 @@ async fn recv_cmd(
     // on the next tick. Existing channels and live links are untouched.
     let mut known_channels: std::collections::HashSet<String> =
         devices.iter().map(|(_, s)| channel_of(s)).collect();
+    known_channels.extend(fleet::channel());
     let mut last_devices_scan = Instant::now();
+    // Fleet auto-mesh link state, keyed by peer sid.
+    //   pending  dialed off the fleet channel, certificate NOT yet proven. Such a
+    //            link is reachable but authorizes nothing, and in particular must
+    //            not receive an L3 route (see the l3-announce arm below).
+    //   verified fleet-hello checked out against our owner key.
+    //   greeted  we already sent ours, so a mutual hello does not ping-pong.
+    // L3/fleet binding on a transport with NO RFC-5705 exporter (the relay /
+    // DataChannel path). `Announce::verify` and `fleet-hello` are bound to the
+    // link so a captured message cannot be replayed onto another one, and
+    // direct-QUIC supplies that binding for free. A DataChannel does not, and
+    // webrtc-rs exposes no DTLS exporter, so the two ends establish one by
+    // challenge instead: each side picks a random nonce and sends it, and the
+    // PEER signs against it. Freshly generated per link, so a message captured
+    // on one link is useless on the next, which is the property the exporter was
+    // providing.
+    //   ours[pid]   what WE chose: verify messages arriving from that peer.
+    //   theirs[pid] what THEY chose: sign messages we send to them.
+    let mut bind_ours: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut bind_theirs: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut fleet_pending: std::collections::HashSet<String> = Default::default();
+    let mut fleet_verified: std::collections::HashSet<String> = Default::default();
+    let mut fleet_greeted: std::collections::HashSet<String> = Default::default();
 
     // Daemon-managed mount state: the daemon holds the sshfs child processes and
     // monitors their health centrally instead of spawning per-mount threads.
@@ -16100,7 +16757,16 @@ async fn recv_cmd(
         // ALSO satisfied when the server's digest says the room is empty and
         // no room-independent (channel) link remains, lingering dead links
         // can't block the exit when the server knows nobody's there.
-        let digest_says_alone = digest_alone && conn.links.values().all(|l| l.expected_secret.is_none());
+        // A fleet link is room-INDEPENDENT, exactly like a pair-channel link, so
+        // it must count here too. It can lack a pair secret (WebRTC fallback), and
+        // without this a daemon holding only fleet links would read as "alone" and
+        // take the quiet-exit path while peers are connected.
+        let digest_says_alone = digest_alone
+            && conn.links.keys().all(|pid| {
+                conn.links.get(pid).map(|l| l.expected_secret.is_none()).unwrap_or(true)
+                    && !fleet_pending.contains(pid)
+                    && !fleet_verified.contains(pid)
+            });
         // #28 Mode B: a dead link that keeps FLAPPING, on_stuck reconnect, or a
         // roster/session reconcile re-adopting the gone sender and re-arming
         // `expected_secret` so `digest_says_alone` never holds, must NOT block
@@ -16179,6 +16845,20 @@ async fn recv_cmd(
                     // announce is treated fresh.
                     #[cfg(l3)]
                     l3_seen.remove(&pid);
+                    // Fleet auto-mesh: forget this peer's verification too. A
+                    // reconnect gets a NEW sid and must re-prove its certificate
+                    // on the new link's binding, so carrying the old sid's verdict
+                    // forward would be exactly the stale-trust bug the channel
+                    // binding exists to prevent.
+                    fleet_pending.remove(&pid);
+                    fleet_verified.remove(&pid);
+                    fleet_greeted.remove(&pid);
+                    // A new link gets a NEW challenge. Carrying the old nonce
+                    // forward would let a message captured on the previous link
+                    // verify on this one, which is the whole thing the binding
+                    // exists to stop.
+                    bind_ours.remove(&pid);
+                    bind_theirs.remove(&pid);
                 }
             }
             Ev::PairMatched(v) => {
@@ -16264,7 +16944,17 @@ async fn recv_cmd(
                     // room-independent by design)
                     let mut gone: Vec<String> = Vec::new();
                     for (pid, l) in &conn.links {
-                        if l.expected_secret.is_none() && !present.contains(pid) {
+                        // "Channel-introduced" is the property that matters here,
+                        // and `expected_secret.is_some()` was only ever a PROXY for
+                        // it: true while every channel link carried a pair secret.
+                        // A fleet link is channel-introduced and secretless, so the
+                        // proxy reads it as room-sourced, finds it absent from the
+                        // room roster, and reaps it after two digest ticks. Test the
+                        // property directly instead of the proxy.
+                        let channel_introduced = l.expected_secret.is_some()
+                            || fleet_pending.contains(pid)
+                            || fleet_verified.contains(pid);
+                        if !channel_introduced && !present.contains(pid) {
                             let c = digest_absent.entry(pid.clone()).or_insert(0);
                             *c += 1;
                             if *c >= 2 {
@@ -16382,6 +17072,37 @@ async fn recv_cmd(
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((n.clone(), sec.clone()));
                     }
+                } else if fleet::is_fleet_channel(v["channel"].as_str().unwrap_or("")) {
+                    // Fleet auto-mesh: a device is present on our fleet meeting
+                    // point. We hold NO pair secret for it, so this is the
+                    // secretless presence path (same shape as the enrollment
+                    // channel below): dial now, prove identity with the
+                    // certificate once the link is up. Until `fleet-hello`
+                    // verifies, the link is in `fleet_pending` and authorizes
+                    // nothing.
+                    let pid = v["id"].as_str().unwrap_or_default().to_string();
+                    if !pid.is_empty() && !fleet_verified.contains(&pid) {
+                        fleet_pending.insert(pid.clone());
+                    }
+                    // Dial direct-QUIC keyed by the fleet secret. It must be
+                    // direct, not the WebRTC fallback: only a direct link exposes
+                    // an RFC-5705 channel binding, and fleet-hello is bound to it
+                    // (net.rs channel_binding() returns None). And both ends are
+                    // daemons, so without an explicit dial nobody connects at all
+                    // (maybe_adopt only prepares to ACCEPT).
+                    // GLARE: both ends see each other on the fleet channel, so
+                    // both would dial, collide, and supersede each other forever.
+                    // Measured before this guard: 1 verify, 10 drops, never
+                    // settling, which reads downstream as "peer unreachable" while
+                    // a link is visibly present. Pick ONE dialer deterministically;
+                    // both sides run the same comparison and get opposite answers,
+                    // so exactly one dials and the other accepts.
+                    if conn.my_id < pid {
+                        if let Some(rv) = fleet::rv() {
+                            conn.start_direct_fleet(&pid, &rv).await;
+                        }
+                    }
+                    conn.maybe_adopt(&v, true).await?;
                 } else if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
                     // Enrollment channel: an ephemeral device appeared on
                     // enroll_channel(own_owner_pub). Dial it (channel-presence
@@ -16728,12 +17449,68 @@ async fn recv_cmd(
                 // announce on their own ChannelReady, so each learns the other.
                 // Also replay any announce that arrived BEFORE this transport was
                 // installed (fix #3), now that the link can carry datagrams.
+                // Fleet auto-mesh: this link came off the fleet channel, so there
+                // is no pair secret to prove. Present the owner-signed certificate
+                // bound to THIS link instead.
+                // No exporter on this transport: open the challenge. Our nonce
+                // goes out now; anything we SEND waits until theirs arrives.
+                if t.channel_binding().is_none() {
+                    // Generate ONCE per link, not per ChannelReady. This fires
+                    // again on every re-establish and re-announce, and a fresh
+                    // nonce here would invalidate the one the peer is already
+                    // signing against, which shows up as a permanent
+                    // "signature or channel-binding mismatch". The nonce is
+                    // dropped with the link, so a genuinely new link still gets a
+                    // new one. Re-send the stored value every time, so a peer
+                    // that missed the first copy still gets it.
+                    let nonce = bind_ours
+                        .entry(pid.clone())
+                        .or_insert_with(link_nonce)
+                        .clone();
+                    let _ = t.send_control(&json!({
+                        "type": "l3-nonce",
+                        "nonce": crate::overlay::b64(&nonce),
+                    })).await;
+                }
+                // Only for a node that is actually IN a fleet: this fires on every
+                // ChannelReady, and a user with no fleet has nothing to diagnose
+                // here. It is what made the dial-glare visible, so it stays.
+                if fleet::rv().is_some() {
+                ui::debug(&format!(
+                    "fleet-hello decision pid={pid}: rv={} pending={} shaped={} verified={} cb={} secret={:?}",
+                    fleet::rv().is_some(),
+                    fleet_pending.contains(&pid),
+                    fleet_shaped_link(&conn, &pid),
+                    fleet_verified.contains(&pid),
+                    t.channel_binding().is_some(),
+                    conn.link(&pid).and_then(|l| l.expected_secret.as_ref().map(|(n, _)| n.clone())),
+                ));
+                }
+                if !fleet_verified.contains(&pid)
+                    && fleet::rv().is_some()
+                    && (fleet_pending.contains(&pid) || fleet_shaped_link(&conn, &pid))
+                {
+                    // Mark it, so the L3 gate and the drop-cleanup track this link
+                    // even when it arrived via warm-hold rather than presence.
+                    fleet_pending.insert(pid.clone());
+                    if let Some(cb) = out_binding(&t, &pid, &bind_theirs) {
+                        match fleet::make_hello(&cb, &display_name()) {
+                            Ok(hello) => {
+                                fleet_greeted.insert(pid.clone());
+                                let _ = t.send_control(&hello).await;
+                            }
+                            Err(e) => ui::debug(&format!("fleet-hello not sent to {pid}: {e}")),
+                        }
+                    }
+                }
                 #[cfg(l3)]
                 if let Some(l3) = l3.as_ref() {
-                    if let Some(cb) = t.channel_binding() {
+                    if let Some(cb) = out_binding(&t, &pid, &bind_theirs) {
                         if let Some(ann) = l3.make_announce(&cb) {
                             let _ = t.send_control(&ann.to_json()).await;
                         }
+                    }
+                    if let Some(cb) = in_binding(&t, &pid, &bind_ours) {
                         if let Some(pending) = l3_seen.get(&pid) {
                             if let Ok(ip) = pending.verify(&cb) {
                                 // Seq check AFTER verify, never before, so an
@@ -16742,7 +17519,11 @@ async fn recv_cmd(
                                 // channel binding and possession; none of those
                                 // stop a genuine announce being replayed onto
                                 // the SAME channel later.
-                                if l3.accept_seq(&pending.pubkey, pending.seq).await {
+                                if !fleet_route_ok(&conn, &pid, pending.relay_datagrams) {
+                                    ui::debug(&format!(
+                                        "  l3-announce from {pid} ignored: relayed link and peer does not advertise relay datagrams"
+                                    ));
+                                } else if l3.accept_seq(&pending.pubkey, pending.seq).await {
                                     let who = conn.link(&pid).map(|l| l.shown()).unwrap_or_default();
                                     let v4 = pending.addr_v4();
                                     l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t.clone()).await;
@@ -16864,7 +17645,19 @@ async fn recv_cmd(
                 // C29: an in-session pairing, exactly one side hands over a
                 // secret; consent (pair-keep-ack / our store) completes it.
                 // Only links that aren't ALREADY known are candidates.
-                let fresh_link = conn.link(&pid).map(|l| l.expected_secret.is_none()).unwrap_or(false);
+                // "No pair secret" USED to mean "a peer we have never met", which
+                // is what makes a link a candidate for the in-session ceremony.
+                // Fleet auto-mesh broke that: a sibling whose direct dial fell
+                // back to WebRTC also has no pair secret, and it would consume the
+                // code the human just typed, handing the ceremony secret to a
+                // device we already know and leaving the intended one unpaired.
+                // A fleet peer is never a pairing candidate.
+                let fresh_link = conn
+                    .link(&pid)
+                    .map(|l| l.expected_secret.is_none())
+                    .unwrap_or(false)
+                    && !fleet_pending.contains(&pid)
+                    && !fleet_verified.contains(&pid);
                 if fresh_link {
                     match ceremony {
                         Some(true) => {
@@ -16893,14 +17686,203 @@ async fn recv_cmd(
                 // when we run an overlay ourselves; ignored otherwise.
                 // Check BEFORE the catch-all guard so announces that race ahead of
                 // link creation are cached in l3_seen for replay on ChannelReady.
+                // The peer's half of the link challenge (transports with no
+                // RFC-5705 exporter). Store it, then send everything that was
+                // waiting on a binding: our announce, and our fleet-hello.
+                Some("l3-nonce") => {
+                    match v["nonce"].as_str().map(crate::overlay::unb64) {
+                        Some(Ok(nonce)) if nonce.len() >= 16 => {
+                            bind_theirs.insert(pid.clone(), nonce);
+                            if let Some(t) = conn.transport_of(&pid) {
+                                if let Some(cb) = out_binding(&t, &pid, &bind_theirs) {
+                                    #[cfg(l3)]
+                                    if let Some(l3) = l3.as_ref() {
+                                        if let Some(ann) = l3.make_announce(&cb) {
+                                            let _ = t.send_control(&ann.to_json()).await;
+                                        }
+                                    }
+                                    // Answer EVERY nonce with a fresh hello, even
+                                    // one we have already greeted. A repeat nonce
+                                    // means the peer could not verify what we sent
+                                    // (its challenge had not reached us when we
+                                    // signed) and is asking again. Honouring
+                                    // `fleet_greeted` here would leave it waiting
+                                    // forever for a proof we refuse to re-send.
+                                    if !fleet_verified.contains(&pid) {
+                                        if let Ok(hello) = fleet::make_hello(&cb, &display_name()) {
+                                            fleet_greeted.insert(pid.clone());
+                                            let _ = t.send_control(&hello).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // A short or malformed nonce is refused rather than used:
+                        // a peer that picks a weak challenge would weaken OUR
+                        // replay protection, not theirs.
+                        _ => ui::debug(&format!("l3-nonce from {pid} ignored: missing or too short")),
+                    }
+                }
+                // Fleet auto-mesh: a same-owner device is presenting its
+                // certificate. Three things must hold together (fleet.rs): live
+                // possession bound to THIS link, a certificate chaining to OUR
+                // owner key, and both naming the same device key. Anything less
+                // and the link stays unverified, so it never gains a route.
+                Some(fleet::HELLO) => {
+                    let cb = conn
+                        .transport_of(&pid)
+                        .and_then(|t| in_binding(&t, &pid, &bind_ours));
+                    let owner = fleet::my_owner_pub();
+                    match (cb, owner) {
+                        (Some(cb), Some(owner)) => {
+                            match fleet::verify_hello(&v, &cb, &owner, identity::now_secs()) {
+                                Ok(ok) if device_cert_revoked(&ok.device_pub) => {
+                                    ui::debug(&format!("fleet-hello from {pid} refused: device revoked"));
+                                    fleet_pending.remove(&pid);
+                                    conn.drop_link(&pid);
+                                }
+                                Ok(ok) => {
+                                    let fresh = fleet_verified.insert(pid.clone());
+                                    // Reachability, NOT capability: an empty
+                                    // ceiling. The link forms, warm-hold keeps it
+                                    // and L3 routes to it, while transfer, shell
+                                    // and mount still need their own grant.
+                                    // verified_name is the CAP-STORE KEY, so it is
+                                    // resolved from the PROVEN certificate key, never
+                                    // from the name the peer sent. A peer that could
+                                    // name itself could name itself after a device
+                                    // that holds grants.
+                                    let proven_name = device_name_for_pub(&ok.device_pub);
+                                    // The ceiling comes from the RECORD, which is
+                                    // what `filament grant` edits. Hardcoding it
+                                    // empty made auto-mesh peers ungrantable: the
+                                    // grant landed in devices.json and the live
+                                    // link kept refusing, so `grant` silently did
+                                    // nothing for exactly the devices this feature
+                                    // adds. A sibling we hold no record for still
+                                    // gets nothing, which is the intended
+                                    // reachability-without-capability default.
+                                    let ceiling = proven_name
+                                        .as_deref()
+                                        .and_then(device_caps)
+                                        .unwrap_or_default();
+                                    if let Some(l) = conn.link_mut(&pid) {
+                                        l.verified_name = proven_name.clone();
+                                        l.admit_delegated(ok.owner_pub, ok.device_pub, ok.cert_expires, ceiling);
+                                    }
+                                    // Answer once, so a mutual hello terminates.
+                                    if fleet_greeted.insert(pid.clone()) {
+                                        if let Some(t) = conn.transport_of(&pid) {
+                                            if let Ok(hello) = fleet::make_hello(&cb, &display_name()) {
+                                                let _ = t.send_control(&hello).await;
+                                            }
+                                        }
+                                    }
+                                    // Re-announce our overlay address: an announce
+                                    // that arrived while this link was unverified
+                                    // was DROPPED (below), so without this the
+                                    // route would never form.
+                                    #[cfg(l3)]
+                                    if let Some(l3) = l3.as_ref() {
+                                        if let Some(t) = conn.transport_of(&pid) {
+                                            if let Some(ann) = l3.make_announce(&cb) {
+                                                let _ = t.send_control(&ann.to_json()).await;
+                                            }
+                                        }
+                                    }
+                                    if fresh {
+                                        // Proven petname when we have one; otherwise
+                                        // the claimed display name, presentation only.
+                                        let shown = proven_name.clone().unwrap_or(ok.claimed_name.clone());
+                                        // Record the sibling so `filament devices`
+                                        // can show the fleet. Deliberately with NO
+                                        // pair secret: devices_load() filter-maps on
+                                        // `secret`, so this record can never become a
+                                        // channel subscription or a dial target. It is
+                                        // an INDEX ENTRY, not an authorization, and the
+                                        // empty ceiling it carries matches the link's.
+                                        if proven_name.is_none() {
+                                            if let Some(cert) = identity::DeviceCert::from_json(&v["cert"]) {
+                                                match devices_upsert_atomic(
+                                                    &shown,
+                                                    None,
+                                                    Some(&cert),
+                                                    Some(&[]),
+                                                    Some(identity::IntroScope::Device.to_byte()),
+                                                    None,
+                                                    None,
+                                                ) {
+                                                    Ok(stored) => {
+                                                        // Bind the link to the record we
+                                                        // just created. Without this the
+                                                        // FIRST contact leaves
+                                                        // verified_name unset (there was
+                                                        // no record when we looked it up),
+                                                        // so the daemon cannot resolve
+                                                        // this peer by name until some
+                                                        // later reconnect happens to
+                                                        // re-run the lookup. The name is
+                                                        // still the PROVEN one: it came
+                                                        // from the certificate we just
+                                                        // verified.
+                                                        if let Some(l) = conn.link_mut(&pid) {
+                                                            l.verified_name = Some(stored.clone());
+                                                        }
+                                                        ui::debug(&format!("fleet peer indexed as '{stored}'"));
+                                                    }
+                                                    Err(e) => ui::debug(&format!("fleet peer not indexed: {e}")),
+                                                }
+                                            }
+                                        }
+                                        // The overlay route was installed at announce
+                                        // time, when this link had no name yet, so its
+                                        // MagicDNS entry still reads as the placeholder.
+                                        // Correct it now that the certificate has named
+                                        // the device.
+                                        #[cfg(l3)]
+                                        if let Some(l3) = l3.as_ref() {
+                                            if l3.rename_peer(&pid, &l3::sanitize_host(&shown)).await {
+                                                l3.refresh_hosts().await;
+                                            }
+                                        }
+                                        ui::say(&format!("fleet device '{shown}' joined the mesh"));
+                                    }
+                                }
+                                Err(e) => {
+                                    ui::debug(&format!("fleet-hello from {pid} rejected: {e}"));
+                                    fleet_pending.remove(&pid);
+                                    conn.drop_link(&pid);
+                                }
+                            }
+                        }
+                        _ => ui::debug(&format!("fleet-hello from {pid} ignored: no channel binding or no owner key")),
+                    }
+                }
                 #[cfg(l3)]
                 Some("l3-announce") if l3.is_some() => {
+                    // A fleet link that has not proven its certificate gets NO
+                    // overlay route, and its announce is not even cached for
+                    // replay. Otherwise mere presence on the meeting point would
+                    // buy an IP route, which is the one thing the design says
+                    // presence must never buy.
+                    if fleet_identity_pending(
+                        &conn,
+                        &pid,
+                        fleet_pending.contains(&pid),
+                        fleet_verified.contains(&pid),
+                    ) {
+                        ui::debug(&format!("l3-announce from unverified fleet link {pid} ignored"));
+                        continue;
+                    }
                     match overlay::Announce::from_json(&v) {
                         Ok(ann) => {
                             l3_seen.insert(pid.clone(), ann.clone());
                             // Try to process immediately if transport is available.
                             if let Some(l3) = l3.as_ref() {
-                                match conn.transport_of(&pid).and_then(|t| t.channel_binding().map(|cb| (t, cb))) {
+                                match conn
+                        .transport_of(&pid)
+                        .and_then(|t| in_binding(&t, &pid, &bind_ours).map(|cb| (t, cb)))
+                    {
                                     Some((t, cb)) => match ann.verify(&cb) {
                                         Ok(ip) => {
                                             // Seq check AFTER verify, never before, so an
@@ -16967,6 +17949,12 @@ async fn recv_cmd(
                                                 }
                                             }
                                             let v4 = ann.addr_v4();
+                                            if !fleet_route_ok(&conn, &pid, ann.relay_datagrams) {
+                                                ui::debug(&format!(
+                                                    "  L3 route for {who} withheld: relayed link and peer does not advertise relay datagrams"
+                                                ));
+                                                continue;
+                                            }
                                             l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t).await;
                                             ui::say(&format!("  {} L3 peer {who}.mesh ({ip} / {v4})", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                                             devices_touch(&who, Some(ip), Some(v4));
@@ -17030,6 +18018,11 @@ async fn recv_cmd(
                     // would make the persisted ceiling correct but unreachable.
                     devices = devices_load();
                     sess.channels = devices.iter().map(|(_, secret)| channel_of(secret)).collect();
+                    if let Some(fc) = fleet::channel() {
+                        if !sess.channels.contains(&fc) {
+                            sess.channels.push(fc);
+                        }
+                    }
                     sess.invalidate();
                 }
                 Some("depart") => {
@@ -17075,7 +18068,18 @@ async fn recv_cmd(
                 // capability gate is the proof-verified `trusted` flag on this
                 // link (placeholder for L1-a caps); localhost-only is enforced in
                 // accept_control. A non-trusted or non-loopback open is refused.
-                Some("l2-open") | Some("l2-close") if l2_enabled => {
+                // `l2_enabled` answers "will I ACCEPT inbound stream opens", which
+                // is the right gate for `l2-open` and the WRONG one for
+                // `l2-close`. A close is the peer answering a stream WE opened, and
+                // a node that accepts no inbound opens still opens outbound ones.
+                // Gating both on it meant a refusal ("shell capability not
+                // granted") was silently discarded by the very client that asked,
+                // which then waited out its 2500ms verify window, declared the link
+                // a zombie, and fell through to a 45s cold establish that reported
+                // "can't reach". The answer had arrived in milliseconds.
+                // `l2-open` stays gated; the body already no-ops the authorization
+                // check for a close.
+                Some("l2-close") | Some("l2-open") if l2_enabled || v["type"].as_str() == Some("l2-close") => {
                     // TODO(diag acceptor): emit a diag::Attempt with role
                     // "acceptor" for this l2-open->l2-open-ack round trip. Deferred
                     // because the acceptor has no per-connect span here: this fires
@@ -18284,6 +19288,13 @@ async fn recv_cmd(
                         } else {
                             None
                         };
+                        ui::debug(&format!(
+                            "transfer-gate: from={sender_name} allowed={} legacy_ok={legacy_ok} trusted={link_trusted} binding={binding:?} own_user={} has_grant={has_grant} in_bounds={scoped_in_bounds} revoked={cert_revoked} authoritative={} reason={:?}",
+                            d.allowed(),
+                            own_user.is_some(),
+                            crate::capability::cap_authoritative(),
+                            reason
+                        ));
                         (d.allowed(), reason, d)
                     };
                     // Under authoritative, a capability Deny hard-declines
@@ -20652,6 +21663,17 @@ mod tests {
             }
         }
         assert!(checked >= 6, "expected the internal subcommand invocations to be found, got {checked}");
+    }
+
+    #[test]
+    fn parse_pidfile_reads_the_legacy_two_line_layout() {
+        // 0.8.5 and earlier wrote the exe path on a second line. A CLI upgrade
+        // must not lose track of a daemon that version started.
+        assert_eq!(parse_pidfile("3906581\n/root/.local/bin/filament\n"), Some(3906581));
+        assert_eq!(parse_pidfile("3906581"), Some(3906581));
+        assert_eq!(parse_pidfile("3906581\n"), Some(3906581));
+        assert_eq!(parse_pidfile(""), None);
+        assert_eq!(parse_pidfile("not-a-pid\n123"), None);
     }
 
     #[test]

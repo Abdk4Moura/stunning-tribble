@@ -10,8 +10,17 @@
 //! attaches an IP plane to it. Each node's overlay address is derived from its
 //! Ed25519 overlay key (see `overlay`); peers learn and TRUST each other's address
 //! via a SIGNED `l3-announce` verified against the live link's channel binding
-//! (main.rs). Only direct-QUIC links carry datagrams; relay links are skipped for
-//! now (no L3 over relay yet).
+//! (main.rs).
+//!
+//! Both link kinds carry datagrams. A direct-QUIC link uses real QUIC datagrams.
+//! A relay/DataChannel link carries IP packets on a reserved sid
+//! (`net::L3_DATAGRAM_SID`), which is reliable and ordered where IP wants
+//! neither, so it head-of-line blocks and shares the channel with file transfer.
+//! It is still far better than the alternative it replaces, which was no route at
+//! all for a pair that cannot go direct. The transport ladder always prefers
+//! direct. The SENDER only installs a relayed route when the peer advertised
+//! `dg_relay` in its announce: an older peer discards the reserved sid silently,
+//! and a route that black-holes is worse than no route.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -262,6 +271,27 @@ impl L3 {
     /// Insert a name entry into the MagicDNS table (for self-registration).
     pub async fn names_insert(&self, pid: &str, name: &str, v6: Ipv6Addr, v4: Option<Ipv4Addr>) {
         self.names.lock().await.insert(pid.to_string(), (name.to_string(), v6, v4));
+    }
+
+    /// Re-label an existing peer without touching its routes.
+    ///
+    /// A fleet peer can announce its overlay address BEFORE `fleet-hello` has
+    /// established what it is called, and the route must be installed at announce
+    /// time (that is what makes the mesh instant). The name is therefore whatever
+    /// the link was showing then, which for an unverified fleet link is a
+    /// placeholder. Once the certificate names the device, the MagicDNS entry has
+    /// to catch up, or the peer is reachable as a nonsense hostname.
+    /// Returns true when an entry was actually re-labelled.
+    pub async fn rename_peer(&self, pid: &str, name: &str) -> bool {
+        let mut names = self.names.lock().await;
+        match names.get(pid) {
+            Some((current, v6, v4)) if current != name => {
+                let (v6, v4) = (*v6, *v4);
+                names.insert(pid.to_string(), (name.to_string(), v6, v4));
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Dial `dst:port` over the overlay, in BOTH modes: a kernel `TcpStream`
