@@ -6,7 +6,8 @@
 # deadlocked, or cannot self-heal to CONNECTED. See proofs/README.md.
 #
 # The discipline this enforces: a protocol change must keep the proof green. If
-# you change the establishment FSM (cli/src/{net,main}.rs, frontend/src/lib/*.js,
+# you change the establishment FSM (crates/filament-transport/src/{net,direct}.rs,
+# cli/src/main.rs, frontend/src/lib/*.js,
 # signaling.py, CONTRACT.md), update proofs/establishment_model.py + its
 # state<->code mapping table FIRST, then make CI pass.
 

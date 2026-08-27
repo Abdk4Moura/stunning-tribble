@@ -132,3 +132,26 @@ test-record pipeline rather than as a tail-end change.
 
 Extract mechanics, then vocabulary, then transport, then the loop. In that
 order the risky step is last and lands on top of things that are already tested.
+
+## Where things moved
+
+The carves relocated files that other documents point at. Instructional
+references (the proof gate's own comment, `proofs/README.md`, WORK-STATE) were
+updated; older design docs still name the old paths and are left as the
+historical record they are.
+
+| was | is now |
+|---|---|
+| `cli/src/net.rs` | `crates/filament-transport/src/net.rs` |
+| `cli/src/direct.rs` | `crates/filament-transport/src/direct.rs` |
+| `cli/src/protocol.rs` | `crates/filament-proto/src/lib.rs` |
+| `cli/src/overlay.rs` | `crates/filament-overlay/src/lib.rs` (+ host glue kept in place) |
+| `cli/src/fleet_session.rs` | `crates/filament-fleet/src/session.rs` |
+| `cli/src/fleet.rs` | `crates/filament-fleet/src/lib.rs` (+ host glue kept in place) |
+
+A moved file that leaves stale pointers in a GATE's own instructions is the
+instrument problem in miniature: the check still runs, but the note telling you
+what to re-verify sends you somewhere that no longer exists. `proof.yml` has no
+path filters, so the gate itself never stopped firing; only its comment was
+wrong. That was luck rather than design, and worth knowing before adding path
+filters to any workflow here.

@@ -102,7 +102,8 @@ Tailscale."
   QUIC bidi stream (QUIC gives per-stream flow control + no cross-stream HoL), so a
   stalled stream no longer blocks the others. App-credit (`feat/l2-credit`) was
   tried and FAILED validation. SINGLE PATH (no v1 fallback / no compat needed).
-- File: `cli/src/direct.rs` (also touched by the WireGuard branch; merge ordering TBD).
+- File: `crates/filament-transport/src/direct.rs` (moved out of `cli/src` on
+  2026-08-27; also touched by the WireGuard branch, merge ordering TBD).
 - NEXT: mimo-0x0 returns a plan, then implements; money test = fast stream not
   blocked by a stalled slow stream over one link.
 
@@ -576,7 +577,8 @@ amendment section in `docs/design-mesh-network.md`. Proof:
      - one peer loop replacing eight: the big one, and it should be ASSEMBLED
        from the crates above rather than extracted around them.
 
-1f. **Shared module extracted: `cli/src/fleet_session.rs` (2026-08-27).**
+1f. **Shared module extracted: now `crates/filament-fleet/src/session.rs`
+   (started life as `cli/src/fleet_session.rs`, 2026-08-27).**
    The fleet identity handshake was typed out TWICE, inline: once in the
    daemon's receive loop and once in `send_cmd`. Every per-peer bug this session
    existed in one copy and not the other, and the daemon's copy was the one that
