@@ -550,6 +550,58 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    Granted transfer already works today and is verified, so this affects the
    no-grant convenience case only.
 
+1e. **`send --to <sibling>`: STAYS OPT-IN. Four bugs fixed, still ~50% (2026-08-27).**
+   Item 1b said "enable it when item 2 lands, not before". Item 2 has landed, so
+   the gate was re-examined and the flip is REFUSED on measurement.
+
+   FIRST, the instrument. Every earlier fleet-send number in this file is VOID,
+   including "verified in one topology". Repeated rig rebuilds left daemons from
+   previous runs alive, and a stale daemon sits on the SAME fleet channel under
+   the SAME owner key, so it is indistinguishable from a real sibling: the sender
+   was choosing among as many as 15 impostors instead of 2 devices. It was caught
+   only because the PAIRED control path, 8/8 in every honest run, fell to 0/8.
+   `fleetsend2.sh` now kills every scratchpad daemon and asserts zero before it
+   starts. This is the second time a fleet finding turned out to be a harness
+   defect, after the shared-inbox one; a fleet result without a stated
+   zero-daemon check should not be believed.
+
+   MEASURED, clean rig, release build, 8 attempts per direction:
+
+       sibling -> sibling    6/16   HEAD 1c4b783 (baseline)
+       sibling -> sibling    8/16   with the fixes below
+       device  -> owner     16/16   both (the ordinary PAIRED path)
+
+   So sibling send was NEVER reliable; the flag was hiding it, not protecting a
+   working feature. It fails closed and has never misdelivered in any run.
+
+   FIXED HERE, four bugs, each real and each found by measurement:
+   - `fleet_bind_ours` / `fleet_bind_theirs` / `fleet_rechallenged` were single
+     values on a channel that carries EVERY sibling, so the last peer to connect
+     overwrote the binding the previous one signed against and the real target's
+     hello failed as "channel-binding mismatch", spending the single retry.
+     Now keyed by pid. This is the same shape as the `fleet_proven` bool and the
+     THIRD instance of one-value-for-many-siblings on this channel.
+   - `fleet_bind_theirs` was written and never read; removed.
+   - A peer PROVEN to be a different sibling was dropped but not remembered, so
+     the next roster tick re-adopted it as the target, in a loop, starving the
+     real device. Now recorded in `fleet_wrong` and never targeted again.
+   - Nothing bounded how long an unproven peer could hold the target slot. The
+     OWNER is the standing case: it is PAIRED with us, so its daemon never sends
+     `fleet-hello` at all, and waiting for its proof waits forever. Now a 12s
+     per-peer budget (`FILAMENT_FLEET_PROOF_SECS`) releases the slot.
+   - Receiver side: an offer arriving while the sender's `fleet-hello` was still
+     in flight was DECIDED against a link that read `binding=None`, declining a
+     peer that was about to be Proven. Now deferred and replayed on verification.
+     Note the first version of that fix hung the replay inside `if fresh`, which
+     fires only on a link's FIRST verification, so on a warm link every deferred
+     offer was stranded: 0/8. That is "decision on a narrow view" again, mine.
+
+   WHAT REMAINS is an establishment race, not an authorization one: the failures
+   are "no peer connected within 45s", and the same send succeeds under `-vv`
+   (2/2), which changes timing. That points at discovery/establishment on the
+   fleet channel, the same area as the signaling-harness finding, and it wants a
+   deterministic harness rather than more live retries.
+
 2-DONE. **Owner-signed grant distribution: BUILT and verified (2026-08-27).**
    Owner-signed `CapOp`s now reach fleet devices two ways: seeded in the
    enrollment ack, and re-pushed on every verified `fleet-hello` so later grants

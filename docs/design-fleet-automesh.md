@@ -514,6 +514,21 @@ It is also the same shape as everything else in this document: a value whose
 scope is narrower than the decision resting on it. `fleet_proven` had no peer in
 it at all.
 
+### One value for many siblings: the recurring defect on this channel
+
+The fleet channel carries EVERY sibling. Any state describing "the peer" must
+therefore be keyed by peer, and four separate bugs have now come from state that
+was not:
+
+  `fleet_proven`        one bool  "some peer proved" read as "THIS peer proved"
+  `fleet_bind_ours`     one nonce the last connector overwrote the binding
+  `fleet_rechallenged`  one bool  one sibling spent the retry another needed
+  wrong-peer skip       no memory the dropped peer was re-adopted as the target
+
+A pair channel has exactly one peer on it, so this class of code was correct
+before auto-mesh and is wrong after it. When touching anything on the fleet
+channel, the first question is: is this per-link state stored per link?
+
 ### Grant distribution: DONE
 
 A grant is a `CapOp` with `resource: "self"`, and the self-resource id is derived
