@@ -615,9 +615,19 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    line ("N passed, M failed - route detection ... flow-preserve (#28) ...") is
    the only place that says so.
 
-   Worth fixing at the source: a gate should report success and failure under one
-   stable name, or the ratchet should carry both labels per gate. Until then the
-   ratchet says "failed under another label, or never ran" rather than guessing.
+   FIXED 2026-08-28, in the ratchet rather than in the gates. It was not just
+   11b: measured, TEN of the eleven expected-green gates announce failure under a
+   different label than success ("code transfer, hashes match" fails as "code
+   transfer", "transferred + hash match within ceiling" fails as "bulk
+   transfer", and so on). Only "unit tests" matches. So the ratchet could never
+   report FAILED for almost any gate, and every red was phrased as though the
+   gate had vanished.
+
+   `EXPECTED_GREEN` now carries `"<pass text>|<fail text>"` per gate, so the
+   three cases are distinguished: PASS, FAILED (it ran and failed), and NO
+   VERDICT (neither, which usually means the suite died earlier and marks every
+   later gate at once). Verdicts are unchanged; only the diagnosis is. Fixing it
+   here rather than by renaming gate output keeps main's test strings untouched.
 
    THE DESIGN ISSUE. `gates-ratchet.sh` treats "no `PASS:` line" as a regression,
    which conflates FAILED, DID NOT RUN, and FLAKED. Against a suite where ~9-11
