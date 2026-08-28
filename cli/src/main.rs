@@ -8316,6 +8316,19 @@ async fn pair_cmd(
                 // human meant to pair, never that the machine is one of ours, and
                 // this is the step that would otherwise turn "typed the code" into
                 // "member of the mesh".
+                // ALWAYS answer an offer, even to refuse it. Staying silent makes
+                // the other side wait out its whole window before completing as an
+                // ordinary pair, which put 15s on EVERY pairing where the peer is
+                // certless and the operator did not ask to enrol. That is most of
+                // them, and it regressed a gate that times the ceremony.
+                if data["type"].as_str() == Some("enrol-offer")
+                    && (!internal || load_owner_key().is_none())
+                {
+                    sio.emit("signal", json!({
+                        "to": from,
+                        "data": {"type": "enrol-decline", "v": 1}
+                    })).await.ok();
+                }
                 if data["type"].as_str() == Some("enrol-offer") && internal {
                     if let (Some(k), Some(owner_key)) = (cer.k(), load_owner_key()) {
                         if let (Some(nh), Some(sh)) = (
@@ -8382,6 +8395,12 @@ async fn pair_cmd(
                 // The owner certified us. Persist exactly what `join` persists, so a
                 // device enrolled by code is indistinguishable from one enrolled by
                 // invitation: same certificate, same meeting point, same policy.
+                // Refused, or the peer is not enrolling. Settle at once rather
+                // than sitting out the window: the answer has arrived, it is just
+                // "no", and an ordinary pair is exactly what happens next.
+                if data["type"].as_str() == Some("enrol-decline") {
+                    enrol_settled = true;
+                }
                 if data["type"].as_str() == Some("enrol-grant") {
                     if let Some(k) = cer.k() {
                         if let (Some(nh), Some(sh)) = (
