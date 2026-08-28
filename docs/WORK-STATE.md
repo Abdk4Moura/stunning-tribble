@@ -580,6 +580,23 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    all three runs, so nothing was broken there, but that had to be checked
    deliberately: the ratchet would not have said.
 
+   AND THE GATE THAT KEEPS FLIPPING IS 11b, WHICH FAILS UNDER A DIFFERENT NAME.
+   Its two branches do not use the same string:
+
+       ok  "active link preserved across same-uid reconnect (kept deliberately...)"
+       bad "flow-preserve (#28)"
+
+   `EXPECTED_GREEN` matches the ok-text, so a genuine failure of 11b can never be
+   matched as a FAIL by the ratchet: it sees no PASS and no FAIL under that name.
+   Every ratchet red for this gate has therefore been reported as though the gate
+   vanished, when it ran and failed under its own label. The failed-gate summary
+   line ("N passed, M failed - route detection ... flow-preserve (#28) ...") is
+   the only place that says so.
+
+   Worth fixing at the source: a gate should report success and failure under one
+   stable name, or the ratchet should carry both labels per gate. Until then the
+   ratchet says "failed under another label, or never ran" rather than guessing.
+
    THE DESIGN ISSUE. `gates-ratchet.sh` treats "no `PASS:` line" as a regression,
    which conflates FAILED, DID NOT RUN, and FLAKED. Against a suite where ~9-11
    gates are red and the green set drifts by one per run, it blocks merges at

@@ -72,8 +72,13 @@ for want in "${EXPECTED_GREEN[@]}"; do
     printf '  FAILED    %s\n' "$want"
     missing=$((missing + 1))
   else
-    # Neither PASS nor FAIL: this gate produced no verdict at all.
-    printf '  NO VERDICT %s (did it run?)\n' "$want"
+    # Neither PASS nor FAIL *under this name*, which is NOT the same as "did not
+    # run". Gates report success and failure under DIFFERENT strings: gate 11b
+    # passes as "active link preserved across same-uid reconnect ..." and fails
+    # as "flow-preserve (#28)". EXPECTED_GREEN matches the ok-text, so a genuine
+    # failure can never be matched here as FAILED. Check the run's own
+    # "N passed, M failed - <labels>" line before concluding it never ran.
+    printf '  NO PASS   %s (failed under another label, or never ran)\n' "$want"
     missing=$((missing + 1))
     not_run=$((not_run + 1))
   fi
@@ -87,8 +92,10 @@ printf '\n%s of %s expected-green gates held; run reported %s PASS / %s FAIL\n' 
 if [ "$missing" -gt 0 ]; then
   echo "FAIL: $missing gate(s) that used to pass no longer do. That is a regression, not a known-red gate." >&2
   if [ "$not_run" -gt 0 ]; then
-    echo "NOTE: $not_run of them produced NO verdict at all. Check whether the suite" >&2
-    echo "      aborted before reaching them, which marks every later gate at once." >&2
+    echo "NOTE: $not_run of them logged no PASS under the expected name. A gate reports" >&2
+    echo "      failure under a DIFFERENT label than it passes under, so read the run's" >&2
+    echo "      own \"N passed, M failed - <labels>\" line to tell a real failure from a" >&2
+    echo "      suite that aborted before reaching the gate." >&2
   fi
   echo "NOTE: this suite is known to flake (see WORK-STATE.md, 1i: 12/13/11 of the" >&2
   echo "      expected-green gates across three runs, one of which differed only in" >&2
