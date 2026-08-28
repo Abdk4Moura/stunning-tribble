@@ -72,6 +72,29 @@ WEDGE is compute (govern USE, not reachability), built as a separate product ON 
 core. Pitch: "secure compute pooling among trusted devices," never "a no-account
 Tailscale."
 
+## Build-order audit against `origin/main` (2026-08-28)
+
+The WireGuard entry claimed "ready to merge" and turned out to be half-landed
+dead code in main. That prompted checking the rest of the build order the same
+way, against the tree rather than against memory. Each line below is what
+`origin/main` actually contains, not what a section says.
+
+| item | section claims | main actually has |
+|---|---|---|
+| 1. L1 PAKE v2 | "SPEC'D, to build; CLI/native side remaining" | `cli/src/pake_ceremony.rs`, 509 lines, using spake2, plus 9 `tests/l1a` gate scripts. The CLI side IS built and shipping: `add --word` runs the ceremony today. What IS still outstanding is the server split, `backend/signaling.py` still mints words. |
+| 4. L2 per-sid QUIC | "IN PROGRESS -> mimo-0x0" | nothing. No per-sid wiring in `direct.rs`, and `origin/main..origin/feat/l2-perstream` is 0 commits, so the branch holds nothing main lacks. Not started, or lost the same way the WireGuard wiring was. |
+| 5. WireGuard L3 | "Built + measured, ready to merge" | module + ADR present, `mod wg;` declared, ZERO callers. Half-landed, dead code. See the section below. |
+| 6. Product interface | "CORE, to build" | `ctl.rs` is 849 lines with ~21 ops, no version field, no published contract. Accurate as written: the seam exists, the contract does not. |
+
+So two of the four entries overstate what exists (L1 partly, WireGuard badly),
+one understates it (L2 is not in progress, it is absent), and one is right.
+
+THE PATTERN, and it is the same one that produced the stale path pointers and a
+CI red misread as a regression: a status line is a claim about the tree that
+nobody re-checks, and it ages badly precisely where the work was interrupted.
+Anything here worth acting on should be re-verified against `main` first. It
+takes one `git grep` per entry.
+
 ## Status by workstream
 
 ### WireGuard L3 data plane -- HALF-LANDED IN MAIN, and it is dead code there
