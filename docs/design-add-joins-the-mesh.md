@@ -1,6 +1,24 @@
 # `add` must be able to put a device on the mesh
 
-> Status: diagnosed and reproduced 2026-08-27, NOT yet implemented.
+> Status: RESOLVED 2026-08-28. Diagnosed and reproduced 2026-08-27, implemented
+> in `66357a0` (enrolment over the pairing code) and `13dcc0a` (one spelling per
+> axis, and verbs that mean offer/accept).
+>
+> The surface that came out of it:
+>
+>     filament add                             offer a code, ordinary pair
+>     filament add --for device                ...and enrol into your mesh
+>     filament add --for person                ...explicitly external
+>     filament add --for device --out f.json   ...delivered as a file
+>     filament join <code>                     accept a code
+>     filament join --invite-file f.json       accept a file
+>
+> `--internal`, added in the first pass, was deleted in the second: `--for`
+> already asked that question on the invitation path, so the code path did not
+> need a second spelling of it. Net one FEWER flag than before this work began.
+>
+> The report below is kept as written, because the reproduction is the useful
+> part and it is what a future reader should compare against.
 
 ## The report
 
