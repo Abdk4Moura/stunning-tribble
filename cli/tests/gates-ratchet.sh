@@ -53,13 +53,29 @@ EXPECTED_GREEN=(
   "stepped-away sender: held"
 )
 
+# A missing PASS line has three different causes and they want different
+# responses: the gate FAILED, the gate never RAN (the suite died earlier, so
+# every later gate looks regressed at once), or it FLAKED. The verdict below is
+# unchanged - any missing PASS still fails the job - but saying WHICH is the
+# difference between a one-command diagnosis and re-reading the whole log.
+#
+# Measured 2026-08-28: three runs of this suite scored 12, 13 and 11 of the
+# expected-green gates, where the 11 differed from the 13 by one file
+# (.gitignore) and nothing else. So a red here is not on its own evidence that
+# the tree changed for the worse, and the message should not imply that it is.
 missing=0
+not_run=0
 for want in "${EXPECTED_GREEN[@]}"; do
   if grep -aq "^PASS:.*$want" "$LOG"; then
-    printf '  ok       %s\n' "$want"
-  else
-    printf '  REGRESSED %s\n' "$want"
+    printf '  ok        %s\n' "$want"
+  elif grep -aq "^FAIL:.*$want" "$LOG"; then
+    printf '  FAILED    %s\n' "$want"
     missing=$((missing + 1))
+  else
+    # Neither PASS nor FAIL: this gate produced no verdict at all.
+    printf '  NO VERDICT %s (did it run?)\n' "$want"
+    missing=$((missing + 1))
+    not_run=$((not_run + 1))
   fi
 done
 
@@ -70,6 +86,13 @@ printf '\n%s of %s expected-green gates held; run reported %s PASS / %s FAIL\n' 
 
 if [ "$missing" -gt 0 ]; then
   echo "FAIL: $missing gate(s) that used to pass no longer do. That is a regression, not a known-red gate." >&2
+  if [ "$not_run" -gt 0 ]; then
+    echo "NOTE: $not_run of them produced NO verdict at all. Check whether the suite" >&2
+    echo "      aborted before reaching them, which marks every later gate at once." >&2
+  fi
+  echo "NOTE: this suite is known to flake (see WORK-STATE.md, 1i: 12/13/11 of the" >&2
+  echo "      expected-green gates across three runs, one of which differed only in" >&2
+  echo "      .gitignore). Confirm against a re-run before concluding the tree broke." >&2
   exit 1
 fi
 echo "ratchet held. Known-red gates remain red and are tracked in #249; this job does not police them."
