@@ -74,7 +74,29 @@ Tailscale."
 
 ## Status by workstream
 
-### WireGuard L3 data plane -- BUILT + MEASURED, ready to merge
+### WireGuard L3 data plane -- HALF-LANDED IN MAIN, and it is dead code there
+
+> CORRECTION (2026-08-28). This section said "ready to merge" and named three
+> commits: adr `6639d6d`, wg module `691a4be`, wiring `08f72a4`. Checked against
+> `origin/main`, none of those three SHAs is an ancestor of main, so the numbers
+> are stale (the work reached main through different commits). What IS true:
+>
+>   - `cli/src/wg.rs` (173 lines) is in main, via `ec5d400`.
+>   - `docs/adr-0001-wireguard-as-l3-data-plane.md` is in main.
+>   - `main.rs` declares `mod wg;`.
+>   - NOTHING in main calls it. Zero `wg::` references anywhere under `cli/src`.
+>
+> So the carrier module is compiled into every shipped binary and reachable from
+> nothing: the wiring that made `serve-tun --wireguard` real did not land with
+> it. The measured numbers below were taken with that wiring in place, so they
+> do not describe main today.
+>
+> `origin/main..origin/feat/wireguard-l3` is empty, so the branch cannot supply
+> the missing piece either. Before this is called done, someone has to find where
+> the wiring went, or write it again against the current `direct.rs`/`l3.rs`,
+> which have both moved into `filament-transport` since.
+
+### WireGuard L3 data plane -- the original entry (numbers predate the split)
 - ADR: `docs/adr-0001-wireguard-as-l3-data-plane.md`
 - Branch `feat/wireguard-l3`: adr `6639d6d`, wg module `691a4be`, wiring `08f72a4`.
 - Numbers: loopback 0.48 -> 1.37 Gbps (0 retransmits vs 382); cross-machine
