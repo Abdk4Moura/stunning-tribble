@@ -7,11 +7,12 @@
 
 ## One-paragraph state
 
-filament's L3 data plane is moving to WireGuard (built + measured, branch
-`feat/wireguard-l3`, ready to merge). The identity/access/product design is
-complete and committed. The trust root, L1 PAKE v2, is spec'd with owner decisions
-locked (`L1-pake-protocol.md` §13) and is the next thing to build, contracted to
-filament-professional. Product thesis: a no-account pairwise mesh plus a secure
+filament's L3 data plane was moving to WireGuard, but only half of it landed:
+`cli/src/wg.rs` is in main with `mod wg;` declared and ZERO callers, and
+`feat/wireguard-l3` holds nothing main lacks, so the wiring has to be found or
+rewritten (audit below). The identity/access/product design is complete and
+committed. The trust root, L1 PAKE v2, is BUILT on the CLI side and running
+today; what remains there is the server nameplate split, not the ceremony. Product thesis: a no-account pairwise mesh plus a secure
 compute-pooling platform on top; the p2p send is the consumer wedge; enterprise
 features are a demand-pulled compliance envelope built LAST.
 
@@ -34,7 +35,8 @@ fallback, both dropped.)
 ## Master build order (and why this sequence)
 
 THE TRUST ARC (sequential, one continuous code area, filament-professional):
-1. **L1 PAKE v2** (trust root). PAKE closes the first-pairing MITM gap; produces
+1. **L1 PAKE v2** (trust root). CLI side BUILT (see the audit above); the server
+   split remains. PAKE closes the first-pairing MITM gap; produces
    the per-device pinned secret + v2 device record. IN PROGRESS.
 2. **Identity layer** (user-key over device-certs). The CONTINUATION of L1: extends
    the same pairing/device-record code; ADDITIVE on top of L1's device secret (user
@@ -44,7 +46,8 @@ THE TRUST ARC (sequential, one continuous code area, filament-professional):
    interface at `open`.
 
 PARALLEL CORE TRACKS (independent of the trust arc):
-4. **L2 per-sid QUIC streams** (HoL-free multiplexing). Each sid its own QUIC
+4. **L2 per-sid QUIC streams** (HoL-free multiplexing). NOT in main (see audit).
+   Each sid its own QUIC
    stream. IN PROGRESS -> mimo-0x0 (`design-l2-perstream-quic.md`, single-path).
 5. **Merge WireGuard L3 data plane** (`feat/wireguard-l3`). Built + measured, ready.
 6. **Product interface** (`docs/design-product-interface.md`). Formalize `ctl.rs`
@@ -130,7 +133,13 @@ takes one `git grep` per entry.
 - NEXT: final review + rebase on main + merge. Bench scripts in the job tmp
   (`l3bench.sh`, `wgbench.sh`, `cross_wg_bench.sh`).
 
-### L1 PAKE v2 (trust root) -- SPEC'D, DECISIONS LOCKED, to build
+### L1 PAKE v2 (trust root) -- CLI SIDE BUILT; SERVER SPLIT OUTSTANDING
+
+> Corrected 2026-08-28 against `origin/main`, see the audit above. The heading
+> said "to build". The CLI/native side IS built and shipping:
+> `cli/src/pake_ceremony.rs` is 509 lines using spake2, with 9 `tests/l1a` gate
+> scripts, and `filament add --word` runs the ceremony today. What remains is
+> the server nameplate-only split: `backend/signaling.py` still mints words.
 - Spec: `docs/L1-pake-protocol.md` (decisions §13, 2026-07-26).
 - Locked: v2-only cutover (no v1 fallback); auto-mint 16-bit (256x256);
   user-chosen gate = "2 distinct words, not a common phrase"; gate #3
@@ -142,7 +151,13 @@ takes one `git grep` per entry.
   2-4, and the §10 gates (esp. negative gates #2 server-can't-derive, #3 burn+no-retry).
 - NEXT: contract to filament-professional.
 
-### L2 per-sid QUIC streams -- IN PROGRESS (mimo-0x0)
+### L2 per-sid QUIC streams -- NOT STARTED IN main (heading said IN PROGRESS)
+
+> Corrected 2026-08-28. `origin/main` has no per-sid wiring in `direct.rs`, and
+> `origin/main..origin/feat/l2-perstream` is 0 commits, so that branch holds
+> nothing main lacks. Either the contracted work has not landed, or it went the
+> way the WireGuard wiring did. Worth confirming with mimo-0x0 before anyone
+> plans around it as in-flight.
 - Spec: `docs/design-l2-perstream-quic.md` (PROPOSED). Each L2 `sid` gets its own
   QUIC bidi stream (QUIC gives per-stream flow control + no cross-stream HoL), so a
   stalled stream no longer blocks the others. App-credit (`feat/l2-credit`) was
