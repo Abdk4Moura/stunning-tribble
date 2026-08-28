@@ -470,9 +470,9 @@ const EXAMPLES: &str = "\
 COMMANDS
   Start
     init                   create your Filament identity and first device
-    add                    connect another device: mint a code, or add <code> to claim one
-    add --for <device|person>  mint a bounded invitation; the other side joins
-    join                   claim a bounded invitation
+    add                    offer: a code, or an invitation file with --out
+    add --for device       ...and enrol them into your mesh (--for person to not)
+    join                   accept: join <code>, or join --invite-file <path>
     id                     show your identity and certified devices
   Share
     send <file>            send files (mints a one-time code, or --to <device>)
@@ -502,7 +502,7 @@ EXAMPLES
   filament video.mp4                 send it; mints a speakable one-time code + QR
   filament receive clever-lynx-63    claim a code and receive
   filament send big.iso --to laptop  send to a remembered device, no code
-  filament add                       mint a code; the other device runs `filament add <code>`
+  filament add                       offer a code; the other device runs `filament join <code>`
   filament add --for person          bounded invitation; the other device runs `filament join`
   filament up --install              always-on receiver (the daemon, autostart)
   filament shell laptop              open a shell on a known device
@@ -679,10 +679,16 @@ enum Cmd {
         /// least two words, e.g. --word "gigantic element".
         #[arg(long)]
         word: Option<String>,
-        /// Mint a bounded invitation FOR a device you control or for another
-        /// person (the other side claims it with `join`). Omit the value on a
-        /// terminal to be asked; omit the flag to mint a pairing code instead
-        /// (the other side claims it with `add <code>`).
+        /// Who is joining: `device` (one of yours, enrolled into your mesh) or
+        /// `person` (someone else, paired only). A device name is accepted and
+        /// means `device`.
+        ///
+        /// With `--out` this is delivered as a bounded invitation file; without
+        /// it you get a pairing code. Either way the other side accepts with
+        /// `join`. The transport differs; the question does not.
+        ///
+        /// Omit the value on a terminal to be asked. Omit the flag entirely for
+        /// an ordinary pair, which confers no membership.
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         for_: Option<String>,
         /// Maximum capabilities for the bounded invitation. Defaults to
@@ -695,18 +701,18 @@ enum Cmd {
         /// Write the invitation to a new owner-only file instead of displaying it.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
-        /// Enrol the other side as a device of YOURS: issue it an owner-signed
-        /// certificate and admit it to your mesh, over the pairing code.
-        ///
-        /// Without this, `add` pairs the two machines but does not confer
-        /// membership, so a device of your own ends up filed under EXTERNAL.
-        /// It is explicit on purpose: completing a pairing code proves a human
-        /// meant to pair, not that the machine on the other end is yours.
-        #[arg(long)]
-        internal: bool,
     },
-    /// Join through a bounded invitation. Invitation material is never accepted in argv.
+    /// Accept: claim a pairing code, or a bounded invitation file.
+    ///
+    /// `add` offers and `join` accepts. Which transport carried the offer (a
+    /// code you read aloud, or a file you were handed) is an argument here, not
+    /// a different verb: accepting used to be `add <code>` for one and `join`
+    /// for the other, so the verb named the transport rather than what you were
+    /// doing. `add <code>` still works.
     Join {
+        /// A pairing code from the offering device. Invitation FILE material is
+        /// never accepted in argv; use --invite-file for that.
+        code: Option<String>,
         /// Read the invitation from an owner-only regular file.
         #[arg(long, value_name = "PATH", conflicts_with = "invite_fd")]
         invite_file: Option<PathBuf>,
@@ -5649,6 +5655,43 @@ async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
     Ok(())
 }
 
+/// Resolve `--for` into "device" or "person", and an optional pre-filled name.
+///
+/// ONE spelling of the who-question, shared by both transports. It used to live
+/// inside the invitation path only, so the pairing-code path grew its own flag
+/// (`--internal`) meaning the same thing. Two spellings of one question is what
+/// made this surface confusing; the fix is one resolver, not another flag.
+///
+/// Fails closed without a TTY: a script that does not say must never be assumed
+/// to mean "this machine is mine", because that is the answer that hands out an
+/// owner-signed certificate.
+fn resolve_for_kind(
+    caps: &UiCapability,
+    for_: Option<String>,
+) -> Result<(String, Option<String>)> {
+    match for_.as_deref() {
+        None => {
+            if caps.interactive {
+                // A cancelled picker (Ctrl-C / Esc) is a cancellation, not a
+                // missing argument (#203): exit cleanly instead of reporting
+                // the non-interactive requirement.
+                let choices = vec!["A device I control".to_string(), "Another person".to_string()];
+                match codeentry::pick("WHO IS JOINING", &choices)? {
+                    Some(index) => Ok((
+                        if index == 0 { "device".to_string() } else { "person".to_string() },
+                        None,
+                    )),
+                    None => Err(cancelled()),
+                }
+            } else {
+                bail!("non-interactive add --for requires device|person or a device name")
+            }
+        }
+        Some("device") | Some("person") => Ok((for_.unwrap(), None)),
+        Some(name) => Ok(("device".to_string(), Some(name.to_string()))),
+    }
+}
+
 async fn add_for_cmd(
     caps: &UiCapability,
     for_: Option<String>,
@@ -5666,24 +5709,7 @@ async fn add_for_cmd(
     // device/person is a DEVICE NAME: select device-kind and pre-fill the
     // invitation so the owner can name the invitee up front. The literals
     // keep working for scripts.
-    let (kind, _invitee_name) = match for_.as_deref() {
-        None => {
-            if caps.interactive {
-                // A cancelled picker (Ctrl-C / Esc) is a cancellation, not a
-                // missing argument (#203): exit cleanly instead of reporting
-                // the non-interactive requirement.
-                let choices = vec!["A device I control".to_string(), "Another person".to_string()];
-                match codeentry::pick("WHO IS JOINING", &choices)? {
-                    Some(index) => ((if index == 0 { "device".to_string() } else { "person".to_string() }), None),
-                    None => return Err(cancelled()),
-                }
-            } else {
-                bail!("non-interactive add --for requires device|person or a device name");
-            }
-        }
-        Some("device") | Some("person") => (for_.unwrap(), None),
-        Some(name) => ("device".to_string(), Some(name.to_string())),
-    };
+    let (kind, _invitee_name) = resolve_for_kind(caps, for_)?;
     // The ergonomic gap behind "I want to shell into my own devices": shell has
     // to be in the invitation ceiling, because a grant cannot widen one later
     // (#226, which now refuses honestly instead of pretending). So the only way
@@ -8234,7 +8260,7 @@ async fn pair_cmd(
                     ui::say(&ui::paint(ui::Tone::Dim, "  scan this in Filament, or enter the code below it"));
                     ui::say(&ui::qr_or_text(&full, 6));
                 }
-                ui::say(&ui::paint(ui::Tone::Dim, "  on the other device: type it into the web app, or `filament add <code>`"));
+                ui::say(&ui::paint(ui::Tone::Dim, "  on the other device: type it into the web app, or `filament join <code>`"));
                 ui::say(&ui::paint(ui::Tone::Dim, "  keep this window open until the other device claims it"));
                 ui::say(&ui::paint(ui::Tone::Dim, "  one claim · expires in 10 min · paired end-to-end (no key crosses the server)"));
             }
@@ -13446,32 +13472,52 @@ async fn main() -> Result<()> {
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
         Cmd::Logs { follow, tail } => logs_cmd(follow, tail).await,
         Cmd::Reset => reset_cmd(&ui_caps),
-        Cmd::Add { code, name, word, for_, allow, expires, out, internal } => {
-            if for_.is_some() {
-                if internal {
-                    bail!(
-                        "--internal applies to the pairing-code form of `add`. \
-                         An invitation already enrols the other side; choose its \
-                         posture with --allow."
-                    );
-                }
+        Cmd::Add { code, name, word, for_, allow, expires, out } => {
+            // THREE ORTHOGONAL AXES, three spellings, no overlap:
+            //   who   --for device|person   (the same question on both transports)
+            //   how   --out                 (a file instead of a spoken code)
+            //   what  --allow               (the ceiling)
+            //
+            // `--for` used to reach only the invitation path, so the code path
+            // grew `--internal` meaning exactly the same thing. Two spellings of
+            // one question is what made this confusing, so `--for` now answers it
+            // everywhere and `--internal` is gone.
+            if out.is_some() {
+                // Delivering as a file is the invitation ceremony, unchanged.
                 add_for_cmd(&ui_caps, for_, allow, expires, out).await
-            } else {
-                // Enrolling requires the UserKey, and only the owner device holds
-                // it. Say so plainly here rather than letting the ceremony run to
-                // completion and quietly produce an ordinary pair.
+            } else if for_.is_some() {
+                // Same question, spoken-code transport. Resolving here (rather
+                // than inside the ceremony) means a script that omits the answer
+                // is refused before anything is minted.
+                let (kind, named) = resolve_for_kind(&ui_caps, for_)?;
+                let internal = kind == "device";
                 if internal && load_owner_key().is_none() {
                     bail!(
-                        "--internal needs this machine's owner key, which only the \
-                         device you ran `filament init` on holds. Run it there, or \
-                         mint an invitation with `add --for device` instead."
+                        "`add --for device` enrols the other side into your mesh, which \
+                         needs this machine's owner key. Only the device you ran \
+                         `filament init` on holds it: run it there, or use \
+                         `--for person` to pair without enrolling."
                     );
                 }
-                pair_cmd(&server, code, name, word, relay, internal, allow).await
+                pair_cmd(&server, code, name.or(named), word, relay, internal, allow).await
+            } else {
+                // No answer given and none required: an ordinary pair, which
+                // confers no membership. This is the safe default and the
+                // pre-existing behaviour.
+                pair_cmd(&server, code, name, word, relay, false, allow).await
             }
         }
-        Cmd::Join { invite_file, invite_fd, name, to } => {
-            join_cmd(&ui_caps, &server, relay, invite_file, invite_fd, name, to).await
+        Cmd::Join { code, invite_file, invite_fd, name, to } => {
+            if let Some(code) = code {
+                if invite_file.is_some() || invite_fd.is_some() {
+                    bail!("give a code or an invitation file, not both");
+                }
+                // Same ceremony `add <code>` runs: accepting a code confers no
+                // membership by itself, the offering side decides that.
+                pair_cmd(&server, Some(code), name, None, relay, false, Vec::new()).await
+            } else {
+                join_cmd(&ui_caps, &server, relay, invite_file, invite_fd, name, to).await
+            }
         }
         Cmd::Depart => depart_cmd(&server, relay).await,
         Cmd::Devices { action, json } => {
@@ -18586,7 +18632,7 @@ async fn recv_cmd(
                 ui::say("");
                 ui::say(&format!("      {}", ui::paint(ui::Tone::Brand, &c.to_uppercase())));
                 ui::say("");
-                ui::say(&ui::paint(ui::Tone::Dim, "  say it aloud; they type it in the web app or `filament add <code>` / one claim / 10 min"));
+                ui::say(&ui::paint(ui::Tone::Dim, "  say it aloud; they type it in the web app or `filament join <code>` / one claim / 10 min"));
             }
             Ev::PairUsed(_) => {
                 ui::say(&ui::paint(ui::Tone::Dim, "  code claimed, connecting..."));
