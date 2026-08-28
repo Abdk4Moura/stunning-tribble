@@ -669,8 +669,6 @@ enum Cmd {
     /// Add a device or person with consent on both ends.
     #[command(next_help_heading = "Connect")]
     Add {
-        /// A code from the other device; omit to mint one for them
-        code: Option<String>,
         /// What to call them (asked interactively if omitted)
         #[arg(long)]
         name: Option<String>,
@@ -5926,7 +5924,7 @@ async fn join_cmd(
         let _ = execute!(err, terminal::LeaveAlternateScreen);
         result?
     } else {
-        bail!("non-interactive join requires --invite-file <path> or --invite-fd <fd>");
+        bail!("non-interactive join requires a code (`join <code>`), --invite-file <path>, or --invite-fd <fd>");
     });
     let inv = parse_invitation_v2(invitation.as_str())?;
     if inv.expires <= identity::now_secs() {
@@ -13163,6 +13161,26 @@ async fn main() -> Result<()> {
             None => return Ok(()),
         }
     }
+    // `add <code>` was how you accepted a code until the verbs split by role.
+    // Clap answers it with "unexpected argument", which tells someone with the
+    // old habit nothing about where the verb went. Name the replacement instead:
+    // a removed spelling should point at its successor, once, and then be gone.
+    // Global flags precede the verb (`filament --no-interactive add <code>`), so
+    // find `add` rather than assuming argv[1], and inspect the token after it.
+    if let Some(i) = argv.iter().position(|a| a == "add") {
+        if let Some(next) = argv.get(i + 1).cloned() {
+            // A code looks like WORD-WORD-1234: dashes AND digits. A device name
+            // passed to --for may contain dashes but no digits, so requiring a
+            // digit keeps `--for my-laptop` out of this.
+            let looks_like_code = !next.starts_with('-')
+                && next.contains('-')
+                && next.chars().any(|c| c.is_ascii_digit())
+                && next.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+            if looks_like_code {
+                bail!("`add` offers, `join` accepts. To claim that code run:  filament join {next}");
+            }
+        }
+    }
     let cli = Cli::parse_from(argv);
     let ui_caps = UiCapability::from_cli(&cli);
     // Resolve the global output verbosity ONCE, before any worker spawns:
@@ -13472,7 +13490,12 @@ async fn main() -> Result<()> {
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
         Cmd::Logs { follow, tail } => logs_cmd(follow, tail).await,
         Cmd::Reset => reset_cmd(&ui_caps),
-        Cmd::Add { code, name, word, for_, allow, expires, out } => {
+        Cmd::Add { name, word, for_, allow, expires, out } => {
+            // `add` OFFERS. Accepting is `join`, which is the only spelling now:
+            // `add <code>` was the second one, and per WORK-STATE's no-backward-
+            // compat rule (no real users yet, clean breaks everywhere) a second
+            // spelling of one action is exactly what that rule exists to remove.
+            let code: Option<String> = None;
             // THREE ORTHOGONAL AXES, three spellings, no overlap:
             //   who   --for device|person   (the same question on both transports)
             //   how   --out                 (a file instead of a spoken code)

@@ -696,7 +696,7 @@ FILAMENT_CONFIG_DIR="$DA17" timeout 90 "$BIN" add --name boxB --server "$SERVER"
 P17=$!; pids+=($P17); sleep 4
 C17=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17-a.log" | head -1 | tr 'A-Z' 'a-z')
 G17=0
-FILAMENT_CONFIG_DIR="$DB17" timeout 90 "$BIN" add "$C17" --name boxA --server "$SERVER" >"$WORK/g17-b.log" 2>&1 || G17=1
+FILAMENT_CONFIG_DIR="$DB17" timeout 90 "$BIN" join "$C17" --name boxA --server "$SERVER" >"$WORK/g17-b.log" 2>&1 || G17=1
 wait $P17 || G17=1
 CHA=$(FILAMENT_CONFIG_DIR="$DA17" "$BIN" devices | grep -oE 'channel [0-9a-f]+' | head -1)
 CHB=$(FILAMENT_CONFIG_DIR="$DB17" "$BIN" devices | grep -oE 'channel [0-9a-f]+' | head -1)
@@ -716,7 +716,7 @@ CR=$!; pids+=($CR); sleep 4
 CX=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17c-a.log" | head -1 | tr 'A-Z' 'a-z')
 T0=$(date +%s)
 FILAMENT_TEST_PAIR_STALL=1 FILAMENT_PAIR_GRACE_SECS=5 FILAMENT_CONFIG_DIR="$DC/b" \
-  timeout 90 "$BIN" add "$CX" --name orphan --server "$SERVER" >"$WORK/g17c-b.log" 2>&1
+  timeout 90 "$BIN" join "$CX" --name orphan --server "$SERVER" >"$WORK/g17c-b.log" 2>&1
 RC=$?; T1=$(date +%s)
 kill $CR 2>/dev/null; wait $CR 2>/dev/null
 if [ $RC -ne 0 ] && [ $((T1 - T0)) -lt 30 ] \
@@ -846,7 +846,7 @@ FILAMENT_CONFIG_DIR="$DA19" timeout 90 "$BIN" add --name boxB --server "$SERVER"
 P19=$!; pids+=($P19); sleep 4
 C19=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g19-pa.log" | head -1 | tr 'A-Z' 'a-z')
 G19=0
-FILAMENT_CONFIG_DIR="$DB19" timeout 90 "$BIN" add "$C19" --name boxA --server "$SERVER" >"$WORK/g19-pb.log" 2>&1 || G19=1
+FILAMENT_CONFIG_DIR="$DB19" timeout 90 "$BIN" join "$C19" --name boxA --server "$SERVER" >"$WORK/g19-pb.log" 2>&1 || G19=1
 wait $P19 || G19=1
 FILAMENT_TEST_EMIT_LOSS=0.5 FILAMENT_TEST_EMIT_SEED=16 FILAMENT_CONFIG_DIR="$DB19" \
   timeout 120 "$BIN" up --dir "$D19" --server "$SERVER" </dev/null >"$WORK/g19-up.log" 2>&1 &
