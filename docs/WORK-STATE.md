@@ -551,6 +551,42 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    Granted transfer already works today and is verified, so this affects the
    no-grant convenience case only.
 
+1i. **The deterministic-core ratchet flakes, measured (2026-08-28).** Recorded
+   because it will be hit again and looks exactly like a regression.
+
+   Three CI runs of `Gates Core`, and the middle one contains ALL of the pairing
+   and enrolment work:
+
+       8929218  before that work    12 passed, 10 failed
+       4ac8494  after it, PASSED    13 passed,  9 failed
+       f2d24b1  .gitignore ONLY     11 passed, 11 failed  <- ratchet went RED
+
+   `f2d24b1` differs from `4ac8494` by one file, `.gitignore`, and the deletion
+   of untracked build artifacts. No source, no test, no gate script. So the green
+   set moves by +-1 on an unchanged tree: `kill-resume` failed in the first run
+   and passed in the other two, `code transfer` passed twice and failed once.
+
+   Two consequences worth keeping.
+
+   FIRST, a red here is not evidence on its own. It was taken as proof that the
+   enrolment commit had regressed gate 11b, and the commit carrying all of that
+   work in fact scored BEST of the three. The 15s pairing delay that was fixed in
+   response was real and independently measured (15s -> 1s), but the CI red that
+   prompted the look was flake. Right repair, wrong stated cause.
+
+   SECOND, `pair-ceremony` and `pair fail-fast` are KNOWN-RED and therefore
+   invisible to the ratchet, which is exactly where a real regression could hide
+   while the pairing ceremony was being changed. They are byte-identical across
+   all three runs, so nothing was broken there, but that had to be checked
+   deliberately: the ratchet would not have said.
+
+   THE DESIGN ISSUE. `gates-ratchet.sh` treats "no `PASS:` line" as a regression,
+   which conflates FAILED, DID NOT RUN, and FLAKED. Against a suite where ~9-11
+   gates are red and the green set drifts by one per run, it blocks merges at
+   random and teaches people to force past it, which is the opposite of what a
+   ratchet is for. Either quarantine the unstable gates by name, or require N
+   consecutive reds before failing.
+
 1g. **libfilament: four crates carved (2026-08-27).** See
    `docs/design-libfilament.md` for the rule and the order.
 
