@@ -695,6 +695,15 @@ enum Cmd {
         /// Write the invitation to a new owner-only file instead of displaying it.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
+        /// Enrol the other side as a device of YOURS: issue it an owner-signed
+        /// certificate and admit it to your mesh, over the pairing code.
+        ///
+        /// Without this, `add` pairs the two machines but does not confer
+        /// membership, so a device of your own ends up filed under EXTERNAL.
+        /// It is explicit on purpose: completing a pairing code proves a human
+        /// meant to pair, not that the machine on the other end is yours.
+        #[arg(long)]
+        internal: bool,
     },
     /// Join through a bounded invitation. Invitation material is never accepted in argv.
     Join {
@@ -6898,6 +6907,60 @@ fn mesh_enrolment(
     Ok((cert, payload))
 }
 
+/// Store an owner-signed enrolment received over the pairing ceremony.
+///
+/// VERIFIES BEFORE IT STORES. The grant arrives sealed under the PAKE key, so
+/// only the party we completed the ceremony with could have sent it, but that
+/// says who sent it and nothing about whether it is well-formed. A certificate
+/// that does not name OUR device key, or does not verify, is refused rather than
+/// written: the whole value of the certificate is that it names one key.
+fn persist_mesh_grant(grant: &Value) -> Result<()> {
+    if local_device_cert_path().exists() {
+        bail!("this device already holds a certificate; refusing to overwrite it");
+    }
+    let our_pub = crate::overlay::overlay_pubkey_bytes()
+        .map_err(|e| anyhow!("cannot read this device's key: {e}"))?;
+    let cert = identity::DeviceCert::from_json(&grant["device_cert"])
+        .ok_or_else(|| anyhow!("the enrolment carried no certificate"))?;
+    if cert.device_pub != our_pub {
+        bail!("the certificate names a different device; refusing it");
+    }
+    cert.verify(identity::now_secs())
+        .map_err(|e| anyhow!("the certificate does not verify: {e}"))?;
+    let owner_name = grant["owner_name"].as_str().unwrap_or("owner");
+    crate::platform::SecretFile::write_str(
+        &local_device_cert_path(),
+        &serde_json::to_string_pretty(
+            &json!({ "name": owner_name, "cert": cert.to_json() }),
+        )?,
+    )?;
+    // The meeting point, and the owner-signed policy that makes it useful. Each
+    // op is verified against the owner key in the header, so this is a relay of
+    // the owner's decisions rather than trust in whoever transmitted them.
+    if let Some(rv) = grant["fleet_rv"].as_str() {
+        if let Err(e) = fleet::store_rv(rv) {
+            ui::debug(&format!("fleet rendezvous secret not stored: {e}"));
+        }
+    }
+    if let Some(hdr) = grant["cap_header"].as_object() {
+        let dir = crate::settings::config_dir();
+        let mut store = crate::capability::load_cap_store(&dir);
+        let already = store.iter().any(|e| {
+            e.get("type").and_then(|x| x.as_str()) == Some("cap_header")
+                && e["resource"].as_str() == Some("self")
+        });
+        if !already {
+            store.push(Value::Object(hdr.clone()));
+            let _ = crate::capability::save_cap_store(&dir, &store);
+        }
+    }
+    if let Some(ops) = grant.get("cap_ops").and_then(|v| v.as_array()) {
+        let added = merge_owner_cap_ops(ops);
+        ui::debug(&format!("mesh grant: merged {added} owner-signed ops"));
+    }
+    Ok(())
+}
+
 fn down_cmd() -> Result<()> {
     match daemon_alive() {
         Some(pid) => {
@@ -7650,7 +7713,19 @@ fn invitation_not_a_code_msg() -> String {
         .to_string()
 }
 
-async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, mut word: Option<String>, relay: bool) -> Result<()> {
+/// `internal` means: issue the peer an owner-signed certificate and admit it to
+/// this mesh. `posture` is the ceiling to grant it, empty meaning the
+/// same-person default. Both are decided by the operator at the moment of
+/// adding, because that is when they know what the machine is for.
+async fn pair_cmd(
+    server: &str,
+    mut code: Option<String>,
+    name: Option<String>,
+    mut word: Option<String>,
+    relay: bool,
+    internal: bool,
+    posture: Vec<String>,
+) -> Result<()> {
     if code.is_none() && word.is_none() && !interactive_allowed() {
         let (message, exit_code) = fleet_ui::pair_ui::err_pair_interactive();
         eprintln!("{message}");
@@ -7835,6 +7910,17 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
     // Peer identity cert received via identity-expose inside the authed PAKE channel.
     // The flow exposes EXACTLY ONE device + its cert; privacy test asserts on actual wire payload.
     let mut peer_identity_cert: Option<identity::DeviceCert> = None;
+    // A certless device offers its device key once, so an owner running
+    // `add --internal` has something to certify.
+    let mut sent_enrol_offer = false;
+    // Set once the owner's answer has been handled. A device that OFFERED its key
+    // must not finish the ceremony before the answer lands: the owner sends the
+    // grant only after seeing the offer, so completing on the pairing result alone
+    // exits first and the certificate is never stored. That is exactly what left
+    // `add --internal` reporting success on the owner side while the device stayed
+    // EXTERNAL.
+    let mut enrol_settled = false;
+    let mut enrol_deadline: Option<Instant> = None;
     let mut sent_identity: bool = false;
     let mut identity_exchange_window: Option<std::time::Instant> = None;
     // Peer signaling sid we run the PAKE with (set when the link is adopted).
@@ -7871,6 +7957,49 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         if let Some(n) = petname.clone() {
             if let Some(sec) = agreed_secret.clone() {
                 if identity_exchange_window.map_or(false, |dl| std::time::Instant::now() < dl) && peer_identity_cert.is_none() {
+                    // A device that holds NO certificate yet still has a device
+                    // key, and that key is the thing an owner must certify. The
+                    // exchange below is gated on having a cert to present, so a
+                    // fresh machine said nothing at all and the owner had nothing
+                    // to sign. That is why `add` could never enrol anybody.
+                    //
+                    // Expose the key alone, sealed under the PAKE key and proven
+                    // by possession. It confers nothing by itself: the owner still
+                    // has to decide to certify it, and only does so when the
+                    // operator asked for --internal.
+                    if !sent_enrol_offer && local_device_cert().is_none() {
+                        if let (Some(ref pid2), Some(k)) = (pake_peer.clone(), cer.k()) {
+                            if let Ok(dpub) = crate::overlay::overlay_pubkey_bytes() {
+                                let mut cmv_arr = [0u8; 32];
+                                if let Some(l) = conn.link(&pid2) {
+                                    if let Some((my_fp, their_fp)) = match &l.peer { Some(p) => p.fingerprints().await, None => None } {
+                                        let cmv = crate::pake::our_confirm(k, &my_fp, &their_fp, cer.caps_canon(), cer.scope());
+                                        cmv_arr.copy_from_slice(&cmv);
+                                        let caps_d = crate::identity::caps_digest(cer.caps_canon());
+                                        let pmsg = crate::identity::possession_msg(
+                                            0x01, &cmv_arr, cer.scope(), &caps_d, &[0u8; 32], &dpub, &[0u8; 32],
+                                        );
+                                        if let Ok(psig) = crate::overlay::overlay_sign_possession(&pmsg) {
+                                            let inner = serde_json::json!({
+                                                "device_pub": hex::encode(dpub),
+                                                "possession_sig": hex::encode(psig),
+                                                "name": display_name(),
+                                            });
+                                            let sk = crate::identity::sealing_key_from_k(k);
+                                            if let Ok((n, sealed)) = crate::identity::seal_plaintext(&sk, inner.to_string().as_bytes()) {
+                                                sio.emit("signal", serde_json::json!({
+                                                    "to": pid2,
+                                                    "data": {"type": "enrol-offer", "v": 1,
+                                                             "nonce": hex::encode(n), "sealed": hex::encode(sealed)}
+                                                })).await.ok();
+                                                sent_enrol_offer = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if !sent_identity {
                         if let Some(local_cert) = local_device_cert() {
                             if let Some(ref pid2) = pake_peer {
@@ -7901,6 +8030,28 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                         }
                     }
                 } else {
+                // We offered our device key and the owner has not answered yet.
+                // Wait, bounded: if no grant arrives we finish as an ordinary
+                // pair, which is the pre-existing behaviour, so waiting can only
+                // add an outcome and never remove one.
+                // NOT `continue`: that jumps to the top of the loop and skips the
+                // event processing further down, so the ceremony would spin here
+                // for the whole window without ever READING the grant it is
+                // waiting for. Measured exactly that way: the owner logged the
+                // grant, the claimer logged "no grant arrived", and no signal was
+                // processed in between. Fall through to the event loop instead and
+                // re-enter this block on the next pass.
+                let awaiting_enrolment = sent_enrol_offer && !enrol_settled && {
+                    let dl = *enrol_deadline
+                        .get_or_insert_with(|| Instant::now() + Duration::from_secs(15));
+                    if Instant::now() >= dl {
+                        ui::debug("enrol: no grant arrived; completing as an ordinary pair");
+                        false
+                    } else {
+                        true
+                    }
+                };
+                if !awaiting_enrolment {
                 let same_person = peer_identity_cert
                     .as_ref()
                     .and_then(|cert| load_owner_key().map(|owner| owner.public_key_bytes() == cert.user_pub))
@@ -7951,7 +8102,9 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 }
                 tokio::time::sleep(Duration::from_millis(300)).await; // let acks flush
                 let _ = sio.disconnect().await;
-                return Ok(());                } // close identity_exchange_window else
+                return Ok(());
+                } // close: not awaiting an enrolment answer
+                } // close identity_exchange_window else
 
             }
         }
@@ -8158,6 +8311,110 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 // Identity expose: sealed cert + possession signature, inside authed PAKE channel.
                 // Fixes holes A (confidentiality+integrity via K-derived seal, server never sees user_pub)
                 // and B (replayable bearer: possession signature over session-bound confirm MAC, bound to device key).
+                // A certless peer offered its device key. Certify it ONLY when the
+                // operator asked for --internal: completing a pairing code proves a
+                // human meant to pair, never that the machine is one of ours, and
+                // this is the step that would otherwise turn "typed the code" into
+                // "member of the mesh".
+                if data["type"].as_str() == Some("enrol-offer") && internal {
+                    if let (Some(k), Some(owner_key)) = (cer.k(), load_owner_key()) {
+                        if let (Some(nh), Some(sh)) = (
+                            data.get("nonce").and_then(|v| v.as_str()),
+                            data.get("sealed").and_then(|v| v.as_str()),
+                        ) {
+                            if let (Ok(nb), Ok(sb)) = (hex::decode(nh), hex::decode(sh)) {
+                                if nb.len() == 12 {
+                                    let mut na = [0u8; 12];
+                                    na.copy_from_slice(&nb);
+                                    let sk = identity::sealing_key_from_k(k);
+                                    if let Ok(pt) = identity::open_sealed(&sk, &na, &sb) {
+                                        if let Ok(inner) = serde_json::from_slice::<Value>(&pt) {
+                                            let dpub = inner.get("device_pub").and_then(|v| v.as_str())
+                                                .and_then(|h| hex::decode(h).ok())
+                                                .filter(|b| b.len() == 32)
+                                                .map(|b| { let mut a = [0u8; 32]; a.copy_from_slice(&b); a });
+                                            if let Some(dpub) = dpub {
+                                                // The posture the operator chose. Empty means the
+                                                // same-person convenience; anything given is the
+                                                // ceiling verbatim, so a device added deliberately
+                                                // without shell does not get shell.
+                                                let caps: Vec<String> = if posture.is_empty() {
+                                                    vec![
+                                                        "transfer".to_string(),
+                                                        "mount".to_string(),
+                                                        "shell".to_string(),
+                                                    ]
+                                                } else {
+                                                    posture.clone()
+                                                };
+                                                let expires = identity::now_secs()
+                                                    .saturating_add(identity::CERT_TTL_SECS);
+                                                match mesh_enrolment(&owner_key, dpub, &caps, expires, true) {
+                                                    Ok((_cert, mut grant)) => {
+                                                        grant["type"] = json!("enrol-grant");
+                                                        grant["owner_name"] = json!(display_name());
+                                                        if let Ok((gn, gs)) = identity::seal_plaintext(
+                                                            &sk, grant.to_string().as_bytes(),
+                                                        ) {
+                                                            sio.emit("signal", json!({
+                                                                "to": from,
+                                                                "data": {"type": "enrol-grant", "v": 1,
+                                                                         "nonce": hex::encode(gn),
+                                                                         "sealed": hex::encode(gs)}
+                                                            })).await.ok();
+                                                            ui::say(&format!(
+                                                                "  {} enrolling as one of your devices (ceiling: {})",
+                                                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                                                capability_list_summary(&caps)
+                                                            ));
+                                                        }
+                                                    }
+                                                    Err(e) => ui::debug(&format!("enrol grant failed: {e}")),
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // The owner certified us. Persist exactly what `join` persists, so a
+                // device enrolled by code is indistinguishable from one enrolled by
+                // invitation: same certificate, same meeting point, same policy.
+                if data["type"].as_str() == Some("enrol-grant") {
+                    if let Some(k) = cer.k() {
+                        if let (Some(nh), Some(sh)) = (
+                            data.get("nonce").and_then(|v| v.as_str()),
+                            data.get("sealed").and_then(|v| v.as_str()),
+                        ) {
+                            if let (Ok(nb), Ok(sb)) = (hex::decode(nh), hex::decode(sh)) {
+                                if nb.len() == 12 {
+                                    let mut na = [0u8; 12];
+                                    na.copy_from_slice(&nb);
+                                    let sk = identity::sealing_key_from_k(k);
+                                    if let Ok(pt) = identity::open_sealed(&sk, &na, &sb) {
+                                        if let Ok(grant) = serde_json::from_slice::<Value>(&pt) {
+                                            enrol_settled = true;
+                                            match persist_mesh_grant(&grant) {
+                                                Ok(()) => ui::say(&format!(
+                                                    "  {} joined {}'s mesh",
+                                                    ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                                    ui::paint(ui::Tone::Bold,
+                                                        grant["owner_name"].as_str().unwrap_or("the owner"))
+                                                )),
+                                                Err(e) => ui::say(&ui::paint(
+                                                    ui::Tone::Warn,
+                                                    &format!("  paired, but could not join the mesh: {e}"),
+                                                )),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if data["type"].as_str() == Some("identity-expose") {
                     if let Some(k) = cer.k() {
                         if let Some(nonce_hex) = data.get("nonce").and_then(|v| v.as_str()) {
@@ -13170,11 +13427,28 @@ async fn main() -> Result<()> {
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
         Cmd::Logs { follow, tail } => logs_cmd(follow, tail).await,
         Cmd::Reset => reset_cmd(&ui_caps),
-        Cmd::Add { code, name, word, for_, allow, expires, out } => {
+        Cmd::Add { code, name, word, for_, allow, expires, out, internal } => {
             if for_.is_some() {
+                if internal {
+                    bail!(
+                        "--internal applies to the pairing-code form of `add`. \
+                         An invitation already enrols the other side; choose its \
+                         posture with --allow."
+                    );
+                }
                 add_for_cmd(&ui_caps, for_, allow, expires, out).await
             } else {
-                pair_cmd(&server, code, name, word, relay).await
+                // Enrolling requires the UserKey, and only the owner device holds
+                // it. Say so plainly here rather than letting the ceremony run to
+                // completion and quietly produce an ordinary pair.
+                if internal && load_owner_key().is_none() {
+                    bail!(
+                        "--internal needs this machine's owner key, which only the \
+                         device you ran `filament init` on holds. Run it there, or \
+                         mint an invitation with `add --for device` instead."
+                    );
+                }
+                pair_cmd(&server, code, name, word, relay, internal, allow).await
             }
         }
         Cmd::Join { invite_file, invite_fd, name, to } => {
