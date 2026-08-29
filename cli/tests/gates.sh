@@ -513,7 +513,19 @@ else bad "uid supersede"; tail -n 4 "$WORK/g11-send.log" "$WORK/g11-recv2.log"; 
 say "11b: active same-uid link survives a live reconnect (#28)"
 D1B="$WORK/g11b1"; D2B="$WORK/g11b2"; mkdir -p "$D1B" "$D2B"
 # -v on the sender: "keeping active link" is a DEBUG (resilience-internal) line.
-"$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11b-send.log" 2>&1 &
+# The gate needs the transfer STILL FLOWING when R2 rejoins. Without a stall it
+# raced the machine: 80 MB at the ~96 MB/s gate 9 measures is under a second, and
+# the 8 MB threshold below is crossed in ~0.08s, inside the first poll. On a fast
+# runner the transfer finished before the reconnect, "keeping active link" never
+# printed, and the gate failed BECAUSE the machine was quick. Same problem, and
+# the same remedy, as FILAMENT_TEST_PAIR_STALL in gate 17b.
+#
+# 3ms is chosen, not guessed: 80 MB in ~60 KiB chunks is ~1365 chunks, so 3ms
+# each adds ~4.1s and the transfer lasts ~4.9s. R2 is spawned within ~0.6s (a
+# 0.5s poll plus process start), so the reconnect lands mid-flight with about 8x
+# margin, and the suite pays four seconds. 25ms would have added 34s.
+FILAMENT_TEST_TRANSFER_STALL_MS=${FILAMENT_TEST_TRANSFER_STALL_MS:-3} \
+  "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11b-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W2=$(wait_code "$WORK/g11b-send.log") || { bad "flow-preserve (no code minted)"; tail -n 3 "$WORK/g11b-send.log"; }
 FILAMENT_UID="livedev$$" "$BIN" receive "$W2" -y --dir "$D1B" --server "$SERVER" >"$WORK/g11b-recv1.log" 2>&1 &

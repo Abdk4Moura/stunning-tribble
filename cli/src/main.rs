@@ -166,6 +166,21 @@ mod test_hooks {
     pub fn no_direct() -> bool {
         std::env::var("FILAMENT_TEST_NO_DIRECT").map(|v| v == "1").unwrap_or(false)
     }
+    /// gate 11b: hold each chunk briefly so a transfer is still FLOWING when the
+    /// gate's second receiver rejoins.
+    ///
+    /// 11b asserts that a same-uid reconnect does not tear down a live transfer,
+    /// which requires the transfer to still be live when the reconnect lands. It
+    /// waits for 8 MB of an 80 MB file, but that file moves at ~96 MB/s on CI, so
+    /// the whole thing finishes in under a second and the reconnect arrives after
+    /// the fact. The gate then fails on a FAST machine, which is why it flips run
+    /// to run. Same problem, and same remedy, as `pair_stall` for gate 17b.
+    pub fn transfer_stall_ms() -> u64 {
+        std::env::var("FILAMENT_TEST_TRANSFER_STALL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
     /// gate 18b: revert the mode-B post-completion drop to reconnect-always.
     pub fn disable_modeb_drop() -> bool {
         std::env::var("FILAMENT_TEST_DISABLE_MODEB_DROP").is_ok()
@@ -270,6 +285,8 @@ mod test_hooks {
 #[cfg(not(feature = "test-hooks"))]
 mod test_hooks {
     #[inline] pub fn pair_stall() -> bool { false }
+    /// No stall in a build without test hooks: the send loop is untouched.
+    #[inline] pub fn transfer_stall_ms() -> u64 { 0 }
     #[inline] pub fn webrtc_relay_only() -> bool { false }
     #[inline] pub fn disable_modeb_drop() -> bool { false }
     #[inline] pub fn no_defer() -> bool { false }
@@ -16413,6 +16430,14 @@ async fn stream_one(
             }
 
             while pos < end {
+                // Gate 11b only: slow the send so the transfer is still in flight
+                // when the reconnect lands. Zero in every build without test
+                // hooks, and the no-hook twin returns 0, so the shipped loop is
+                // unchanged.
+                let stall = test_hooks::transfer_stall_ms();
+                if stall > 0 {
+                    tokio::time::sleep(Duration::from_millis(stall)).await;
+                }
                 // Fire the NEXT read (into the alternate buffer) BEFORE sending.
                 let next_want = std::cmp::min(chunk as u64, end - (pos + cur_n as u64)) as usize;
                 let next_read = if next_want > 0 {

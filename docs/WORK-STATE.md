@@ -691,8 +691,16 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    lands inside the window. Enlarging the payload only buys margin; it does not
    make the gate deterministic, and it makes every run slower.
 
-   Until then this gate will keep flipping, and a ratchet that fails the build on
-   it will keep blocking green PRs at random.
+   FIXED 2026-08-29. `FILAMENT_TEST_TRANSFER_STALL_MS` holds each chunk briefly,
+   exactly as `FILAMENT_TEST_PAIR_STALL` does for 17b, and 11b sets it to 3ms.
+   That number is derived, not guessed: 80 MB in ~60 KiB chunks is ~1365 chunks,
+   so 3ms each adds ~4.1s and the transfer lasts ~4.9s, against the ~0.6s R2
+   needs to spawn. About 8x margin for four seconds of suite time. (25ms, the
+   first value tried, would have added 34s.)
+
+   Both halves verified: the hook string is present in a `--features test-hooks`
+   build and ABSENT from a release build, which is the property the "release
+   build (no test-hooks)" job exists to protect.
 
    THE DESIGN ISSUE. `gates-ratchet.sh` treats "no `PASS:` line" as a regression,
    which conflates FAILED, DID NOT RUN, and FLAKED. Against a suite where ~9-11
