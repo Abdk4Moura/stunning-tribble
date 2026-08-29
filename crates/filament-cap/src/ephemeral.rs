@@ -798,12 +798,18 @@ impl EnrollmentPayload {
     /// Nonce is NOT in the JSON — the verifier supplies its own.
     pub fn from_json(v: &serde_json::Value) -> Option<Self> {
         use base64::Engine;
-        let principal = if let Some(b64) = v.get("inv_v2").and_then(|x| x.as_str()) {
-            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64).ok()?;
-            EnrollmentPrincipal::Compact(Invitation::from_payload(&bytes)?)
-        } else {
-            EnrollmentPrincipal::Legacy(AuthKey::from_json(v.get("auth_key")?)?)
-        };
+        // ONE ACCEPTED SHAPE. This used to fall back to a Legacy principal read
+        // from an `auth_key` field. The producer of that shape was `ephemeral
+        // mint`, which no longer exists, so nothing could legitimately send it,
+        // and an enrolment parser that still accepts it is a second way to
+        // become a principal kept alive past its reason.
+        //
+        // Closing the request handler alone was NOT enough: the daemon reaches
+        // this function on the RESPONSE path, so the shape stayed reachable
+        // through a different door. Both are shut here.
+        let b64 = v.get("inv_v2").and_then(|x| x.as_str())?;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64).ok()?;
+        let principal = EnrollmentPrincipal::Compact(Invitation::from_payload(&bytes)?);
         let device_pub: [u8; 32] = hex::decode(v.get("device_pub")?.as_str()?).ok()?.try_into().ok()?;
         let enroll_possession_sig: [u8; 64] = hex::decode(v.get("enroll_possession_sig")?.as_str()?).ok()?.try_into().ok()?;
         let device_possession_sig: [u8; 64] = hex::decode(v.get("device_possession_sig")?.as_str()?).ok()?.try_into().ok()?;
@@ -1836,10 +1842,16 @@ mod tests {
         let mut nonce = [0u8; 32];
         rng.fill(&mut nonce).unwrap();
 
-        let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
-        let payload = EnrollmentPayload::build(EnrollmentPrincipal::Legacy(ak), device_pub, &enroll_kp, &device_kp, nonce, verifier_pub);
+        // Round-trips the SURVIVING shape. It used to build a Legacy principal,
+        // and from_json now refuses that: nothing produces it since `ephemeral
+        // mint` was collapsed into `add --for runner`, and an enrolment parser
+        // that still accepted it was a second way to become a principal.
+        let _ = enroll_pub;
+        let inv = mint_v2(&owner);
+        let payload = EnrollmentPayload::build(EnrollmentPrincipal::Compact(inv), device_pub, &enroll_kp, &device_kp, nonce, verifier_pub);
         let json = payload.to_json();
-        let round = EnrollmentPayload::from_json(&json).unwrap();
+        let round = EnrollmentPayload::from_json(&json)
+            .expect("the one accepted shape must round-trip through JSON");
         assert_eq!(payload.device_pub, round.device_pub);
         assert_eq!(payload.enroll_possession_sig, round.enroll_possession_sig);
         assert_eq!(payload.device_possession_sig, round.device_possession_sig);

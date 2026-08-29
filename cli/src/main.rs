@@ -6611,31 +6611,31 @@ async fn respond_to_auth_key_enroll_request(
     // that rationale is stale and it made the flagship join flow fail for a
     // default-configured owner. The joined device's ceiling binds either way.
 
-    // #186: the enrollment request carries the compact v2 invitation
-    // (base64url). The legacy v1 mint/enroll path (hidden) still sends the
-    // `auth_key` JSON, and its joiner verifies the daemon by full-issuer, so
-    // both are accepted here.
+    // ONE READER. The enrolment request carries the invitation payload,
+    // base64url. There was a second branch here for an `auth_key` JSON, whose
+    // own comment said "the legacy v1 mint/enroll path (hidden) still sends"
+    // it: that path was `ephemeral mint`, which no longer exists, so nothing
+    // produces that form and this accepted a shape it could never receive.
+    //
+    // A second accepted credential shape on an ENROLMENT handler is not free
+    // even when unused. It is a second way to become a principal, reviewed
+    // once and then carried, and it is the kind of thing that outlives the
+    // reason it was added.
     let ak = {
         use base64::Engine;
-        if let Some(v2_b64) = v.get("auth_key_v2").and_then(|x| x.as_str()) {
-            let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(v2_b64) else {
+        let Some(v2_b64) = v.get("auth_key_v2").and_then(|x| x.as_str()) else {
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+            return;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(v2_b64) else {
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+            return;
+        };
+        match crate::ephemeral::Invitation::from_payload(&bytes) {
+            Some(inv) => crate::ephemeral::EnrollmentPrincipal::Compact(inv),
+            None => {
                 let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
                 return;
-            };
-            match crate::ephemeral::Invitation::from_payload(&bytes) {
-                Some(inv) => crate::ephemeral::EnrollmentPrincipal::Compact(inv),
-                None => {
-                    let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
-                    return;
-                }
-            }
-        } else {
-            match crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v)) {
-                Some(ak) => crate::ephemeral::EnrollmentPrincipal::Legacy(ak),
-                None => {
-                    let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
-                    return;
-                }
             }
         }
     };
