@@ -5097,83 +5097,11 @@ fn mint_capability(raw: &str) -> Result<String> {
 }
 
 
-/// CLI handler for `filament ephemeral`
-/// Interactive options for `ephemeral mint`.
-///
-/// Two things shape this. Arrow keys already navigate, so the list does not need
-/// a "More..." ITEM: an item consumes a slot, sits between real choices, and
-/// reads with their weight while deciding nothing. What a long list DOES need is
-/// to admit its length, which the picker's viewport now does with "N more"
-/// counts rather than silently truncating.
-///
-/// That frees the ambient key for something worth a keybinding: switching what
-/// KIND of access is being granted. A temporary key and a permanent device are
-/// the same question ("what may it do") with different answers about how long,
-/// and making that a toggle shows both live rather than making the operator back
-/// out and run a different verb.
-///
-/// Returns None when the operator switched to the permanent-device path, which
-/// the caller turns into the enrolment flow instead.
-fn interactive_mint_options(
-    ttl_default: u64,
-    reuse_default: &str,
-) -> Result<Option<(Vec<String>, u64, String)>> {
-    let bundle = |n: usize| -> Vec<String> {
-        let mut c = vec!["transfer".to_string()];
-        if n >= 1 {
-            c.push("mount".to_string());
-        }
-        if n >= 2 {
-            c.push("shell".to_string());
-        }
-        c
-    };
-    let items: Vec<String> = vec![
-        "Send and receive files".to_string(),
-        "...and mount my folders".to_string(),
-        "...and open a terminal   (OWNER-EQUIVALENT)".to_string(),
-        "Lifetime and reuse...".to_string(),
-    ];
+// interactive_mint_options lived here. It drove the guided capability/lifetime
+// picker for `ephemeral mint`, and went dead when that verb collapsed into
+// `add --for runner`. Left behind by that change and found by the warning
+// count, not by reading: rustc had been saying "never used" ever since.
 
-    let mut caps = bundle(0);
-    let mut ttl = ttl_default;
-    let mut reuse = reuse_default.to_string();
-
-    loop {
-        let header = format!(
-            "WHAT THIS KEY MAY DO   [temporary key \u{b7} {} \u{b7} {}]",
-            human_duration(ttl),
-            reuse.to_lowercase(),
-        );
-        match codeentry::pick_with_keys(
-            &header,
-            &items,
-            &[('p', "permanent device instead")],
-        )? {
-            codeentry::Picked::Item(n @ 0..=2) => return Ok(Some((bundle(n), ttl, reuse))),
-            codeentry::Picked::Item(3) => {
-                let secs = [(900u64, "15 minutes"), (3600, "1 hour"), (86_400, "1 day"), (604_800, "7 days")];
-                let l: Vec<String> = secs.iter().map(|(_, t)| t.to_string()).collect();
-                match codeentry::pick("LIFETIME", &l)? {
-                    Some(n) if n < secs.len() => ttl = secs[n].0,
-                    _ => return Err(cancelled()),
-                }
-                let uses = [("Once", "Once, then it is spent"), ("N(3)", "Up to 3 times"), ("Reusable", "Any number of times")];
-                let l2: Vec<String> = uses.iter().map(|(_, t)| t.to_string()).collect();
-                match codeentry::pick("HOW MANY TIMES", &l2)? {
-                    Some(n) if n < uses.len() => reuse = uses[n].0.to_string(),
-                    _ => return Err(cancelled()),
-                }
-                // Back to the main list, whose header now shows the new values.
-            }
-            // The toggle: this is not a temporary key at all, it is a device of
-            // yours. Hand back to the enrolment path rather than minting.
-            codeentry::Picked::Key('p') => return Ok(None),
-            codeentry::Picked::Item(_) | codeentry::Picked::Key(_) => {}
-            codeentry::Picked::Cancelled => return Err(cancelled()),
-        }
-    }
-}
 
 /// Render a duration the way the pickers show it.
 fn human_duration(secs: u64) -> String {
@@ -6287,186 +6215,18 @@ async fn enroll_and_send_cmd(
     Ok(())
 }
 
-/// Enroll as delegated + open shell in one session.
-/// Same flow as enroll_and_send_cmd but opens an l2 shell instead of sending files.
-async fn enroll_and_netcat_cmd(
-    server: &str,
-    auth_key_path: PathBuf,
-    to_name: Option<String>,
-    rport: u16,
-    relay: bool,
-) -> Result<()> {
-    let ak = load_delegation(&auth_key_path)?;
-    let enroll_seed: [u8; 32] = ak.enroll_private_key;
-    let device_pub = crate::overlay::overlay_pubkey_bytes()?;
+// enroll_and_netcat_cmd lived here: 178 lines that enrolled with a delegated
+// credential and then opened an l2 shell. It had NO caller, and the verb it
+// served was removed earlier (see the note about the dead netcat verb and its
+// ProxyCommand call sites). It shared 138 of 169 normalised lines with
+// enroll_and_send_cmd and had already drifted from it.
+//
+// Deleted rather than deduplicated. The first move here was to lift the shared
+// prologue and loop into one driver with a tail enum, which built and passed,
+// and was the wrong answer: it was abstracting a branch nothing could reach.
+// With one live caller there is nothing to share, and a plain function is
+// simpler than an enum that exists to serve a dead arm.
 
-    ui::say(&format!("  {} enrolling as delegated (caps: {})",
-        ui::paint(ui::Tone::Dim, "->"),
-        capability_list_summary(&ak.caps)));
-
-    let enroll_chan = crate::ephemeral::enroll_channel_fp(&ak.issuer_fp);
-    let my_uid = mk_uid("n");
-    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let sio = net::connect_signaling(server, tx.clone()).await?;
-    let mut sess = session::Session::new(&display_name(), &my_uid);
-    sess.channels = vec![enroll_chan.clone()];
-    sess.room = Some(format!("enrollup-{}", fresh_secret()));
-    sess.emit(&sio, "join", json!({ "room": sess.room.as_ref().unwrap(), "name": display_name(), "uid": my_uid })).await;
-    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
-
-    let mut conn = Conn::for_command(server, sio.clone(), tx.clone(), my_uid, relay, to_name.clone(), false, direct::direct_enabled());
-
-    {
-        let tx = tx.clone();
-        tokio::spawn(async move { let _ = tokio::signal::ctrl_c().await; let _ = tx.send(Ev::Interrupted); });
-    }
-
-    let started = Instant::now();
-    let deadline = Duration::from_secs(60);
-
-    loop {
-        if started.elapsed() >= deadline { return Err(enrollment_timeout(deadline.as_secs())); }
-        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
-        let Ok(Some(ev)) = ev else {
-            if conn.active.is_some() { break; }
-            continue;
-        };
-        match ev {
-            Ev::Welcome(v) => {
-                // The owner daemon is already in the enroll room; the server hands
-                // us its roster here. Dial each peer (owner answers) so rendezvous
-                // does not depend on a later peer-joined we would otherwise miss.
-                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
-                if let Some(peers) = v["peers"].as_array() {
-                    for p in peers { conn.maybe_adopt(p, true).await?; }
-                }
-            }
-            Ev::PeerJoined(v) => { conn.maybe_adopt(&v, true).await?; }
-            Ev::Synced(v) => {
-                if let Some(roster) = sess.on_synced(&v) {
-                    for p in &roster.peers {
-                        conn.maybe_adopt_from(p, true, AdoptSource::Digest).await?;
-                    }
-                    for p in &roster.channel_peers {
-                        if p["channel"].as_str() == Some(enroll_chan.as_str())
-                            && !is_self_uid(&conn.my_uid, p["uid"].as_str())
-                        {
-                            conn.maybe_adopt_from(p, true, AdoptSource::Digest).await?;
-                        }
-                    }
-                }
-            }
-            Ev::KnownPeer(v) => {
-                // Enroller drives: dial the owner daemon (present on the enroll
-                // channel) as the IMPOLITE offerer; the owner answers via
-                // ensure_responder. Server presence does not reliably notify the
-                // pre-existing owner of a late enroller, so we must initiate.
-                if !is_self_uid(&conn.my_uid, v["uid"].as_str())
-                    && v["channel"].as_str() == Some(enroll_chan.as_str())
-                {
-                    let pid = v["id"].as_str().unwrap_or_default().to_string();
-                    if !pid.is_empty() && !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid) {
-                        conn.roster.insert(pid.clone(), v.clone());
-                        conn.establish_as(v.clone(), Some(false)).await?;
-                        if conn.active.is_none() { conn.active = Some(pid); }
-                    }
-                }
-            }
-            Ev::Signal(v) => {
-                let from = v["from"].as_str().unwrap_or_default().to_string();
-                let data = v["data"].clone();
-                conn.ensure_responder(&from, &data).await?;
-                conn.apply_signal(&from, data).await;
-            }
-            Ev::DirectReady(pid, t, route) => {
-                conn.adopt_direct(&pid, t.clone(), route);
-                let _ = tx.send(Ev::ChannelReady(pid, t));
-            }
-            Ev::ChannelReady(pid, t) => {
-                open_enrollment(&mut conn, &pid, &t, enroll_seed, device_pub, &ak).await;
-            }
-            Ev::Control(pid, v) => match v["type"].as_str() {
-                Some("identity-auth-key-enroll-challenge") => {
-                    if let Some(t) = conn.transport_of(&pid) {
-                        let nonce_hex = v["nonce"].as_str().unwrap_or_default();
-                        let verifier_hex = v["verifier_pub"].as_str().unwrap_or_default();
-                        let cert_val = v.get("device_cert").cloned().unwrap_or(serde_json::Value::Null);
-                        if let (Ok(nonce_bytes), Ok(verifier_bytes)) = (hex::decode(nonce_hex), hex::decode(verifier_hex)) {
-                            if let (Ok(nonce_arr), Ok(verifier_pub)) = (
-                                nonce_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
-                                verifier_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
-                            ) {
-                                if let Some(response) = crate::ephemeral::build_enrollment_response(&pid, nonce_arr, verifier_pub, &cert_val) {
-                                    let _ = t.send_control(&json!({
-                                        "type": "identity-auth-key-enroll-response",
-                                        "auth_key": response["auth_key"],
-                                        "device_pub": response["device_pub"],
-                                        "enroll_possession_sig": response["enroll_possession_sig"],
-                                        "device_possession_sig": response["device_possession_sig"],
-                                    })).await;
-                                }
-                            }
-                        }
-                    }
-                }
-                Some("identity-auth-key-enroll-ack") => {
-                    let name = persist_join_ack(&v, &ak)?;
-                    ui::say(&format!("  {} joined as {name}", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-                    conn.active = Some(pid.clone());
-                    break;
-                }
-                Some("identity-auth-key-enroll-error") => {
-                    bail!("enrollment denied: {}", v["reason"].as_str().unwrap_or("unknown"));
-                }
-                _ => {}
-            },
-            Ev::Interrupted => bail!("interrupted"),
-            _ => {}
-        }
-    }
-
-    ui::say(&format!("  {} opening shell to port {}", ui::paint(ui::Tone::Dim, "->"), rport));
-    let active_pid = conn.active.as_ref().cloned().unwrap_or_default();
-    let t = conn.transport_of(&active_pid)
-        .ok_or_else(|| anyhow::anyhow!("no transport after enrollment"))?;
-    // Send l2-open request for shell on rport
-    let r = t.send_control(&json!({
-        "type": "l2-open",
-        "host": "127.0.0.1",
-        "rport": rport,
-    })).await;
-    match r {
-        Ok(()) => {
-            ui::say(&format!("  {} shell request sent", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-            // Wait for l2-open-ack or close
-            let shell_start = Instant::now();
-            loop {
-                if shell_start.elapsed() >= Duration::from_secs(30) {
-                    bail!("shell request timed out (no response from owner)");
-                }
-                let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
-                let Ok(Some(ev)) = ev else { continue; };
-                if let Ev::Control(ref pid, ref v) = ev {
-                    if pid == &active_pid {
-                        match v["type"].as_str() {
-                            Some("l2-open-ack") => {
-                                ui::say(&format!("  {} shell authorized (sid {})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), v["sid"]));
-                                break;
-                            }
-                            Some("l2-close") => {
-                                bail!("shell refused: {}", v["err"].as_str().unwrap_or("not authorized"));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                if matches!(ev, Ev::Interrupted) { bail!("interrupted"); }
-            }
-        }
-        Err(e) => bail!("failed to send shell request: {e}"),
-    }
-    Ok(())
-}
 
 /// Respond to an identity-auth-key-enroll-request with a nonce challenge.
 /// Step 1: rate-limit BEFORE expensive ops (anti-flood).
