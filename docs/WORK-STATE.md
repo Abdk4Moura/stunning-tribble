@@ -675,6 +675,43 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1k. **The flake was measured again, and I misread it twice (2026-08-29).** Item
+   1i said "a red here is not evidence on its own". I read that sentence, quoted
+   it while analysing a red, and then treated the red as proof anyway. Recording
+   the numbers and the mistake, because the mistake is the reusable part.
+
+   Extracting the authorization preamble (five copies -> one function) produced:
+
+       tree            Gates Core
+       clean           56cc23b PASS, 8848880 PASS            2 of 2
+       authz           44e91bf FAIL, 44e91bf PASS on re-run,
+                       f185f9c FAIL                          1 of 3
+
+   THE SAME COMMIT BOTH FAILED AND PASSED. 44e91bf's two attempts ran the same
+   tree and disagreed, which is the cleanest possible demonstration that this
+   gate cannot, by itself, tell you whether a tree regressed. `code transfer` is
+   the same gate 1i already named as flipping.
+
+   8848880 is a free CONTROL and worth noticing as a technique: it was a revert,
+   so its main.rs is byte-identical to 56cc23b. Running the gate on a tree you
+   already have a result for is how you separate "this change broke it" from
+   "this gate flips", and it cost nothing because the revert had to run anyway.
+
+   WHAT THE NUMBERS SUPPORT, which is less than it looks: clean 2/2 against
+   authz 1/3 leans toward a real difference and is nowhere near evidence. Fisher
+   exact is about p=0.4. At these sizes the honest answer is "unproven", and the
+   experiment that settles it is several samples per tree BEFORE interpreting
+   any single result.
+
+   THE FAILURE MODE, twice in one hour and in opposite directions. First I
+   shipped the extraction claiming "every decision below the preamble is
+   byte-identical", an argument that examined cert_revoked and generalised to
+   the other four inputs, ignoring that borrows had become owned copies and that
+   an immutable borrow of `conn` held across the arm was dropped. Then I read two
+   reds as "two independent runs" and reverted, when they came from a gate
+   already measured as non-deterministic. Neither error was a missing fact. Both
+   were a conclusion running ahead of what had actually been checked.
+
 1i. **The deterministic-core ratchet flakes, measured (2026-08-28).** Recorded
    because it will be hit again and looks exactly like a regression.
 
