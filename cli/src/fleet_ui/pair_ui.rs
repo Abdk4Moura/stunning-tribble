@@ -135,9 +135,23 @@ pub fn render_inter_user_success(peer_name: &str, cap: &str, expiry: &str) -> St
 pub fn err_pair_interactive() -> (String, i32) {
     (
         format!(
-            "{err} add is interactive (it needs consent on both ends). For automation, create a bounded invitation instead:\n  {fix}",
+            "{err} `add` with no arguments needs a person at both ends: it reads out a code \
+             for someone to type. In a script, write an invitation they claim later instead:\n\n               {a}\n  {b}\n  {c}\n\n               A bare name means a device you own. They claim it with:  {j}",
             err = ui::paint(Tone::Err, ui::glyph_err()),
-            fix = "filament add --for device",
+            // EVERY SUGGESTED COMMAND HERE RUNS. The previous version said
+            // `filament add --for device`, which fails with this very message
+            // (--out is required too), so the error told you to run the thing
+            // that produced it. A suggested command is a claim about behaviour,
+            // and that one had never been checked against the path it describes.
+            //
+            // Each line answers a different thing the operator might have meant,
+            // because "what did you want" is the question a bare `add` leaves
+            // open, and the claim side is named because an invitation nobody
+            // knows how to redeem is not a working instruction.
+            a = ui::paint(Tone::Brand, "filament add laptop --out laptop.invite      a device you own"),
+            b = ui::paint(Tone::Brand, "filament add --for person --out alice.invite  someone else"),
+            c = ui::paint(Tone::Brand, "filament add --for runner --out ci.key        a CI runner"),
+            j = ui::paint(Tone::Brand, "filament join <file>"),
         ),
         super::EXIT_BAD_ARG,
     )
@@ -203,9 +217,59 @@ mod tests {
     #[test]
     fn err_pair_interactive_exit_code() {
         let (msg, code) = err_pair_interactive();
-        assert!(msg.contains("interactive"), "must explain why");
-        assert!(msg.contains("add --for"), "must suggest the bounded invitation");
+        assert!(msg.contains("both ends"), "must explain why a script cannot do this");
+        assert!(msg.contains("join"), "must name the claim side, or the advice is half a ceremony");
         assert_eq!(code, 2, "bad-arg = exit 2");
+    }
+
+    /// EVERY SUGGESTED COMMAND MUST RUN.
+    ///
+    /// This message used to suggest `filament add --for device`, which fails
+    /// with this very message because --out is required too: the error told you
+    /// to run the thing that produced it. Nothing caught it, because no test
+    /// read error text.
+    ///
+    /// So the assertion is not "mentions --for" (the old one, which the broken
+    /// suggestion satisfied) but "clap accepts what this tells you to type".
+    #[test]
+    fn every_suggested_command_parses() {
+        use clap::Parser;
+        let (msg, _) = err_pair_interactive();
+        let plain = strip_ansi(&msg);
+        let mut checked = 0;
+        for line in plain.lines() {
+            let Some(start) = line.find("filament ") else { continue };
+            // the command runs to the double-space that starts its description
+            let rest = &line[start..];
+            let cmd = rest.split("  ").next().unwrap_or(rest).trim();
+            if cmd.contains('<') {
+                continue; // a placeholder, not a literal command
+            }
+            let argv: Vec<&str> = cmd.split_whitespace().collect();
+            assert!(
+                crate::Cli::try_parse_from(&argv).is_ok(),
+                "suggested command does not parse: {cmd}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 3, "expected the three concrete suggestions, saw {checked}");
+    }
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for c2 in chars.by_ref() {
+                    if c2 == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     #[test]

@@ -687,6 +687,13 @@ enum Cmd {
     /// Add a device or person with consent on both ends.
     #[command(next_help_heading = "Connect")]
     Add {
+        /// Who you are adding: a name for the device or person. `filament add
+        /// laptop` is the short way to say `--for laptop`, which means a device
+        /// of yours called laptop.
+        ///
+        /// The name is the thing you always know, so it is the thing that does
+        /// not need a flag. Everything else has a default or is asked.
+        who: Option<String>,
         /// What to call them (asked interactively if omitted)
         #[arg(long)]
         name: Option<String>,
@@ -5452,7 +5459,14 @@ fn resolve_for_kind(
                     None => Err(cancelled()),
                 }
             } else {
-                bail!("non-interactive add --for requires device|person or a device name")
+                // A NUDGE, not a restatement of the rule. The operator got this
+                // far because they wanted to add something; tell them the next
+                // command for each thing they might have meant, and name the
+                // claim side too, because an invitation is useless if you do not
+                // know the other end runs `join`.
+                bail!(
+                    "--for needs to know who is joining:\n                       a device you own   filament add laptop --out laptop.invite\n                       someone else       filament add --for person --out alice.invite\n                       a CI runner        filament add --for runner --out ci.key\n\n                       A bare name means a device, so `add laptop` is `--for laptop`.\n                       They claim it with:  filament join <file>"
+                )
             }
         }
         Some("device") | Some("person") | Some("runner") => Ok((for_.unwrap(), None)),
@@ -5526,7 +5540,17 @@ async fn add_for_cmd(
         caps.confirm("include deliberate remote authority in this invitation ceiling")?;
     }
     if !caps.interactive && out.is_none() {
-        bail!("non-interactive add --for requires --out <new-owner-only-file>");
+        // They already said who. Do not re-explain --for; name the one missing
+        // piece, with a filename derived from what they actually typed so the
+        // suggestion is copy-pasteable rather than a template.
+        let suggested = invite_path_for(_invitee_name.as_deref(), &kind);
+        bail!(
+            "a script has to say where the invitation goes ({} would hold a credential):\n               filament add {} --out {}\n\n               Then on that machine:  filament join {}",
+            "nothing can ask you",
+            _invitee_name.clone().unwrap_or_else(|| format!("--for {kind}")),
+            suggested.display(),
+            suggested.display(),
+        );
     }
     let owner_key = identity::UserKey::load(&crate::platform::PlatformKeyStore)?
         .ok_or_else(|| anyhow!("no identity. Run `filament init` first"))?;
@@ -7380,6 +7404,28 @@ fn peer_authz(conn: &mut Conn, pid: &str) -> PeerAuthz {
         idev,
         iusr,
     }
+}
+
+/// Does this positional look like a pairing code rather than a device name?
+///
+/// `add <name>` and the removed `add <code>` spelling occupy the same argv slot,
+/// so this decides which the operator meant. A code is WORD-WORD-NNNN or
+/// WORD-WORD-WORD-NNNN: at least two dashes and a last segment of exactly four
+/// digits, the machine-assigned connect number.
+///
+/// The old rule was "contains a dash and any digit", which was fine while the
+/// name only arrived through --for and became wrong the moment it went
+/// positional: `add my-laptop-2` was answered with "run filament join
+/// my-laptop-2".
+fn token_is_pairing_code(token: &str) -> bool {
+    let segs: Vec<&str> = token.split('-').collect();
+    !token.starts_with('-')
+        && segs.len() >= 3
+        && segs
+            .last()
+            .map(|t| t.len() == 4 && t.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false)
+        && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 fn cancelled() -> anyhow::Error {
@@ -12928,13 +12974,21 @@ async fn main() -> Result<()> {
     // find `add` rather than assuming argv[1], and inspect the token after it.
     if let Some(i) = argv.iter().position(|a| a == "add") {
         if let Some(next) = argv.get(i + 1).cloned() {
-            // A code looks like WORD-WORD-1234: dashes AND digits. A device name
-            // passed to --for may contain dashes but no digits, so requiring a
-            // digit keeps `--for my-laptop` out of this.
-            let looks_like_code = !next.starts_with('-')
-                && next.contains('-')
-                && next.chars().any(|c| c.is_ascii_digit())
-                && next.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+            // A code is WORD-WORD-NNNN or WORD-WORD-WORD-NNNN: at least two
+            // dashes, and a LAST segment of exactly four digits (the machine
+            // assigned connect number).
+            //
+            // The old rule was "contains a dash and any digit", justified by
+            // "a device name may contain dashes but no digits". That held while
+            // the name only arrived via --for. `add <name>` is positional now,
+            // so the same token is a legitimate name and the loose rule refuses
+            // it: `add my-laptop-2` was answered with "run filament join
+            // my-laptop-2". Tightened against the format codes actually have.
+            //
+            //   brave-otter-ruby-3141  3 dashes, last 4 digits  -> code
+            //   my-laptop-2            2 dashes, last 1 digit   -> name
+            //   macbook-2019           1 dash                   -> name
+            let looks_like_code = token_is_pairing_code(&next);
             if looks_like_code {
                 bail!("`add` offers, `join` accepts. To claim that code run:  filament join {next}");
             }
@@ -13249,7 +13303,21 @@ async fn main() -> Result<()> {
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
         Cmd::Logs { follow, tail } => logs_cmd(follow, tail).await,
         Cmd::Reset => reset_cmd(&ui_caps),
-        Cmd::Add { name, word, for_, allow, expires, out, via } => {
+        Cmd::Add { who, name, word, for_, allow, expires, out, via } => {
+            // `filament add laptop` == `filament add --for laptop`. `--for`
+            // already accepts a device NAME (that is how --for my-laptop works),
+            // so the positional needs no new meaning, only a shorter spelling of
+            // the one thing the operator always knows.
+            //
+            // Naming it twice is a contradiction, not a precedence puzzle, so it
+            // is refused rather than silently resolved.
+            let for_ = match (who, for_) {
+                (Some(w), None) => Some(w),
+                (Some(w), Some(f)) => {
+                    bail!("you named the invitee twice: `add {w}` and `--for {f}`. Use one.")
+                }
+                (None, f) => f,
+            };
             // `add` OFFERS. Accepting is `join`, which is the only spelling now:
             // `add <code>` was the second one, and per WORK-STATE's no-backward-
             // compat rule (no real users yet, clean breaks everywhere) a second
@@ -23750,10 +23818,14 @@ mod tests {
         let caps = UiCapability { interactive: false, json: false, yes: true, color: false };
         for spelled in [Some(String::new()), Some("   ".to_string())] {
             let err = resolve_for_kind(&caps, spelled).expect_err("empty --for must not resolve silently");
-            assert!(
-                err.to_string().contains("requires device|person"),
-                "an unanswered --for must be refused, got: {err}"
-            );
+            let msg = err.to_string();
+            // The refusal is the same; the message became a nudge. Assert what
+            // it must DO (name each thing the operator might have meant, and the
+            // claim side) rather than a phrase, so improving the wording does
+            // not fail the test while a wrong suggestion would pass it.
+            assert!(msg.contains("--for person"), "must name the person option: {msg}");
+            assert!(msg.contains("--for runner"), "must name the runner option: {msg}");
+            assert!(msg.contains("join"), "must name the claim side: {msg}");
         }
         // An explicit answer still resolves without asking.
         assert_eq!(resolve_for_kind(&caps, Some("device".into())).unwrap().0, "device");
@@ -23761,6 +23833,27 @@ mod tests {
         // And a bare word is still a DEVICE NAME, which is why "" reached that arm.
         let (kind, named) = resolve_for_kind(&caps, Some("my-laptop".into())).unwrap();
         assert_eq!((kind.as_str(), named.as_deref()), ("device", Some("my-laptop")));
+    }
+
+    #[test]
+    fn a_device_name_is_not_mistaken_for_a_pairing_code() {
+        // `add <name>` shares its argv slot with the removed `add <code>`, so
+        // this predicate decides which was meant. Pinned because the previous
+        // rule ("a dash and any digit") was correct for the surface it was
+        // written against and silently wrong once the name went positional.
+        for code in ["brave-otter-ruby-3141", "ACCEPTANCE-ALPHA-3779", "a-b-0000"] {
+            assert!(token_is_pairing_code(code), "{code} is a code");
+        }
+        for name in [
+            "my-laptop-2",     // 2 dashes, but one digit
+            "macbook-2019",    // a year, only one dash
+            "laptop",
+            "work-laptop",
+            "pi-4",
+            "node-01-12345",   // five digits, not the connect number
+        ] {
+            assert!(!token_is_pairing_code(name), "{name} is a device name");
+        }
     }
 
     #[test]
