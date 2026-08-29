@@ -134,17 +134,12 @@ fn render_device_row(d: &DeviceEntry) -> String {
         DeviceTier::NeedsReview => ui::paint(Tone::Warn, ui::glyph_review()),
         DeviceTier::MeshRoster => ui::paint(Tone::Brand, ui::glyph_mesh()),
     };
-<<<<<<< Updated upstream
     // #217 for the mesh: a sibling we have never contacted has UNKNOWN liveness,
     // never "idle"/"offline". The roster carries name + key only, so the row says
     // what is true (known via the owner, no direct channel yet) and nothing else.
     let status = match d.online {
         Some(true) => ui::paint(Tone::Ok, "online"),
         Some(false) if d.tier == DeviceTier::MeshRoster => ui::paint(Tone::Dim, "via owner"),
-=======
-    let status = match d.online {
-        Some(true) => ui::paint(Tone::Ok, "online"),
->>>>>>> Stashed changes
         // #217: "a warm link is NOT held open right now" is the normal, healthy
         // idle state, not an absence. "offline" promised far more than the value
         // supports and read as a failure next to "last seen just now".
@@ -276,13 +271,8 @@ mod tests {
                 name: "old-laptop".into(),
                 tier: DeviceTier::NeedsReview,
                 online: Some(false),
-<<<<<<< Updated upstream
                 caps_summary: "uncertified \u{b7} trusted in full".into(),
                 countdown: "no certificate".into(),
-=======
-                caps_summary: "(full legacy trust)".into(),
-                countdown: "promote to continue".into(),
->>>>>>> Stashed changes
                 last_seen: None,
             },
         ];

@@ -42,24 +42,15 @@ pub fn reuse_disabled() -> bool {
 #[cfg(unix)]
 pub use imp::{
     daemon_present, send_reply, serve, serve_at, try_approve_request, try_bootstrap,
-<<<<<<< Updated upstream
     try_cap_status, try_deny_request, try_dial, try_fleet_rendezvous, try_list_mounts, try_list_pending, try_list_warm, try_mount,
     try_mount_health, try_open, try_open_at, try_ping, try_pty, try_pty_reason, try_reconfigure, try_reload,
-=======
-    try_cap_status, try_deny_request, try_dial, try_list_mounts, try_list_pending, try_list_warm, try_mount,
-    try_mount_health, try_open, try_open_at, try_ping, try_pty, try_reconfigure, try_reload,
->>>>>>> Stashed changes
     try_reload_expose, try_resize, try_unmount, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
 pub use stub::{
-<<<<<<< Updated upstream
     daemon_present, try_approve_request, try_cap_status, try_deny_request, try_fleet_rendezvous,
     try_list_pending, try_list_warm, try_ping,
-=======
-    try_approve_request, try_cap_status, try_deny_request, try_list_pending, try_list_warm, try_ping,
->>>>>>> Stashed changes
     Req,
 };
 

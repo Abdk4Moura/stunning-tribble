@@ -894,7 +894,6 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::proc
     Ok(cmd.spawn()?)
 }
 
-<<<<<<< Updated upstream
 // --------------------------------------------------- process identity --
 
 /// The absolute path of the executable backing a live process, or `None` when
@@ -963,8 +962,6 @@ pub fn process_exe_path(_pid: u32) -> Option<PathBuf> {
     None
 }
 
-=======
->>>>>>> Stashed changes
 // ------------------------------------------------------- InstallSource --
 
 /// How filament was installed. Used to gate `filament update`:
