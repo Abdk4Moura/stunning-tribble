@@ -695,9 +695,10 @@ enum Cmd {
         /// least two words, e.g. --word "gigantic element".
         #[arg(long)]
         word: Option<String>,
-        /// Who is joining: `device` (one of yours, enrolled into your mesh) or
-        /// `person` (someone else, paired only). A device name is accepted and
-        /// means `device`.
+        /// Who is joining: `device` (one of yours, enrolled into your mesh),
+        /// `person` (someone else, paired only), or `runner` (unattended: CI, a
+        /// borrowed box; a temporary key, not a member). A device name is
+        /// accepted and means `device`.
         ///
         /// With `--out` this is delivered as a bounded invitation file; without
         /// it you get a pairing code. Either way the other side accepts with
@@ -717,6 +718,12 @@ enum Cmd {
         /// Write the invitation to a new owner-only file instead of displaying it.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
+        /// How they get it: `code` (spoken now, both of you present) or `file`
+        /// (written, claimed later). Implied by --out when omitted. This is the
+        /// SAME question the guided flow asks, spelled the same way, so the two
+        /// modes do not diverge.
+        #[arg(long, value_name = "WAY")]
+        via: Option<String>,
     },
     /// Accept: claim a pairing code, or a bounded invitation file.
     ///
@@ -726,8 +733,9 @@ enum Cmd {
     /// for the other, so the verb named the transport rather than what you were
     /// doing. `add <code>` still works.
     Join {
-        /// A pairing code from the offering device. Invitation FILE material is
-        /// never accepted in argv; use --invite-file for that.
+        /// A pairing code, or the PATH to an invitation file. Invitation
+        /// material itself is never accepted in argv (it would land in `ps`
+        /// output and shell history); a path is not material.
         code: Option<String>,
         /// Read the invitation from an owner-only regular file.
         #[arg(long, value_name = "PATH", conflicts_with = "invite_fd")]
@@ -1159,30 +1167,6 @@ enum Cmd {
 /// Ephemeral device commands: mint auth keys, enroll as delegated.
 #[derive(Subcommand)]
 enum EphemeralAction {
-    /// Mint a new auth key signed by your user identity key.
-    Mint {
-        // "reach" was listed here and is NOT grantable: canonical_capability()
-        // rejects it, so the help advertised a capability that does not exist.
-        // The canonical set is CANONICAL_CAPABILITIES in filament-cap.
-        /// Capabilities: shell, transfer, mount. Omit on a terminal to be asked.
-        #[arg(long, value_delimiter = ',')]
-        caps: Vec<String>,
-        /// Peer device_pub(s) that may enroll this key (hex, comma-separated). Empty = any.
-        #[arg(long, value_delimiter = ',')]
-        audience: Vec<String>,
-        /// Time-to-live: a duration such as 15m, 1h, 30d, or plain seconds (max 30 days)
-        #[arg(long, default_value = "86400")]
-        ttl: String,
-        /// Reuse: Once, N(N), or Reusable
-        #[arg(long, default_value = "Once")]
-        reuse: String,
-        /// Human-readable tag for the use case
-        #[arg(long, default_value = "ci")]
-        tag: String,
-        /// Write the secret key bundle to a new owner-only file.
-        #[arg(long, value_name = "PATH")]
-        out: Option<PathBuf>,
-    },
     /// Enroll as an ephemeral delegated device using an auth key.
     Enroll {
         /// Owner-only file containing the auth key bundle.
@@ -5205,88 +5189,10 @@ fn human_duration(secs: u64) -> String {
 
 async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Result<()> {
     match action {
-        EphemeralAction::Mint { caps, audience, ttl, reuse, tag, out } => {
-            // `add --for --expires` has always taken 1h/30d; --ttl took raw
-            // seconds. After the mint verbs collapsed, one concept spelled two
-            // ways is a difference the user has to remember for no reason, so
-            // both go through the same parser.
-            let ttl = parse_mint_ttl(&ttl)?;
-            // Ask only when the operator did not already say. Passing --caps is a
-            // deliberate answer, and a script that passes nothing must NOT be
-            // prompted into a key it never asked for: it gets today's defaults.
-            let (caps, ttl, reuse) = if caps.is_empty() && interactive_allowed() {
-                match interactive_mint_options(ttl, &reuse)? {
-                    Some(chosen) => chosen,
-                    // The operator switched to the permanent-device path. Say
-                    // where it lives rather than minting a key they said they did
-                    // not want: the two flows produce different objects and one
-                    // cannot stand in for the other.
-                    None => {
-                        ui::say("");
-                        ui::say(&format!(
-                            "  {} a permanent device is enrolled, not minted:",
-                            ui::paint(ui::Tone::Dim, "\u{2192}")
-                        ));
-                        ui::say(&format!(
-                            "      {}",
-                            ui::paint(ui::Tone::Brand, "filament add --for device")
-                        ));
-                        return Ok(());
-                    }
-                }
-            } else {
-                (caps, ttl, reuse)
-            };
-            let uk = match crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
-                Some(uk) => uk,
-                None => bail!("no identity. Run 'filament init' first."),
-            };
-            let rng = ring::rand::SystemRandom::new();
-            let mut seed = [0u8; 32];
-            ring::rand::SecureRandom::fill(&rng, &mut seed).map_err(|e| anyhow::anyhow!("{}", e))?;
-            let enroll_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let enroll_pub: [u8; 32] = ring::signature::KeyPair::public_key(&enroll_kp).as_ref().try_into().unwrap();
-            let audience_pubs: Vec<[u8; 32]> = audience.iter()
-                .map(|s| {
-                    let b = hex::decode(s).map_err(|e| anyhow::anyhow!("audience hex: {}", e))?;
-                    let arr: [u8; 32] = b.try_into().map_err(|_| anyhow::anyhow!("audience key must be 32 bytes"))?;
-                    Ok(arr)
-                })
-                .collect::<Result<_>>()?;
-            let reuse = match reuse.to_lowercase().as_str() {
-                "once" => crate::ephemeral::Reuse::Once,
-                "reusable" => crate::ephemeral::Reuse::Reusable,
-                s if s.starts_with("n(") || s.starts_with('n') => {
-                    let num: u32 = s.trim_start_matches('n').trim_start_matches('(').trim_end_matches(')').parse()
-                        .map_err(|_| anyhow::anyhow!("invalid reuse count"))?;
-                    crate::ephemeral::Reuse::N(num)
-                }
-                _ => bail!("invalid reuse: {reuse} (Once, N(3), Reusable)"),
-            };
-            let ak = crate::ephemeral::AuthKey::mint_with_bounds(uk.keypair(), enroll_pub, caps, audience_pubs, ttl, reuse, tag, 30 * 24 * 3600, true)?;
-            let json = Zeroizing::new(serde_json::to_string_pretty(&serde_json::json!({
-                "auth_key": ak.to_json(),
-                "enroll_private_key": hex::encode(seed),
-            }))?);
-            seed.fill(0);
-            let out = out.ok_or_else(|| anyhow!("secret output requires --out <new-owner-only-file>; use `filament add --for` for the guided flow"))?;
-            write_owner_only_file(&out, json.as_str())?;
-            eprintln!("{} auth key bundle written to {}",
-                ui::paint(ui::Tone::Ok, ui::glyph_ok()), out.display());
-            // Arm: a file write (armed.json), not IPC. The daemon's arm-gate
-            // picks it up on the next tick.
-            crate::armed::arm(hex::encode(ak.enroll_pub), ak.expires);
-            if daemon_alive().is_none() {
-                ui::say(&format!("  {} no local daemon running yet (start 'filament up' before this key is claimed)",
-                    ui::paint(ui::Tone::Dim, "·")));
-            }
-            Ok(())
-        }
         EphemeralAction::Enroll { auth_key_file, to } => {
             let auth_key = Zeroizing::new(read_owner_only_file(&auth_key_file)?);
             // #186: the claim token is now the compact v2 invitation.
-            let inv = parse_invitation_v2(auth_key.as_str())?;
+            let inv = parse_invitation(auth_key.as_str())?;
             if inv.expires <= identity::now_secs() {
                 bail!("this invitation has expired");
             }
@@ -5295,7 +5201,7 @@ async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Re
     }
 }
 
-fn persist_join_ack(v: &Value, auth_key: &crate::ephemeral::AuthKey) -> Result<String> {    if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
+fn persist_join_ack(v: &Value, auth_key: &crate::ephemeral::Invitation) -> Result<String> {    if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
         bail!("this device already holds an identity key; join only from a clean Filament identity");
     }
     if local_device_cert_path().exists() {
@@ -5329,13 +5235,18 @@ fn persist_join_ack(v: &Value, auth_key: &crate::ephemeral::AuthKey) -> Result<S
         .ok_or_else(|| anyhow!("join acknowledgement omitted the owner certificate"))?;
     let overlay_pub = crate::overlay::overlay_pubkey_bytes()?;
     if local_cert.device_pub != overlay_pub
-        || local_cert.user_pub != auth_key.issuer
+        || crate::ephemeral::issuer_fingerprint(&local_cert.user_pub) != auth_key.issuer_fp
         || local_cert.expires != expires
         || local_cert.verify(identity::now_secs()).is_err()
     {
         bail!("join acknowledgement carried an invalid local device certificate");
     }
-    if owner_cert.user_pub != auth_key.issuer || owner_cert.verify(identity::now_secs()).is_err() {
+    // Compared by FINGERPRINT for the same reason the invitation path does it:
+    // the credential carries 8 bytes of the owner key, not 32. The certificate
+    // is still mandatory, so this authenticates the owner exactly as before.
+    if crate::ephemeral::issuer_fingerprint(&owner_cert.user_pub) != auth_key.issuer_fp
+        || owner_cert.verify(identity::now_secs()).is_err()
+    {
         bail!("join acknowledgement carried an invalid owner certificate");
     }
     let cert_path = local_device_cert_path();
@@ -5412,7 +5323,7 @@ fn persist_join_ack(v: &Value, auth_key: &crate::ephemeral::AuthKey) -> Result<S
 /// #186: the join-ack validation for a COMPACT (v2) invitation. The owner is
 /// verified by the 8-byte fingerprint of the cert's user key (the joiner only
 /// holds the fp); the bound checks are identical to persist_join_ack.
-fn persist_join_ack_v2(v: &Value, inv: &crate::ephemeral::InvitationV2) -> Result<String> {
+fn persist_join_ack_v2(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<String> {
     if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
         bail!("this device already holds an identity key; join only from a clean Filament identity");
     }
@@ -5712,19 +5623,27 @@ fn resolve_for_kind(
                 // A cancelled picker (Ctrl-C / Esc) is a cancellation, not a
                 // missing argument (#203): exit cleanly instead of reporting
                 // the non-interactive requirement.
-                let choices = vec!["A device I control".to_string(), "Another person".to_string()];
+                // THE SAME THREE ANSWERS THE FLAG TAKES, in the same order, so
+                // reading `--for runner` in a script and picking "An unattended
+                // runner" here are visibly the same choice. The third answer is
+                // what `ephemeral mint` used to be a separate verb for: an
+                // unattended machine is not a member, it holds a temporary key.
+                let choices = vec![
+                    "A device I control          (joins my mesh)".to_string(),
+                    "Another person              (paired, not a member)".to_string(),
+                    "An unattended runner        (CI, borrowed box; temporary)".to_string(),
+                ];
                 match codeentry::pick("WHO IS JOINING", &choices)? {
-                    Some(index) => Ok((
-                        if index == 0 { "device".to_string() } else { "person".to_string() },
-                        None,
-                    )),
+                    Some(0) => Ok(("device".to_string(), None)),
+                    Some(1) => Ok(("person".to_string(), None)),
+                    Some(_) => Ok(("runner".to_string(), None)),
                     None => Err(cancelled()),
                 }
             } else {
                 bail!("non-interactive add --for requires device|person or a device name")
             }
         }
-        Some("device") | Some("person") => Ok((for_.unwrap(), None)),
+        Some("device") | Some("person") | Some("runner") => Ok((for_.unwrap(), None)),
         Some(name) => Ok(("device".to_string(), Some(name.to_string()))),
     }
 }
@@ -5768,7 +5687,11 @@ async fn add_for_cmd(
         }
     }
     let mut ceiling = if allow.is_empty() {
-        if kind == "device" {
+        if kind == "runner" {
+            // A runner moves bytes and nothing else by default. Widening it is
+            // --allow, deliberately, the same as for anyone else.
+            vec!["transfer".to_string()]
+        } else if kind == "device" {
             let mut c = vec!["transfer".to_string(), "mount".to_string()];
             if interactive_shell {
                 c.push("shell".to_string());
@@ -5802,19 +5725,31 @@ async fn add_for_cmd(
     // self-contained signature, not hex-inside-JSON-inside-base64. ~530 chars
     // became ~210, and the QR fits a normal terminal.
     let ttl_abs = identity::now_secs().saturating_add(ttl);
-    let inv = crate::ephemeral::InvitationV2::mint(
+    // AN INVITATION IS AN AUTH KEY WITH DIFFERENT CONFIG. The two were separate
+    // artifacts in separate formats reached by separate verbs, and the fields
+    // say otherwise: enroll_pub, caps, expires, reuse, ephemeral and sig are the
+    // same in both, and Invitation already CARRIES the `ephemeral` flag that
+    // is the whole difference. It was hardcoded `false` here, so the only way to
+    // get the ephemeral variant was a different command writing a different file
+    // format that a different claim verb could read.
+    //
+    // So `runner` is not a third artifact. It is this one, minted ephemeral:
+    // removed on disconnect, no persistent record, which is exactly what an
+    // unattended CI box should leave behind.
+    let ephemeral = kind == "runner";
+    let inv = crate::ephemeral::Invitation::mint(
         owner_key.keypair(),
         enroll_seed,
         ceiling.clone(),
         ttl_abs,
         30 * 24 * 3600,
         crate::ephemeral::Reuse::Once,
-        false,
+        ephemeral,
         display_name(),
     )?;
     enroll_seed.fill(0);
     let token = Zeroizing::new(format!(
-        "filament-invite:v2:{}",
+        "filament-invite:{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_token())
     ));
     // #205/#211: arming is a FILE WRITE, not IPC. The mint records the key in
@@ -5915,21 +5850,16 @@ async fn add_for_cmd(
     Ok(())
 }
 
-fn parse_invitation_v2(raw: &str) -> Result<crate::ephemeral::InvitationV2> {
+fn parse_invitation(raw: &str) -> Result<crate::ephemeral::Invitation> {
     use base64::Engine;
     let token = raw.trim();
-    if token.starts_with("filament-invite:v1:") {
-        // #186: the v1 JSON token was replaced in 0.8.4. An old token is
-        // merely stale, so say so rather than failing to parse it.
-        bail!("this invitation uses the pre-0.8.4 format; ask the owner to mint a new one with `filament add --for`");
-    }
     let encoded = token
-        .strip_prefix("filament-invite:v2:")
+        .strip_prefix("filament-invite:")
         .ok_or_else(|| anyhow!("invitation has an unknown format"))?;
     let bytes = Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|_| anyhow!("invitation is not valid base64url"))?);
-    crate::ephemeral::InvitationV2::from_token(bytes.as_slice())
+    crate::ephemeral::Invitation::from_token(bytes.as_slice())
         .ok_or_else(|| anyhow!("invitation payload is not a valid v2 invitation"))
 }
 
@@ -5963,7 +5893,7 @@ async fn join_cmd(
     } else {
         bail!("non-interactive join requires a code (`join <code>`), --invite-file <path>, or --invite-fd <fd>");
     });
-    let inv = parse_invitation_v2(invitation.as_str())?;
+    let inv = parse_invitation(invitation.as_str())?;
     if inv.expires <= identity::now_secs() {
         bail!("this invitation has expired");
     }
@@ -6011,7 +5941,7 @@ async fn join_cmd(
 
 async fn enroll_cmd(
     server: &str,
-    inv: crate::ephemeral::InvitationV2,
+    inv: crate::ephemeral::Invitation,
     to_name: Option<String>,
     relay: bool,
     proposed_name: Option<&str>,
@@ -6224,6 +6154,27 @@ async fn enroll_cmd(
 }
 
 /// Enroll as delegated + send files in one session.
+/// Read a delegation credential from an owner-only file.
+///
+/// ONE LOADER. This was written twice, byte for byte, in enroll_and_send_cmd and
+/// enroll_and_netcat_cmd (the second even said "same as enroll_and_send_cmd" and
+/// then repeated it), and it read a bundle format that only `ephemeral mint`
+/// produced. Both callers need exactly two things out of it: the capability list
+/// to show, and the issuer fingerprint to derive the enrolment channel from.
+///
+/// Both are in the ordinary invitation, so there is no second format to keep.
+/// `enroll_channel(full_key)` IS `enroll_channel_fp(fingerprint(full_key))`, so
+/// the 8-byte fingerprint an invitation carries reaches the same rendezvous the
+/// daemon derives from its full key.
+fn load_delegation(path: &std::path::Path) -> Result<crate::ephemeral::Invitation> {
+    let raw = Zeroizing::new(read_owner_only_file(path)?);
+    let inv = parse_invitation(raw.as_str())?;
+    if inv.expires <= identity::now_secs() {
+        bail!("this key has expired");
+    }
+    Ok(inv)
+}
+
 /// Loads auth key, joins enrollment channel, completes handshake, then sends
 /// files over the enrolled transport. The owner's daemon applies the ceiling.
 async fn enroll_and_send_cmd(
@@ -6234,23 +6185,15 @@ async fn enroll_and_send_cmd(
     relay: bool,
     remember: Option<String>,
 ) -> Result<()> {
-    // Load auth key
-    let auth_key_contents = Zeroizing::new(read_owner_only_file(&auth_key_path)?);
-    let v: serde_json::Value = serde_json::from_str(auth_key_contents.as_str())?;
-    let ak = crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v))
-        .ok_or_else(|| anyhow::anyhow!("invalid auth key JSON"))?;
-    let enroll_seed = v.get("enroll_private_key")
-        .and_then(|s| s.as_str())
-        .and_then(|s| hex::decode(s).ok())
-        .ok_or_else(|| anyhow::anyhow!("missing enroll_private_key"))?;
-    let enroll_seed: [u8; 32] = enroll_seed.try_into().map_err(|_| anyhow::anyhow!("bad enroll key"))?;
+    let ak = load_delegation(&auth_key_path)?;
+    let enroll_seed: [u8; 32] = ak.enroll_private_key;
     let device_pub = crate::overlay::overlay_pubkey_bytes()?;
 
     ui::say(&format!("  {} enrolling as delegated (caps: {})",
         ui::paint(ui::Tone::Dim, "->"),
         capability_list_summary(&ak.caps)));
 
-    let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
+    let enroll_chan = crate::ephemeral::enroll_channel_fp(&ak.issuer_fp);
     let my_uid = mk_uid("a");
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     let sio = net::connect_signaling(server, tx.clone()).await?;
@@ -6469,23 +6412,15 @@ async fn enroll_and_netcat_cmd(
     rport: u16,
     relay: bool,
 ) -> Result<()> {
-    // Load auth key (same as enroll_and_send_cmd)
-    let auth_key_contents = Zeroizing::new(read_owner_only_file(&auth_key_path)?);
-    let v: serde_json::Value = serde_json::from_str(auth_key_contents.as_str())?;
-    let ak = crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v))
-        .ok_or_else(|| anyhow::anyhow!("invalid auth key JSON"))?;
-    let enroll_seed = v.get("enroll_private_key")
-        .and_then(|s| s.as_str())
-        .and_then(|s| hex::decode(s).ok())
-        .ok_or_else(|| anyhow::anyhow!("missing enroll_private_key"))?;
-    let enroll_seed: [u8; 32] = enroll_seed.try_into().map_err(|_| anyhow::anyhow!("bad enroll key"))?;
+    let ak = load_delegation(&auth_key_path)?;
+    let enroll_seed: [u8; 32] = ak.enroll_private_key;
     let device_pub = crate::overlay::overlay_pubkey_bytes()?;
 
     ui::say(&format!("  {} enrolling as delegated (caps: {})",
         ui::paint(ui::Tone::Dim, "->"),
         capability_list_summary(&ak.caps)));
 
-    let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
+    let enroll_chan = crate::ephemeral::enroll_channel_fp(&ak.issuer_fp);
     let my_uid = mk_uid("n");
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     let sio = net::connect_signaling(server, tx.clone()).await?;
@@ -6687,7 +6622,7 @@ async fn respond_to_auth_key_enroll_request(
                 let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
                 return;
             };
-            match crate::ephemeral::InvitationV2::from_payload(&bytes) {
+            match crate::ephemeral::Invitation::from_payload(&bytes) {
                 Some(inv) => crate::ephemeral::EnrollmentPrincipal::Compact(inv),
                 None => {
                     let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
@@ -7701,6 +7636,20 @@ fn malformed_entry_banner(arg: &str) {
 
 /// Map a codeentry Outcome::Cancelled into a clean error (used by the wired
 /// commands so a cancel exits non-zero without a stack-y message).
+/// Where a written credential lands when the operator did not name a file.
+///
+/// Named after the invitee when we know it so two of them in one directory do
+/// not collide. Both callers use this, because "the default path" is exactly
+/// the sort of thing that gets spelled twice and then differs.
+fn invite_path_for(named: Option<&str>, kind: &str) -> std::path::PathBuf {
+    let stem = named.unwrap_or(kind);
+    let safe: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    std::path::PathBuf::from(format!("filament-invite-{safe}.txt"))
+}
+
 fn cancelled() -> anyhow::Error {
     anyhow!("cancelled")
 }
@@ -7729,7 +7678,7 @@ fn first_screen_actions(owner: bool, joined: bool, device_count: usize) -> Vec<(
             // An ephemeral key is for when nobody is there, a CI runner or a
             // borrowed machine that enrols later, so it cannot be folded into
             // either without losing what makes it different.
-            ("Mint a temporary key (CI, borrowed box)", "ephemeral mint"),
+            ("Mint a temporary key (CI, borrowed box)", "add --for runner"),
             ("Serve in the background", "up --install"),
             ("See every device", "devices"),
             ("View my identity", "id"),
@@ -13568,7 +13517,7 @@ async fn main() -> Result<()> {
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
         Cmd::Logs { follow, tail } => logs_cmd(follow, tail).await,
         Cmd::Reset => reset_cmd(&ui_caps),
-        Cmd::Add { name, word, for_, allow, expires, out } => {
+        Cmd::Add { name, word, for_, allow, expires, out, via } => {
             // `add` OFFERS. Accepting is `join`, which is the only spelling now:
             // `add <code>` was the second one, and per WORK-STATE's no-backward-
             // compat rule (no real users yet, clean breaks everywhere) a second
@@ -13591,6 +13540,56 @@ async fn main() -> Result<()> {
                 // than inside the ceremony) means a script that omits the answer
                 // is refused before anything is minted.
                 let (kind, named) = resolve_for_kind(&ui_caps, for_)?;
+                // ASK "how", not only "who". The comment above names three
+                // orthogonal axes and the guided flow asked exactly one of them,
+                // so from the first screen the ONLY reachable delivery was a
+                // spoken code, which needs both people present at the same
+                // moment. `--out` (a bounded invitation they claim later) was
+                // reachable only by knowing to type it.
+                //
+                // Reported as "why can't I mint a key for a regular device or
+                // person": you could, but only from the command line. Third time
+                // on this branch that a path existed and its interactive surface
+                // did not (see `join` in the no-identity menu, and `ephemeral
+                // mint` on the first screen).
+                // HOW, resolved ONCE for both modes. `--via` is the flag, the
+                // picker below is the prompt, and they are the same question:
+                // a script and a person answer it the same way and get the same
+                // thing. Before this, HOW was inferred from whether --out
+                // happened to be present, and the guided flow never asked at
+                // all, so the file path was reachable only by knowing to type a
+                // flag nobody was told about.
+                let via = match via.as_deref() {
+                    Some("code") => Some("code".to_string()),
+                    Some("file") => Some("file".to_string()),
+                    Some(other) => bail!("--via takes `code` or `file`, not '{other}'"),
+                    // --out names a file, so it answers HOW by itself.
+                    None if out.is_some() => Some("file".to_string()),
+                    // An unattended runner is never present to hear a code read
+                    // out, so the question does not arise: it is always a file.
+                    None if kind == "runner" => Some("file".to_string()),
+                    None if ui_caps.interactive => {
+                        let who = if kind == "device" { "that device" } else { "them" };
+                        let choices = vec![
+                            "Read out a code now         (we are both here)".to_string(),
+                            format!("Write a file {who} claims later"),
+                        ];
+                        match codeentry::pick("HOW SHOULD THEY GET IT", &choices)? {
+                            Some(0) => Some("code".to_string()),
+                            Some(_) => Some("file".to_string()),
+                            None => return Err(cancelled()),
+                        }
+                    }
+                    None => Some("code".to_string()),
+                };
+
+                // A runner is not a member: it gets a temporary KEY, which is
+                // what `ephemeral mint` was a separate verb for. Same two
+                // questions, third answer to the first one.
+                if via.as_deref() == Some("file") {
+                    let path = out.unwrap_or_else(|| invite_path_for(named.as_deref(), &kind));
+                    return add_for_cmd(&ui_caps, Some(kind), allow, expires, Some(path)).await;
+                }
                 let internal = kind == "device";
                 if internal && load_owner_key().is_none() {
                     bail!(
@@ -13609,6 +13608,24 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Join { code, invite_file, invite_fd, name, to } => {
+            // ONE VERB FOR THE PERSON HOLDING THE THING. They were handed a code
+            // or a file; making them know WHICH, and then pick between `join
+            // <code>`, `join --invite-file` and `ephemeral enroll
+            // --auth-key-file`, puts the most spellings in front of the person
+            // with the least information.
+            //
+            // A PATH is safe as a positional; the invitation MATERIAL is not,
+            // and still is not accepted here, because argv lands in `ps` output
+            // and shell history. So the test is "does this name a file that
+            // exists", not "does this look like a token".
+            let (code, invite_file) = match code {
+                Some(arg) if invite_file.is_none() && invite_fd.is_none()
+                    && std::path::Path::new(&arg).is_file() =>
+                {
+                    (None, Some(std::path::PathBuf::from(arg)))
+                }
+                other => (other, invite_file),
+            };
             if let Some(code) = code {
                 if invite_file.is_some() || invite_fd.is_some() {
                     bail!("give a code or an invitation file, not both");
@@ -14762,19 +14779,30 @@ async fn open_enrollment(
     t: &Arc<dyn Transport>,
     enroll_seed: [u8; 32],
     device_pub: [u8; 32],
-    ak: &filament_cap::ephemeral::AuthKey,
+    ak: &filament_cap::ephemeral::Invitation,
 ) {
+    // SAME THREE STEPS the invitation path already performs (mark ready,
+    // register pending, send the request), and now the same credential on the
+    // wire. This branch used to send `auth_key` (an AuthKey JSON) and register
+    // through `register_enrollment_legacy`, purely because `ephemeral mint`
+    // wrote a different artifact than `add --for` did. The daemon carried a
+    // reader for each. One credential means one of everything.
     conn.mark_ready(pid, t, true);
-    crate::ephemeral::register_enrollment_legacy(
+    crate::ephemeral::register_enrollment(
         pid.to_string(),
         enroll_seed,
         device_pub,
         ak.clone(),
     );
+    let payload = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ak.to_payload())
+    };
     let _ = t
         .send_control(&json!({
             "type": "identity-auth-key-enroll-request",
-            "auth_key": ak.to_json(),
+            "auth_key_v2": payload,
+            "device_pub": hex::encode(device_pub),
         }))
         .await;
 }
@@ -24082,14 +24110,20 @@ mod tests {
     }
 
     #[test]
-    fn mint_ttl_default_parses() {
-        // The clap default is a string now, so a typo in it would only surface
-        // at runtime. Read it off the parser rather than restating the literal.
-        let cli = Cli::try_parse_from(["filament", "ephemeral", "mint"]).expect("defaults must parse");
-        if let Some(Cmd::Ephemeral { action: EphemeralAction::Mint { ttl, .. } }) = cli.cmd {
-            assert_eq!(parse_mint_ttl(&ttl).unwrap(), 86400, "the default ttl must be one day");
-        } else {
-            panic!("expected `ephemeral mint`");
+    fn credential_lifetime_defaults_parse() {
+        // This used to read the clap default off `ephemeral mint --ttl`. That
+        // verb is gone: a runner is `add --for runner`, one credential with a
+        // different config, so the defaults that matter now live in add_for_cmd
+        // and are chosen by KIND.
+        //
+        // Pinned because they are strings interpreted at runtime: a typo in one
+        // would otherwise surface only when somebody actually mints that kind.
+        assert_eq!(parse_mint_ttl("30d").unwrap(), 30 * 24 * 3600, "a device lasts 30 days");
+        assert_eq!(parse_mint_ttl("1h").unwrap(), 3600, "a person or runner lasts an hour");
+        // Both sit inside the 30-day ceiling add_for_cmd enforces.
+        for d in ["30d", "1h"] {
+            let secs = parse_mint_ttl(d).unwrap();
+            assert!(secs > 0 && secs <= 30 * 24 * 3600, "{d} must be inside the bound");
         }
     }
 
@@ -25025,14 +25059,14 @@ mod tests {
         // the mint and the claim-side parser, and a secret passed as a bare
         // positional argument must be rejected (never parsed as an invitation).
         use base64::Engine;
-        use crate::ephemeral::{InvitationV2, Reuse};
+        use crate::ephemeral::{Invitation, Reuse};
         use ring::signature::KeyPair;
         let rng = ring::rand::SystemRandom::new();
         let mut seed = [0u8; 32];
         ring::rand::SecureRandom::fill(&rng, &mut seed).unwrap();
         let owner_seed = [7u8; 32];
         let owner = ring::signature::Ed25519KeyPair::from_seed_unchecked(&owner_seed).unwrap();
-        let inv = InvitationV2::mint(
+        let inv = Invitation::mint(
             &owner,
             seed,
             vec!["transfer".to_string()],
@@ -25044,14 +25078,14 @@ mod tests {
         )
         .unwrap();
         let token = format!(
-            "filament-invite:v2:{}",
+            "filament-invite:{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .encode(inv.to_token())
         );
-        let parsed = parse_invitation_v2(&token).expect("a well-formed v2 token must parse");
+        let parsed = parse_invitation(&token).expect("a well-formed v2 token must parse");
         assert_eq!(parsed.caps, inv.caps, "caps round-trip");
         assert_eq!(parsed.enroll_pub, inv.enroll_pub, "derived pub round-trips");
-        assert!(parse_invitation_v2("secret-as-a-positional-argument").is_err());
+        assert!(parse_invitation("secret-as-a-positional-argument").is_err());
     }
 
     #[test]
