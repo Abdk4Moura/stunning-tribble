@@ -1192,7 +1192,10 @@ enum Cmd {
 enum EphemeralAction {
     /// Mint a new auth key signed by your user identity key.
     Mint {
-        /// Capabilities to grant (shell, transfer, mount, reach)
+        // "reach" was listed here and is NOT grantable: canonical_capability()
+        // rejects it, so the help advertised a capability that does not exist.
+        // The canonical set is CANONICAL_CAPABILITIES in filament-cap.
+        /// Capabilities: shell, transfer, mount. Omit on a terminal to be asked.
         #[arg(long, value_delimiter = ',')]
         caps: Vec<String>,
         /// Peer device_pub(s) that may enroll this key (hex, comma-separated). Empty = any.
@@ -5228,9 +5231,129 @@ async fn mint_cmd(
 }
 
 /// CLI handler for `filament ephemeral`
+/// Interactive options for `ephemeral mint`, with the long tail behind "More".
+///
+/// The default view is FOUR lines and one keypress mints a usable key. That is
+/// the design constraint: a picker listing every capability, lifetime and reuse
+/// policy up front is a form, and forms get skipped. Progressive disclosure
+/// keeps the common answer immediate and the rare one reachable.
+///
+/// Capabilities are offered as BUNDLES rather than the three raw names, matching
+/// what `add --for device` already does, because "may it open a terminal" is the
+/// question a person actually has. The owner-equivalent choice says so on its own
+/// line rather than assuming the reader knows shell implies everything.
+fn interactive_mint_options(
+    ttl_default: u64,
+    reuse_default: &str,
+) -> Result<(Vec<String>, u64, String)> {
+    let bundle = |n: usize| -> Vec<String> {
+        let mut c = vec!["transfer".to_string()];
+        if n >= 1 {
+            c.push("mount".to_string());
+        }
+        if n >= 2 {
+            c.push("shell".to_string());
+        }
+        c
+    };
+
+    let mut caps = bundle(0);
+    let mut ttl = ttl_default;
+    let mut reuse = reuse_default.to_string();
+
+    match codeentry::pick(
+        "WHAT THIS KEY MAY DO",
+        &[
+            "Send and receive files".to_string(),
+            "...and mount my folders".to_string(),
+            "...and open a terminal   (OWNER-EQUIVALENT)".to_string(),
+            "More options...".to_string(),
+        ],
+    )? {
+        Some(n @ 0..=2) => return Ok((bundle(n), ttl, reuse)),
+        // "More" is a DESTINATION, not a capability answer. Fall through with the
+        // narrowest bundle already chosen, so opening the detail menu can never
+        // widen access by itself.
+        Some(3) => {}
+        Some(_) | None => return Err(cancelled()),
+    }
+
+    // The detail menu, entered only on request. Loops so several things can be
+    // changed in one visit, and shows each current value so nothing is hidden.
+    loop {
+        let shown = format!(
+            "Done   ({}, {}, {})",
+            capability_list_summary(&caps),
+            human_duration(ttl),
+            reuse,
+        );
+        match codeentry::pick(
+            "MORE OPTIONS",
+            &[
+                shown,
+                "Capabilities...".to_string(),
+                "Lifetime...".to_string(),
+                "How many times it may be used...".to_string(),
+            ],
+        )? {
+            Some(0) => return Ok((caps, ttl, reuse)),
+            Some(1) => {
+                match codeentry::pick(
+                    "CAPABILITIES",
+                    &[
+                        "Send and receive files".to_string(),
+                        "...and mount my folders".to_string(),
+                        "...and open a terminal   (OWNER-EQUIVALENT)".to_string(),
+                    ],
+                )? {
+                    Some(n @ 0..=2) => caps = bundle(n),
+                    Some(_) | None => return Err(cancelled()),
+                }
+            }
+            Some(2) => {
+                let choices = [(900u64, "15 minutes"), (3600, "1 hour"), (86_400, "1 day"), (604_800, "7 days")];
+                let items: Vec<String> = choices.iter().map(|(_, t)| t.to_string()).collect();
+                match codeentry::pick("LIFETIME", &items)? {
+                    Some(n) if n < choices.len() => ttl = choices[n].0,
+                    Some(_) | None => return Err(cancelled()),
+                }
+            }
+            Some(3) => {
+                let choices = [("Once", "Once, then it is spent"), ("N(3)", "Up to 3 times"), ("Reusable", "Any number of times")];
+                let items: Vec<String> = choices.iter().map(|(_, t)| t.to_string()).collect();
+                match codeentry::pick("HOW MANY TIMES", &items)? {
+                    Some(n) if n < choices.len() => reuse = choices[n].0.to_string(),
+                    Some(_) | None => return Err(cancelled()),
+                }
+            }
+            Some(_) | None => return Err(cancelled()),
+        }
+    }
+}
+
+/// Render a duration the way the pickers show it.
+fn human_duration(secs: u64) -> String {
+    match secs {
+        s if s % 604_800 == 0 && s >= 604_800 => format!("{}d", s / 86_400),
+        s if s % 86_400 == 0 && s >= 86_400 => format!("{}d", s / 86_400),
+        s if s % 3600 == 0 && s >= 3600 => format!("{}h", s / 3600),
+        s if s % 60 == 0 && s >= 60 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+
 async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Result<()> {
     match action {
         EphemeralAction::Mint { caps, audience, ttl, reuse, tag, out } => {
+            // Ask only when the operator did not already say. Passing --caps is a
+            // deliberate answer, and a script that passes nothing must NOT be
+            // prompted into a key it never asked for: it gets today's defaults.
+            let (caps, ttl, reuse) = if caps.is_empty() && interactive_allowed() {
+                interactive_mint_options(ttl, &reuse)?
+            } else {
+                (caps, ttl, reuse)
+            };
             let uk = match crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
                 Some(uk) => uk,
                 None => bail!("no identity. Run 'filament init' first."),
