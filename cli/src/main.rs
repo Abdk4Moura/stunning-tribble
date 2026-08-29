@@ -7334,6 +7334,33 @@ struct PeerAuthz {
     ak_caps: Option<Vec<String>>,
 }
 
+impl PeerAuthz {
+    /// The gate's arguments in the order every call site uses them.
+    ///
+    /// Returned as one tuple because the alternative was five identical lines of
+    /// destructuring at five call sites, which is the duplication this struct
+    /// was extracted to remove, reintroduced one layer up.
+    fn parts(
+        &self,
+    ) -> (
+        Option<&[u8; 32]>,
+        Option<&[u8; 32]>,
+        crate::capability::BindingStrength,
+        Option<u64>,
+        bool,
+        Option<&[String]>,
+    ) {
+        (
+            self.idev.as_ref(),
+            self.iusr.as_ref(),
+            self.binding,
+            self.expires,
+            self.cert_revoked,
+            self.ak_caps.as_deref(),
+        )
+    }
+}
+
 fn peer_authz(conn: &mut Conn, pid: &str) -> PeerAuthz {
     if let Some(l) = conn.link_mut(pid) {
         resolve_peer_identity(l);
@@ -19692,10 +19719,7 @@ async fn recv_cmd(
                             l2_open_allowed(blanket, peer_has_shell)
                         };
                         let az = peer_authz(&mut conn, &pid);
-                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = (
-                            az.idev.as_ref(), az.iusr.as_ref(), az.binding,
-                            az.expires, az.cert_revoked, az.ak_caps.as_deref(),
-                        );
+                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -19905,10 +19929,7 @@ async fn recv_cmd(
                     // under FILAMENT_CAP_AUTHORITATIVE.
                     let granted = {
                         let az = peer_authz(&mut conn, &pid);
-                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = (
-                            az.idev.as_ref(), az.iusr.as_ref(), az.binding,
-                            az.expires, az.cert_revoked, az.ak_caps.as_deref(),
-                        );
+                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -20027,10 +20048,7 @@ async fn recv_cmd(
                     // under FILAMENT_CAP_AUTHORITATIVE.
                     let granted = {
                         let az = peer_authz(&mut conn, &pid);
-                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = (
-                            az.idev.as_ref(), az.iusr.as_ref(), az.binding,
-                            az.expires, az.cert_revoked, az.ak_caps.as_deref(),
-                        );
+                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -20216,10 +20234,7 @@ async fn recv_cmd(
                     // in shadow, cap gates under FILAMENT_CAP_AUTHORITATIVE.
                     let (authorized, read_only) = {
                         let az = peer_authz(&mut conn, &pid);
-                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = (
-                            az.idev.as_ref(), az.iusr.as_ref(), az.binding,
-                            az.expires, az.cert_revoked, az.ak_caps.as_deref(),
-                        );
+                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -20908,10 +20923,7 @@ async fn recv_cmd(
                     // under FILAMENT_CAP_AUTHORITATIVE.
                     let (ok, xfer_deny_reason, xfer_gate) = {
                         let az = peer_authz(&mut conn, &pid);
-                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = (
-                            az.idev.as_ref(), az.iusr.as_ref(), az.binding,
-                            az.expires, az.cert_revoked, az.ak_caps.as_deref(),
-                        );
+                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
