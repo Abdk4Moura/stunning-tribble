@@ -5882,7 +5882,7 @@ async fn enroll_cmd(
     loop {
         let elapsed = started.elapsed();
         if elapsed >= enroll_deadline {
-            bail!("enrollment timed out after {}s (no response from peer)", enroll_deadline.as_secs());
+            return Err(enrollment_timeout(enroll_deadline.as_secs()));
         }
 
         let slice = Duration::from_secs(2).min(enroll_deadline.saturating_sub(elapsed));
@@ -6102,7 +6102,7 @@ async fn enroll_and_send_cmd(
 
     loop {
         if started.elapsed() >= deadline {
-            bail!("enrollment timed out after {}s", deadline.as_secs());
+            return Err(enrollment_timeout(deadline.as_secs()));
         }
         let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
         let Ok(Some(ev)) = ev else {
@@ -6325,7 +6325,7 @@ async fn enroll_and_netcat_cmd(
     let deadline = Duration::from_secs(60);
 
     loop {
-        if started.elapsed() >= deadline { bail!("enrollment timed out"); }
+        if started.elapsed() >= deadline { return Err(enrollment_timeout(deadline.as_secs())); }
         let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
         let Ok(Some(ev)) = ev else {
             if conn.active.is_some() { break; }
@@ -7532,6 +7532,18 @@ fn invite_path_for(named: Option<&str>, kind: &str) -> std::path::PathBuf {
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
         .collect();
     std::path::PathBuf::from(format!("filament-invite-{safe}.txt"))
+}
+
+/// The enrolment timeout message, said once.
+///
+/// It was said three times and had already drifted into three different
+/// sentences: "timed out after Ns (no response from peer)", "timed out after
+/// Ns", and a bare "timed out". Which one an operator saw depended on whether
+/// they were joining, sending with a key, or opening a port, which is not a
+/// distinction they can act on. The least informative was the one a CI runner
+/// hit, where there is nobody watching to fill in the gap.
+fn enrollment_timeout(secs: u64) -> anyhow::Error {
+    anyhow!("enrollment timed out after {secs}s (no response from peer)")
 }
 
 fn cancelled() -> anyhow::Error {
