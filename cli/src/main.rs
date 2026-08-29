@@ -1132,37 +1132,6 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<RequestsAction>,
     },
-    /// Mint a scoped, expiring key for another machine to join.
-    #[command(hide = true)]
-    Mint {
-        /// Mint a key for a device in your fleet.
-        #[arg(long)]
-        fleet: bool,
-        /// Mint a narrow key for this paired external device.
-        #[arg(long)]
-        external: Option<String>,
-        /// Mint a single-use CI/automation key.
-        #[arg(long)]
-        ci: bool,
-        /// Key lifetime, such as 1h or 15m.
-        #[arg(long)]
-        ttl: Option<String>,
-        /// Reuse policy: once, N(3), or reusable.
-        #[arg(long)]
-        reuse: Option<String>,
-        /// Capabilities to grant (comma-separated).
-        #[arg(long, value_delimiter = ',')]
-        allow: Vec<String>,
-        /// Paired audience name for a CI key.
-        #[arg(long)]
-        audience: Option<String>,
-        /// Do not prompt for deliberate choices.
-        #[arg(long)]
-        yes: bool,
-        /// Write the secret key bundle to a new owner-only file.
-        #[arg(long, value_name = "PATH")]
-        out: Option<PathBuf>,
-    },
     /// Mint auth keys or enroll as an ephemeral delegated device.
     ///
     /// Unhidden 2026-08-29. It was hidden while the banner did not mention it,
@@ -5139,96 +5108,6 @@ fn mint_capability(raw: &str) -> Result<String> {
     }
 }
 
-async fn mint_cmd(
-    server: &str,
-    fleet: bool,
-    external: Option<String>,
-    ci: bool,
-    ttl: Option<String>,
-    reuse: Option<String>,
-    allow: Vec<String>,
-    audience: Option<String>,
-    _yes: bool,
-    out: Option<PathBuf>,
-    relay: bool,
-) -> Result<()> {
-    let is_external = external.is_some();
-    let selected = fleet as u8 + external.is_some() as u8 + ci as u8;
-    if selected != 1 {
-        let (message, _) = fleet_ui::mint::err_needs_key_type();
-        bail!("{message}");
-    }
-    let key_type = if fleet { fleet_ui::mint::KeyType::Fleet } else if ci { fleet_ui::mint::KeyType::CI } else { fleet_ui::mint::KeyType::External };
-    let default_ttl = if ci { "15m" } else { "1h" };
-    let ttl_text = ttl.as_deref().unwrap_or(default_ttl);
-    let ttl_secs = parse_mint_ttl(ttl_text)?;
-    if is_external && ttl_secs > 24 * 3600 {
-        let (message, _) = fleet_ui::mint::err_over_ttl();
-        bail!("{message}");
-    }
-
-    let mut caps = Vec::new();
-    for raw in &allow {
-        let cap = mint_capability(raw)?;
-        if !caps.contains(&cap) {
-            caps.push(cap);
-        }
-    }
-    if is_external && caps.is_empty() {
-        bail!("external keys need at least one --allow capability");
-    }
-    if ci && audience.is_none() {
-        bail!("CI keys require --audience <paired-device>");
-    }
-    if caps.is_empty() {
-        caps.push("transfer".to_string());
-    }
-
-    let audience_name = external.or(audience);
-    let audience = audience_name
-        .map(|name| {
-            device_cert_for(&name)
-                .map(|cert| hex::encode(cert.device_pub))
-                .ok_or_else(|| anyhow!("no certified paired device named '{name}'"))
-        })
-        .transpose()?;
-    let lifetime = fleet_ui::mint::Lifetime {
-        ttl: ttl_text.to_string(),
-        reuse: match reuse.as_deref().unwrap_or("once").to_ascii_lowercase().as_str() {
-            "once" => fleet_ui::mint::Reuse::Once,
-            "reusable" => fleet_ui::mint::Reuse::Reusable,
-            value if value.starts_with("n(") && value.ends_with(')') => fleet_ui::mint::Reuse::Times(value[2..value.len() - 1].parse().map_err(|_| anyhow!("invalid --reuse '{value}'"))?),
-            value => fleet_ui::mint::Reuse::Times(value.parse().map_err(|_| anyhow!("invalid --reuse '{value}'"))?),
-        },
-        max_ttl: if ci { "15m".to_string() } else { "24h".to_string() },
-    };
-    let mint_caps = fleet_ui::mint::MintCaps {
-        shell: caps.iter().any(|cap| cap == "shell"),
-        write: caps.iter().any(|cap| cap == "mount"),
-        all_ports: caps.iter().any(|cap| cap == "all-ports"),
-    };
-    eprintln!("{}", fleet_ui::mint::render_header());
-    eprintln!("{}", fleet_ui::mint::render_summary(key_type, &mint_caps));
-    eprintln!("{}", fleet_ui::mint::render_lifetime(&lifetime));
-
-    ephemeral_cmd(
-        server,
-        EphemeralAction::Mint {
-            caps,
-            audience: audience.into_iter().collect(),
-            ttl: ttl_secs,
-            reuse: match lifetime.reuse {
-                fleet_ui::mint::Reuse::Once => "Once".to_string(),
-                fleet_ui::mint::Reuse::Times(n) => format!("N({n})"),
-                fleet_ui::mint::Reuse::Reusable => "Reusable".to_string(),
-            },
-            tag: if ci { "ci".to_string() } else if is_external { "external".to_string() } else { "fleet".to_string() },
-            out,
-        },
-        relay,
-    )
-    .await
-}
 
 /// CLI handler for `filament ephemeral`
 /// Interactive options for `ephemeral mint`.
@@ -8077,6 +7956,9 @@ async fn pair_cmd(
     // A certless device offers its device key once, so an owner running
     // `add --internal` has something to certify.
     let mut sent_enrol_offer = false;
+    // The certificate this side ISSUED to a certless peer, held until the
+    // ceremony completes so it can be stored together with the pair secret.
+    let mut issued_cert: Option<(identity::DeviceCert, Vec<String>)> = None;
     // Set once the owner's answer has been handled. A device that OFFERED its key
     // must not finish the ceremony before the answer lands: the owner sends the
     // grant only after seeing the offer, so completing on the pairing result alone
@@ -8242,6 +8124,24 @@ async fn pair_cmd(
                     }
                     // No cert: store secret only (legacy or first-pair no identity)
                     devices_store_v2(&n, &sec, &caps)?;
+                    // ...unless WE certified them during this ceremony. Then the
+                    // secret and the certificate belong in one record: the owner
+                    // dials on the secret and judges on the certificate, and a
+                    // row holding only one of them is either unreachable or
+                    // "uncertified, trusted in full".
+                    if let Some((cert, caps)) = issued_cert.as_ref() {
+                        if let Err(e) = devices_upsert_atomic(
+                            &n,
+                            Some(&sec),
+                            Some(cert),
+                            Some(caps),
+                            Some(identity::IntroScope::Device.to_byte()),
+                            None,
+                            None,
+                        ) {
+                            ui::debug(&format!("enrol: could not record the certificate: {e}"));
+                        }
+                    }
                 } else {
                     // #23: atomic (secret,cert) together in ONE write, not separate writes.
                     // devices_store_v2 writes secret, store_provisional writes cert to temp file.
@@ -8527,7 +8427,16 @@ async fn pair_cmd(
                                                 let expires = identity::now_secs()
                                                     .saturating_add(identity::CERT_TTL_SECS);
                                                 match mesh_enrolment(&owner_key, dpub, &caps, expires, true) {
-                                                    Ok((_cert, mut grant)) => {
+                                                    Ok((cert, mut grant)) => {
+                                                        // Remember what we issued; the RECORD is
+                                                        // written at ceremony completion, where the
+                                                        // pair secret also exists. Writing it here
+                                                        // instead created the row early with a cert
+                                                        // and no secret, and the owner then never
+                                                        // subscribed to that pair channel, so
+                                                        // `send --to` from the joined device found
+                                                        // nobody. Measured exactly that way.
+                                                        issued_cert = Some((cert.clone(), caps.clone()));
                                                         grant["type"] = json!("enrol-grant");
                                                         grant["owner_name"] = json!(display_name());
                                                         if let Ok((gn, gs)) = identity::seal_plaintext(
@@ -14332,9 +14241,6 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Requests { action } => requests_cmd(action).await,
-        Cmd::Mint { fleet, external, ci, ttl, reuse, allow, audience, yes, out } => {
-            mint_cmd(&server, fleet, external, ci, ttl, reuse, allow, audience, yes, out, relay).await
-        }
         Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
             require_known_device(&peer)?;
