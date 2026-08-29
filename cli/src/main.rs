@@ -7306,6 +7306,55 @@ fn enrollment_timeout(secs: u64) -> anyhow::Error {
     anyhow!("enrollment timed out after {secs}s (no response from peer)")
 }
 
+/// Everything the capability gate needs to know about a peer, resolved once.
+///
+/// This preamble was written FIVE times in the daemon, identically: lazy-resolve
+/// the peer's identity from its stored certificate, then read binding, expiry,
+/// revocation and the auth-key ceiling off the link. Five copies of the inputs
+/// to an authorization decision.
+///
+/// This file already records what that shape costs. The four role-election bugs
+/// were ONE bug: an input trusted to be computed the same way in several places,
+/// with nothing enforcing it. Aimed at the gate that decides who may open a
+/// shell, mount a folder or receive a file, it is the same wager.
+///
+/// Checked before extracting, because a divergence would be a live bug rather
+/// than untidiness: all five DO reach cap_gate_effective with cert_revoked. Four
+/// compute it here and the transfer arm computed it a few lines later, after its
+/// trust floor. Ordering differed; the input did not. Two copies had also
+/// drifted in whitespace, which is the usual sign of paste.
+///
+/// Owned, not borrowed, so a caller can hold it while still using `conn`.
+struct PeerAuthz {
+    idev: Option<[u8; 32]>,
+    iusr: Option<[u8; 32]>,
+    binding: crate::capability::BindingStrength,
+    expires: Option<u64>,
+    cert_revoked: bool,
+    ak_caps: Option<Vec<String>>,
+}
+
+fn peer_authz(conn: &mut Conn, pid: &str) -> PeerAuthz {
+    if let Some(l) = conn.link_mut(pid) {
+        resolve_peer_identity(l);
+    }
+    let link = conn.link(pid);
+    let idev = link.and_then(|l| l.identity_device_pub);
+    let iusr = link.and_then(|l| l.identity_user_pub);
+    PeerAuthz {
+        binding: link
+            .map(|l| l.identity_binding)
+            .unwrap_or(crate::capability::BindingStrength::None),
+        expires: link.and_then(|l| l.identity_cert_expires),
+        cert_revoked: cert_revoked_for(idev.as_ref()),
+        ak_caps: link
+            .and_then(|l| l.principal_kind.auth_key_caps())
+            .map(|c| c.to_vec()),
+        idev,
+        iusr,
+    }
+}
+
 fn cancelled() -> anyhow::Error {
     anyhow!("cancelled")
 }
@@ -19642,19 +19691,11 @@ async fn recv_cmd(
                                 .unwrap_or(false);
                             l2_open_allowed(blanket, peer_has_shell)
                         };
-                        // Lazy-resolve peer identity from stored device cert
-                        {
-                            if let Some(l) = conn.link_mut(&pid) {
-                                resolve_peer_identity(l);
-                            }
-                        }
-                        let link = conn.link(&pid);
-                        let idev = link.and_then(|l| l.identity_device_pub.as_ref());
-                        let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
-                        let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
-                        let expires = link.and_then(|l| l.identity_cert_expires);
-                        let cert_revoked = cert_revoked_for(idev);
-                        let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
+                        let az = peer_authz(&mut conn, &pid);
+                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = (
+                            az.idev.as_ref(), az.iusr.as_ref(), az.binding,
+                            az.expires, az.cert_revoked, az.ak_caps.as_deref(),
+                        );
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -19863,19 +19904,11 @@ async fn recv_cmd(
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under FILAMENT_CAP_AUTHORITATIVE.
                     let granted = {
-                        // Lazy-resolve peer identity from stored device cert
-                        {
-                            if let Some(l) = conn.link_mut(&pid) {
-                                resolve_peer_identity(l);
-                            }
-                        }
-                        let link = conn.link(&pid);
-                        let idev = link.and_then(|l| l.identity_device_pub.as_ref());
-                        let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
-                        let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
-                        let expires = link.and_then(|l| l.identity_cert_expires);
-                        let cert_revoked = cert_revoked_for(idev);
-                        let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
+                        let az = peer_authz(&mut conn, &pid);
+                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = (
+                            az.idev.as_ref(), az.iusr.as_ref(), az.binding,
+                            az.expires, az.cert_revoked, az.ak_caps.as_deref(),
+                        );
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -19993,19 +20026,11 @@ async fn recv_cmd(
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under FILAMENT_CAP_AUTHORITATIVE.
                     let granted = {
-                        // Lazy-resolve peer identity from stored device cert
-                        {
-                            if let Some(l) = conn.link_mut(&pid) {
-                                resolve_peer_identity(l);
-                            }
-                        }
-                        let link = conn.link(&pid);
-                        let idev = link.and_then(|l| l.identity_device_pub.as_ref());
-                        let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
-                        let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
-                        let expires = link.and_then(|l| l.identity_cert_expires);
-                        let cert_revoked = cert_revoked_for(idev);
-                        let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
+                        let az = peer_authz(&mut conn, &pid);
+                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = (
+                            az.idev.as_ref(), az.iusr.as_ref(), az.binding,
+                            az.expires, az.cert_revoked, az.ak_caps.as_deref(),
+                        );
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -20190,19 +20215,11 @@ async fn recv_cmd(
                     // samples the legacy-allowed population); legacy (trusted) stands
                     // in shadow, cap gates under FILAMENT_CAP_AUTHORITATIVE.
                     let (authorized, read_only) = {
-                        // Lazy-resolve peer identity from stored device cert
-                        {
-                            if let Some(l) = conn.link_mut(&pid) {
-                                resolve_peer_identity(l);
-                            }
-                        }
-                        let link = conn.link(&pid);
-                        let idev = link.and_then(|l| l.identity_device_pub.as_ref());
-                        let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
-                        let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
-                        let expires = link.and_then(|l| l.identity_cert_expires);
-                        let cert_revoked = cert_revoked_for(idev);
-                        let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
+                        let az = peer_authz(&mut conn, &pid);
+                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = (
+                            az.idev.as_ref(), az.iusr.as_ref(), az.binding,
+                            az.expires, az.cert_revoked, az.ak_caps.as_deref(),
+                        );
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -20890,18 +20907,11 @@ async fn recv_cmd(
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under FILAMENT_CAP_AUTHORITATIVE.
                     let (ok, xfer_deny_reason, xfer_gate) = {
-                        // Lazy-resolve peer identity from stored device cert
-                        {
-                            if let Some(l) = conn.link_mut(&pid) {
-                                resolve_peer_identity(l);
-                            }
-                        }
-                        let link = conn.link(&pid);
-                        let idev = link.and_then(|l| l.identity_device_pub.as_ref());
-                        let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
-                        let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
-                        let expires = link.and_then(|l| l.identity_cert_expires);
-                        let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
+                        let az = peer_authz(&mut conn, &pid);
+                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = (
+                            az.idev.as_ref(), az.iusr.as_ref(), az.binding,
+                            az.expires, az.cert_revoked, az.ak_caps.as_deref(),
+                        );
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -20931,7 +20941,6 @@ async fn recv_cmd(
                         // could still redirect the write — closed separately by the
                         // plain-file-only (O_NOFOLLOW/O_EXCL) write hardening tracked as
                         // a fleet-trust follow-up.
-                        let cert_revoked = cert_revoked_for(idev);
                         let landing = dir.join(&name);
                         let scoped_in_bounds = crate::path_within(&dir, &landing);
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
