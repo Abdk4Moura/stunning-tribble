@@ -247,9 +247,22 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    requires a secret, hiding the very records it should show), and the FLEET tier
    asked `load_owner_key()`, "do I hold the owner's PRIVATE key", so every joined
    device rendered its own siblings as EXTERNAL.
-   STILL OPEN: the L2 verbs cannot dial them. `send --to` now says so accurately
-   rather than claiming the name is unknown while listing it. Making them
-   addressable needs one-shot verbs to ride the daemon's warm link, since there is no secret to dial with.
+   PARTLY CLOSED BY 1h, AND THE SPLIT IS EXACT. `send --to <sibling>` is now
+   brokered and reliable (58/58): the daemon mints a single-use secret over the
+   cert-verified link, so there IS a secret to dial with. Every other L2 verb
+   still cannot dial a sibling.
+
+   Verified by call site, not by assumption: `ctl::try_fleet_rendezvous` has
+   exactly one caller, `send_cmd` (cli/src/main.rs). `shell`, `forward`, `mount`
+   and `expose` never ask for a ticket, so they still hit the no-secret wall that
+   this item was opened for. Generalising "send works now" to "the L2 verbs work
+   now" would be the narrow-view error this file keeps recording.
+
+   REMAINING WORK, and it is small because the mechanism exists: lift the broker
+   call out of `send_cmd` so any one-shot verb can request a ticket before it
+   dials. The 1h security rule has to move with it, unchanged: a ticket is
+   accepted only from a link whose certificate was already verified, or presence
+   on the fleet channel starts buying peerings again.
    **RESOLVED (2026-08-26): the obligation is discharged.** The negative test has
    now been RUN and PASSED. With `laptop`'s shell acceptor armed for a different
    device, a fleet sibling with zero grants is denied by the gate itself:
@@ -867,7 +880,8 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    then all of the other let a bad two-minute window land entirely on one arm:
    the SAME binary measured 2/8 and 8/8. Only interleaved runs are comparable.
 
-   STILL OPEN, ~9%: the receiver sometimes declines with "not in auth key caps".
+   STILL OPEN AT THE TIME, ~9%, AND CLOSED BY 1h RATHER THAN BY FIXING IT: the
+   receiver sometimes declines with "not in auth key caps".
    Its gate decides the offer before the one-shot sender's `fleet-hello` has been
    verified, so an unverified fleet link is judged against the empty ceiling it
    is born with. The narrow deferral (`fleet_pending`, meaning "a hello IS
@@ -876,7 +890,9 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    WORSE, 11/15 -> 3/15: it parks offers whose hello was already handled, which
    then wait out the grace and are declined anyway. Do not retry that.
 
-   MEASUREMENT IS THE BLOCKER NOW, and this is the thing to fix first.
+   MEASUREMENT WAS THE BLOCKER THEN, and it is why this item stops here: the
+   next thing built was 1h, not a fifth patch to this ceremony. The rig-identity
+   confounder below is still live for ANY future sibling-path measurement.
    Interleaving controls for drift WITHIN a rig, but RIG IDENTITY is a
    confounder and it is larger than any effect being chased. The same release
    binary measured:
@@ -931,6 +947,11 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    it should ride the daemon's already-verified link (item 1c, warm-send), or
    have the daemon broker a private single-use rendezvous for it. Build the
    flaky thing on top of the thing that is already reliable.
+
+   THAT IS EXACTLY WHAT 1h DID, and it measured 58/58. This paragraph is kept
+   because the reasoning that produced it (four marginal patches, four
+   regressions, so stop patching the ceremony and remove the race instead) is
+   the transferable part; the plan itself is done.
 
 2-DONE. **Owner-signed grant distribution: BUILT and verified (2026-08-27).**
    Owner-signed `CapOp`s now reach fleet devices two ways: seeded in the
