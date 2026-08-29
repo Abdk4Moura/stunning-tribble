@@ -5201,129 +5201,13 @@ async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Re
     }
 }
 
-fn persist_join_ack(v: &Value, auth_key: &crate::ephemeral::Invitation) -> Result<String> {    if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
-        bail!("this device already holds an identity key; join only from a clean Filament identity");
-    }
-    if local_device_cert_path().exists() {
-        bail!("this device already holds a joined certificate; refusing to overwrite it");
-    }
-    let assigned_name = v["name"].as_str().ok_or_else(|| anyhow!("join acknowledgement omitted the device name"))?;
-    let owner_name = v["owner_name"].as_str().ok_or_else(|| anyhow!("join acknowledgement omitted the owner name"))?;
-    let secret = v["secret"].as_str().ok_or_else(|| anyhow!("join acknowledgement omitted the reconnect secret"))?;
-    if hex::decode(secret).map(|bytes| bytes.len()).ok() != Some(32) {
-        bail!("join acknowledgement carried an invalid reconnect secret");
-    }
-    let expires = v["expires"].as_u64().ok_or_else(|| anyhow!("join acknowledgement omitted its expiry"))?;
-    let ceiling = v["ceiling"]
-        .as_array()
-        .ok_or_else(|| anyhow!("join acknowledgement omitted its capability ceiling"))?
-        .iter()
-        .map(|item| item.as_str().map(str::to_string).ok_or_else(|| anyhow!("join ceiling contains a non-string capability")))
-        .collect::<Result<Vec<_>>>()?;
-    let max_offline = v["max_offline"].as_u64().ok_or_else(|| anyhow!("join acknowledgement omitted its offline budget ceiling"))?;
-    let persistent = v["persistent"].as_bool().unwrap_or(false);
-    if expires != auth_key.expires
-        || ceiling != auth_key.caps
-        || max_offline != auth_key.max_offline
-        || persistent != !auth_key.ephemeral
-    {
-        bail!("join acknowledgement changed a signed principal bound (ceiling, expiry, offline budget, or persistence)");
-    }
-    let local_cert = identity::DeviceCert::from_json(&v["device_cert"])
-        .ok_or_else(|| anyhow!("join acknowledgement omitted the local device certificate"))?;
-    let owner_cert = identity::DeviceCert::from_json(&v["owner_cert"])
-        .ok_or_else(|| anyhow!("join acknowledgement omitted the owner certificate"))?;
-    let overlay_pub = crate::overlay::overlay_pubkey_bytes()?;
-    if local_cert.device_pub != overlay_pub
-        || crate::ephemeral::issuer_fingerprint(&local_cert.user_pub) != auth_key.issuer_fp
-        || local_cert.expires != expires
-        || local_cert.verify(identity::now_secs()).is_err()
-    {
-        bail!("join acknowledgement carried an invalid local device certificate");
-    }
-    // Compared by FINGERPRINT for the same reason the invitation path does it:
-    // the credential carries 8 bytes of the owner key, not 32. The certificate
-    // is still mandatory, so this authenticates the owner exactly as before.
-    if crate::ephemeral::issuer_fingerprint(&owner_cert.user_pub) != auth_key.issuer_fp
-        || owner_cert.verify(identity::now_secs()).is_err()
-    {
-        bail!("join acknowledgement carried an invalid owner certificate");
-    }
-    let cert_path = local_device_cert_path();
-    crate::platform::SecretFile::write_str(
-        &cert_path,
-        &serde_json::to_string_pretty(&json!({ "name": assigned_name, "cert": local_cert.to_json() }))?,
-    )?;
-    let transfer_caps = vec!["transfer".to_string()];
-    devices_upsert_atomic(
-        owner_name,
-        Some(secret),
-        Some(&owner_cert),
-        Some(&transfer_caps),
-        Some(identity::IntroScope::Device.to_byte()),
-        None,
-        None,
-    )?;
-    // Fleet auto-mesh: keep the rendezvous secret the owner sent. Its ABSENCE is
-    // not a failure, it just means no auto-mesh (an older owner, or a join that
-    // was not persistent).
-    if let Some(rv) = v["fleet_rv"].as_str() {
-        if let Err(e) = fleet::store_rv(rv) {
-            ui::debug(&format!("fleet rendezvous secret not stored: {e}"));
-        }
-    }
-    // Same-owner fleet-trust: keep the owner's signed capability header so this
-    // device knows which owner its policy answers to. Absence is not a failure
-    // (an older owner simply does not send one); it just leaves the capability
-    // layer unprovisioned here, which is the previous behaviour.
-    if let Some(hdr) = v["cap_header"].as_object() {
-        let dir = crate::settings::config_dir();
-        let mut store = crate::capability::load_cap_store(&dir);
-        let already = store.iter().any(|e| {
-            e.get("type").and_then(|x| x.as_str()) == Some("cap_header")
-                && e["resource"].as_str() == Some("self")
-        });
-        if !already {
-            store.push(Value::Object(hdr.clone()));
-            // The header alone is HALF of what an owner device has:
-            // `ensure_self_genesis_header` writes a header AND a cap_ratchet, and
-            // evaluation needs both. Measured with only the header delivered:
-            // `own_user` resolved (so the header does its job) but the gate still
-            // denied. The ratchet is a LOCAL anti-rollback record keyed on
-            // owner_pub, carries no signature, and owner_pub is right here in the
-            // header, so the joined device can create its own.
-            let owner_pub = hdr
-                .get("owner_pub")
-                .and_then(|v| v.as_str())
-                .and_then(|h| hex::decode(h).ok())
-                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
-            if let Some(owner_pub) = owner_pub {
-                let issued = hdr.get("issued_at").and_then(|v| v.as_u64()).unwrap_or(0);
-                if let Err(e) = crate::capability::update_ratchet(&mut store, &owner_pub, issued) {
-                    ui::debug(&format!("capability ratchet not initialised: {e}"));
-                }
-            }
-            if let Err(e) = crate::capability::save_cap_store(&dir, &store) {
-                ui::debug(&format!("owner capability header not stored: {e}"));
-            }
-        }
-    }
-    // Fleet policy from the owner. Verified against the owner key in the header
-    // just stored, so an unverifiable or foreign-grantor entry is dropped.
-    if let Some(ops) = v["cap_ops"].as_array() {
-        let n = merge_owner_cap_ops(ops);
-        if n > 0 {
-            ui::debug(&format!("stored {n} owner-signed capability op(s)"));
-        }
-    }
-    config_set("name", assigned_name)?;
-    Ok(assigned_name.to_string())
-}
-
-/// #186: the join-ack validation for a COMPACT (v2) invitation. The owner is
-/// verified by the 8-byte fingerprint of the cert's user key (the joiner only
-/// holds the fp); the bound checks are identical to persist_join_ack.
-fn persist_join_ack_v2(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<String> {
+/// Store the certificates a join acknowledgement carried, and return the name.
+///
+/// ONE of these. There were two, `persist_join_ack` and `persist_join_ack_v2`,
+/// identical but for a hoisted local: one took an AuthKey and one an Invitation,
+/// which made them look like different functions. Once the two credentials
+/// collapsed into one, the signatures became the same and so did the bodies.
+fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<String> {
     if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
         bail!("this device already holds an identity key; join only from a clean Filament identity");
     }
@@ -6113,7 +5997,7 @@ async fn enroll_cmd(
                     }
                 }
                 Some("identity-auth-key-enroll-ack") => {
-                    let name = persist_join_ack_v2(&v, &inv)?;
+                    let name = persist_join_ack(&v, &inv)?;
                     if json_output {
                         println!("{}", serde_json::to_string_pretty(&json!({
                             "joined": true,
