@@ -18,6 +18,25 @@ readme = "README.md"
 keywords = ["transport", "p2p", "nat-traversal", "hooks"]
 categories = ["network-programming"]
 
+[features]
+# DECLARED HERE because the code in this crate gates on them. It was carved out
+# of cli/src with its `#[cfg(feature = "test-hooks")]` blocks intact, but the
+# feature declarations stayed behind in cli/Cargo.toml, and a cfg naming a
+# feature its own crate does not declare is UNCONDITIONALLY FALSE.
+#
+# So ~20 fault-injection hooks in direct.rs and net.rs (the data-path freeze, the
+# persistent freeze that forces relay fallback, the unblock that proves the
+# relay->direct upgrade, the flaky-standby no-flap probe) were compiled out of
+# EVERY build, including the gates' own `--features test-hooks` build. rustc had
+# been saying so all along: "unexpected cfg condition value: test-hooks", 20 of
+# them, sitting under the warning ratchet's total.
+#
+# That is worse than a missing feature. These hooks are the INSTRUMENT the P1 and
+# P5 resilience gates measure with, so results they produced after the carve were
+# taken with the faults never injected.
+test-hooks = []
+debug-logs = []
+
 [dependencies]
 # Versions copied verbatim from cli/Cargo.toml, so behaviour is byte-identical.
 anyhow = "1.0.102"

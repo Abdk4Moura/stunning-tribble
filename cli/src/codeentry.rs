@@ -381,8 +381,13 @@ pub fn pick_with_keys(
             // crossterm may deliver the lone 0x03 byte WITHOUT the CONTROL
             // modifier. Match the raw control byte as well as the composed
             // Ctrl-C, so the keypress dismisses the picker on every platform.
+<<<<<<< Updated upstream
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(Picked::Cancelled),
             KeyCode::Char('\u{3}') => return Ok(Picked::Cancelled),
+=======
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
+            KeyCode::Char('\u{3}') => return Ok(None),
+>>>>>>> Stashed changes
             KeyCode::Up | KeyCode::Char('k') => sel = if sel == 0 { items.len() - 1 } else { sel - 1 },
             KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1) % items.len(),
             KeyCode::Enter => return Ok(Picked::Item(sel)),

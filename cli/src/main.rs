@@ -3049,6 +3049,7 @@ fn principal_ceiling_for(name: &str) -> Option<Vec<String>> {
     )
 }
 
+<<<<<<< Updated upstream
 /// The capabilities enforcement actually honours for this device: the enrollment
 /// ceiling for a delegated device (grant writes never widen it), or the grant
 /// store for a non-delegated device. The devices display renders from this, and
@@ -3061,6 +3062,8 @@ fn effective_device_caps(name: &str) -> Vec<String> {
     }
 }
 
+=======
+>>>>>>> Stashed changes
 /// Path-explicit core of `device_caps` (testable without touching the global
 /// config-dir env var).
 #[allow(dead_code)]
@@ -3442,6 +3445,7 @@ fn write_pidfile() -> Result<()> {
 }
 
 fn daemon_alive() -> Option<u32> {
+<<<<<<< Updated upstream
     let raw = std::fs::read_to_string(pidfile()).ok()?;
     let mut lines = raw.lines();
     let pid: u32 = lines.next()?.trim().parse().ok()?;
@@ -3472,6 +3476,55 @@ fn same_executable(a: &Path, b: &Path) -> bool {
     };
     let (a, b) = (norm(a), norm(b));
     a.canonicalize().unwrap_or(a) == b.canonicalize().unwrap_or(b)
+=======
+    let pid: u32 = std::fs::read_to_string(pidfile()).ok()?.trim().parse().ok()?;
+    is_filament_process(pid).then_some(pid)
+}
+
+/// True when the pid is a live filament process. The pidfile alone can hold a
+/// recycled pid, so the process is confirmed by inspecting it, not by trusting
+/// the file. Unix reads /proc/<pid>/cmdline; Windows opens the process and
+/// reads its image name (there is no /proc there - a missing variant made
+/// daemon_alive constant-false on Windows, which silently disabled the 0.8.6
+/// up-follows, --detach, and down features on that platform).
+#[cfg(unix)]
+fn is_filament_process(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+        .map(|cmd| cmd.contains("filament"))
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_filament_process(pid: u32) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    unsafe {
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+            fn QueryFullProcessImageNameW(h: isize, flags: u32, buf: *mut u16, size: *mut u32) -> i32;
+            fn CloseHandle(h: isize) -> i32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 {
+            return false;
+        }
+        let mut buf = [0u16; 512];
+        let mut size = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size);
+        CloseHandle(h);
+        if ok == 0 {
+            return false;
+        }
+        let path = String::from_utf16_lossy(&buf[..size as usize]);
+        path.to_lowercase().contains("filament")
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_filament_process(pid: u32) -> bool {
+    let _ = pid;
+    false
+>>>>>>> Stashed changes
 }
 
 /// The argv for a web-shell PTY.
@@ -4793,7 +4846,30 @@ fn device_countdown(_tier: fleet_ui::devices::DeviceTier, cert: Option<&identity
         let date = chrono::DateTime::from_timestamp(cert.expires as i64, 0)
             .map(|at| at.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "expired".to_string());
+<<<<<<< Updated upstream
         return format!("expired {date}");
+=======
+        return match tier {
+            fleet_ui::devices::DeviceTier::Fleet => format!("renews until {date}"),
+            _ => format!("expired {date}"),
+        };
+    }
+    // Round UP to the nearest whole unit, so a cert issued for 90 days reads
+    // "90d", not "129600m" or a seconds figure a few seconds short of the day.
+    let secs = cert.expires - now;
+    let text = if secs >= 86400 {
+        format!("{}d", (secs + 86399) / 86400)
+    } else if secs >= 3600 {
+        format!("{}h", (secs + 3599) / 3600)
+    } else if secs >= 60 {
+        format!("{}m", (secs + 59) / 60)
+    } else {
+        format!("{secs}s")
+    };
+    match tier {
+        fleet_ui::devices::DeviceTier::Fleet => format!("renews in {text}"),
+        _ => format!("expires in {text}"),
+>>>>>>> Stashed changes
     }
     // Round UP to the nearest whole unit, so a cert issued for 90 days reads
     // "90d", not "129600m" or a seconds figure a few seconds short of the day.
@@ -5735,6 +5811,7 @@ async fn add_for_cmd(
     // device/person is a DEVICE NAME: select device-kind and pre-fill the
     // invitation so the owner can name the invitee up front. The literals
     // keep working for scripts.
+<<<<<<< Updated upstream
     let (kind, _invitee_name) = resolve_for_kind(caps, for_)?;
     // The ergonomic gap behind "I want to shell into my own devices": shell has
     // to be in the invitation ceiling, because a grant cannot widen one later
@@ -5756,6 +5833,22 @@ async fn add_for_cmd(
             Some(1) => interactive_shell = true,
             Some(_) => {}
             None => return Err(cancelled()),
+=======
+    let (kind, _invitee_name) = match for_.as_deref() {
+        None => {
+            if caps.interactive {
+                // A cancelled picker (Ctrl-C / Esc) is a cancellation, not a
+                // missing argument (#203): exit cleanly instead of reporting
+                // the non-interactive requirement.
+                let choices = vec!["A device I control".to_string(), "Another person".to_string()];
+                match codeentry::pick("WHO IS JOINING", &choices)? {
+                    Some(index) => ((if index == 0 { "device".to_string() } else { "person".to_string() }), None),
+                    None => return Err(cancelled()),
+                }
+            } else {
+                bail!("non-interactive add --for requires device|person or a device name");
+            }
+>>>>>>> Stashed changes
         }
     }
     let mut ceiling = if allow.is_empty() {
@@ -7045,6 +7138,7 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
     // the diagnostic timeline is diag.jsonl. Follow whichever exists; prefer
     // the console log when present (it is what a user means by "logs").
     let console = crate::platform::Paths::config_path("daemon.log");
+<<<<<<< Updated upstream
 
     // A daemon under a service manager writes to the journal, not to a file we
     // own, so there is nothing here to read and there never will be. That is
@@ -7086,6 +7180,8 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
         }
     }
 
+=======
+>>>>>>> Stashed changes
     let path = if console.exists() { console } else { crate::platform::Paths::config_path("diag.jsonl") };
     let read_tail = |count: usize| -> Result<()> {
         let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -7113,6 +7209,7 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
     // cleanly, never stop the daemon. The file may not exist yet (the daemon
     // is still starting); poll for it instead of erroring.
     use tokio::io::{AsyncBufReadExt, AsyncSeekExt};
+<<<<<<< Updated upstream
     // #216: ONE interrupt registration, created before the loops and held for
     // the whole follow.
     //
@@ -7141,6 +7238,8 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
             return Ok(());
         }};
     }
+=======
+>>>>>>> Stashed changes
     loop {
         match tokio::fs::OpenOptions::new().read(true).open(&path).await {
             Ok(f) => {
@@ -7150,6 +7249,7 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
                 let mut line = String::new();
                 loop {
                     tokio::select! {
+<<<<<<< Updated upstream
                         biased;
                         _ = interrupted.notified() => detached!(),
                         res = reader.read_line(&mut line) => {
@@ -7161,15 +7261,28 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
                                     _ = interrupted.notified() => detached!(),
                                     _ = tokio::time::sleep(Duration::from_millis(250)) => {}
                                 }
+=======
+                        res = reader.read_line(&mut line) => {
+                            if res? == 0 {
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+>>>>>>> Stashed changes
                                 continue;
                             }
                             eprintln!("{}", line.trim_end());
                             line.clear();
                         }
+<<<<<<< Updated upstream
+=======
+                        _ = tokio::signal::ctrl_c() => {
+                            ui::say("\n  detached (the daemon keeps running)");
+                            return Ok(());
+                        }
+>>>>>>> Stashed changes
                     }
                 }
             }
             Err(_) => {
+<<<<<<< Updated upstream
                 // The same window while waiting for the file to appear: a daemon
                 // that is slow to start must not make ctrl-c inert either.
                 tokio::select! {
@@ -7177,6 +7290,9 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
                     _ = interrupted.notified() => detached!(),
                     _ = tokio::time::sleep(Duration::from_millis(300)) => {}
                 }
+=======
+                tokio::time::sleep(Duration::from_millis(300)).await;
+>>>>>>> Stashed changes
                 continue;
             }
         }
@@ -13199,7 +13315,36 @@ async fn main() -> Result<()> {
         let header = format!("FILAMENT  /  {device_count} DEVICES  /  {availability}");
         let owner = identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some();
         let joined = !owner && local_device_cert().is_some();
+<<<<<<< Updated upstream
         let actions = first_screen_actions(owner, joined, device_count);
+=======
+        let actions: Vec<(&str, &str)> = if owner {
+            vec![
+                ("Send something", "send"),
+                ("Receive something", "receive"),
+                ("Mount remote files", "mount"),
+                ("Connect a device with me now", "add"),
+                ("Invite a device or person", "add --for"),
+                ("Serve in the background", "up --install"),
+                ("See every device", "devices"),
+                ("View my identity", "id"),
+            ]
+        } else if joined {
+            vec![
+                ("Send something", "send"),
+                ("Receive something", "receive"),
+                ("Mount remote files", "mount"),
+                ("See every device", "devices"),
+                ("View my joined identity", "id"),
+            ]
+        } else {
+            vec![
+                ("Set up this first device", "init"),
+                ("Join with an invitation", "join"),
+                ("Receive a one-time transfer", "receive"),
+            ]
+        };
+>>>>>>> Stashed changes
         let labels = actions.iter().map(|(label, _)| (*label).to_string()).collect::<Vec<_>>();
         match codeentry::pick(&header, &labels)? {
             Some(index) => argv.extend(
@@ -13208,6 +13353,7 @@ async fn main() -> Result<()> {
                     .split_whitespace()
                     .map(str::to_string),
             ),
+<<<<<<< Updated upstream
             // #209: Ctrl-C means stop. Answering it with the full
             // status-and-help screen reads as "I picked the first item and got a
             // help page", which is what the owner reported on Windows. Exit
@@ -13237,6 +13383,9 @@ async fn main() -> Result<()> {
             if looks_like_code {
                 bail!("`add` offers, `join` accepts. To claim that code run:  filament join {next}");
             }
+=======
+            None => return tour_cmd(),
+>>>>>>> Stashed changes
         }
     }
     let cli = Cli::parse_from(argv);
@@ -13767,7 +13916,10 @@ async fn main() -> Result<()> {
                 }
                 None => bail!("shell needs a device in non-interactive mode: filament shell <device>"),
             };
+<<<<<<< Updated upstream
             require_known_device(&peer)?;
+=======
+>>>>>>> Stashed changes
             // #219: a device whose invitation ceiling excludes shell can never
             // serve one, and the denial was surfacing as a silent hang (the
             // acceptor's l2-close is only sent when the acceptor is ON). Say so
@@ -13844,19 +13996,28 @@ async fn main() -> Result<()> {
                 // #202: the netcat shape - pipe stdio to the peer's port (the
                 // ssh ProxyCommand contract). `forward` owns the role; --stdio
                 // is the second plumbing.
+<<<<<<< Updated upstream
                 require_known_device(&peer)?;
+=======
+>>>>>>> Stashed changes
                 l2::netcat_cmd(&server, &peer, rport, relay).await
             } else if socks {
                 l2::proxy_cmd(&server, &bind, port, http_port, relay).await
             } else {
+<<<<<<< Updated upstream
                 require_known_device(&peer)?;
+=======
+>>>>>>> Stashed changes
                 let lport = lport.unwrap_or(rport);
                 l2::forward_cmd(&server, lport, &peer, rport, relay).await
             }
         },
         Cmd::Netcat { peer, rport } => {
             // Hidden one-release alias for the netcat shape, now forward --stdio.
+<<<<<<< Updated upstream
             require_known_device(&peer)?;
+=======
+>>>>>>> Stashed changes
             l2::netcat_cmd(&server, &peer, rport, relay).await
         },
         Cmd::Expose { port, to, peer, list, off } => {
@@ -14845,6 +15006,7 @@ async fn send_cmd(
     // discoverable one, and a mistyped name cost a minute of silence before the
     // timeout. Reject up front, like mount does.
     if let Some(target) = to.as_deref() {
+<<<<<<< Updated upstream
         // A fleet sibling has no pair secret, so `devices_load` skips it, but it IS
         // a valid target: the cold path dials it on the fleet secret and then
         // PROVES its certificate before any bytes move (`verify_fleet_identity`).
@@ -14864,6 +15026,10 @@ async fn send_cmd(
                      Use its mesh address ({target}.mesh) for now, or pair with it directly."
                 );
             }
+=======
+        let known = devices_load().iter().any(|(n, _)| n.eq_ignore_ascii_case(target));
+        if !known {
+>>>>>>> Stashed changes
             bail!(
                 "send --to '{target}': no known device by that name; run `filament devices` to see who you can reach"
             );
@@ -20267,7 +20433,11 @@ async fn recv_cmd(
                     if !l2_enabled {
                         let sid = l2::wire_sid(&v).unwrap_or(0);
                         let _ = t
+<<<<<<< Updated upstream
                             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell serving is off there; run `filament up --shell` on that device" }))
+=======
+                            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell acceptor off on this device; run `filament up --shell` here to serve shells" }))
+>>>>>>> Stashed changes
                             .await;
                         continue;
                     }
@@ -24095,6 +24265,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< Updated upstream
     fn a_device_with_no_identity_is_offered_both_ways_in() {
         // #209: there are TWO ways to be brought into an identity, a pairing code
         // claimed with `add <code>` and a bounded invitation claimed with `join`,
@@ -24440,6 +24611,8 @@ mod tests {
     }
 
     #[test]
+=======
+>>>>>>> Stashed changes
     fn down_picks_the_right_systemd_manager_for_the_daemon_cgroup() {
         // Two units can share the name filament.service (system + user under
         // Linger). down must ask the manager whose cgroup actually owns the
@@ -24512,6 +24685,7 @@ mod tests {
         assert!(checked >= 6, "expected the internal subcommand invocations to be found, got {checked}");
     }
 
+<<<<<<< Updated upstream
     /// A keystore rooted in a fresh temp dir, so enrolment tests never touch the
     /// real config and never race each other through the process environment.
     struct ScratchStore(std::path::PathBuf);
@@ -24599,6 +24773,19 @@ mod tests {
                 .expect("enrolment");
         assert!(payload["fleet_rv"].is_string(), "a member must receive fleet_rv");
         assert_eq!(payload["persistent"], serde_json::json!(true));
+=======
+    #[test]
+    fn daemon_alive_recognises_this_process_on_every_platform() {
+        // #204: daemon_alive() was Unix-only (/proc read), so it was
+        // constant-false on Windows and silently disabled up-follows, --detach
+        // and down there. The process check must confirm the CURRENT process is
+        // a filament process on all platforms (the test binary itself is one).
+        let pid = std::process::id();
+        assert!(
+            is_filament_process(pid),
+            "this filament process (pid {pid}) must be recognised by daemon_alive's process check"
+        );
+>>>>>>> Stashed changes
     }
 
     #[test]

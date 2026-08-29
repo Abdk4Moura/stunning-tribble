@@ -156,12 +156,15 @@ pub struct Mux {
     /// caller awaits the receiver. Shared across verbs and keyed by stream id, so
     /// a denial carries a reason for every open kind instead of just mount.
     open_ack_tx: Mutex<HashMap<u32, tokio::sync::oneshot::Sender<OpenOutcome>>>,
+<<<<<<< Updated upstream
     /// A reason an inbound `l2-close` carried for a stream whose open waiter was
     /// already consumed (i.e. a mid-session close). A revoked peer loses a live
     /// shell/stream this way; the reason must reach the caller as a denial, not
     /// be swallowed into a clean close. Entries for streams that never read them
     /// linger only until link death (`shutdown_all`), bounded and harmless.
     close_err: Mutex<HashMap<u32, String>>,
+=======
+>>>>>>> Stashed changes
 }
 
 impl Mux {
@@ -173,7 +176,10 @@ impl Mux {
             accepted: Mutex::new(HashMap::new()),
             resizers: Mutex::new(HashMap::new()),
             open_ack_tx: Mutex::new(HashMap::new()),
+<<<<<<< Updated upstream
             close_err: Mutex::new(HashMap::new()),
+=======
+>>>>>>> Stashed changes
         })
     }
 
@@ -340,6 +346,7 @@ impl Mux {
                 None => OpenOutcome::ClosedWithoutAck,
             };
             let _ = tx.send(outcome);
+<<<<<<< Updated upstream
         } else if let Some(reason) = err {
             // Mid-session close: the open waiter is already consumed, so record
             // the reason where the caller (the pty IO loop) can read it. A revoked
@@ -354,6 +361,8 @@ impl Mux {
             // a denial delivered into that gap is silently lost. The always-present
             // map, written before the close, cannot lose it.
             self.close_err.lock().await.insert(sid, reason.to_string());
+=======
+>>>>>>> Stashed changes
         }
         self.drop_stream(sid).await;
     }
@@ -369,7 +378,10 @@ impl Mux {
     pub async fn shutdown_all(&self) {
         self.resizers.lock().await.clear(); // H-1: no resizer outlives the mux
         self.open_ack_tx.lock().await.clear();
+<<<<<<< Updated upstream
         self.close_err.lock().await.clear();
+=======
+>>>>>>> Stashed changes
         let mut map = self.streams.lock().await;
         for (_, s) in map.drain() {
             if let Some(h) = s.read_pump {
@@ -2174,10 +2186,20 @@ pub(crate) async fn open_mount_stream(
     mux.transport
         .send_control(&json!({ "type": "mount-open", "sid": sid, "root": encoded }))
         .await?;
+<<<<<<< Updated upstream
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), outcome_rx)
         .await
         .map_err(|_| anyhow::anyhow!("mount-open-ack not received (timed out)"))?
         .map_err(|_| anyhow::anyhow!("mount-open-ack channel closed"))?;
+=======
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        outcome_rx,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("mount-open-ack not received (timed out)"))?
+    .map_err(|_| anyhow::anyhow!("mount-open-ack channel closed"))?;
+>>>>>>> Stashed changes
     // #206: an l2-close from the acceptor is a DENIAL (authorization, ceiling,
     // stream cap) carrying a reason. It must surface as a denial, never as a
     // transport-shaped timeout. Silence still means timeout; a refusal is never
@@ -2185,9 +2207,13 @@ pub(crate) async fn open_mount_stream(
     let caps_value = match outcome {
         OpenOutcome::Opened(v) => v.get("caps").cloned().unwrap_or(serde_json::Value::Null),
         OpenOutcome::Refused(reason) => return Err(anyhow!("mount denied by {reason}")),
+<<<<<<< Updated upstream
         OpenOutcome::ClosedWithoutAck => {
             return Err(anyhow!("mount denied by connection closed by the peer"));
         }
+=======
+        OpenOutcome::ClosedWithoutAck => return Err(anyhow!("mount denied by connection closed by the peer")),
+>>>>>>> Stashed changes
     };
     let caps = crate::mount_proto::parse_mount_caps(caps_value)?;
     // Send mount-cap-ack: the client confirms it accepts the server's caps.
@@ -2671,7 +2697,11 @@ async fn pty_attach_once(
     // races back cannot be lost. Only the FIRST attach needs this: a resume that
     // finds no session is a clean end (the acceptor says "no such session"), not a
     // denial, and exit 0 is correct there.
+<<<<<<< Updated upstream
     let ack_rx = if resume {
+=======
+    let (ack_tx, ack_rx) = if resume {
+>>>>>>> Stashed changes
         None
     } else {
         let (tx, rx) = tokio::sync::oneshot::channel::<OpenOutcome>();
@@ -3050,6 +3080,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
             Ok(PtyOutcome::Refused(reason)) => {
                 // The peer is up and said no. Nonzero with the reason; never a
                 // false success that would carry a `&&` pipeline forward.
+<<<<<<< Updated upstream
                 // The remedy depends on WHICH refusal: a revoked certificate is
                 // not repaired by a grant, so the hint must not say "grant".
                 let hint = if reason == crate::capability::REVOKED_REASON {
@@ -3082,16 +3113,30 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                     )
                 };
                 crate::ui::problem(&format!("shell refused by '{peer}'"), &reason, &[hint]);
+=======
+                crate::ui::problem(
+                    &format!("shell refused by '{peer}'"),
+                    &reason,
+                    &[format!(
+                        "grant shell on the peer: {}",
+                        crate::ui::paint(crate::ui::Tone::Brand, &format!("filament grant <this-device> shell"))
+                    )],
+                );
+>>>>>>> Stashed changes
                 std::process::exit(1);
             }
             Ok(PtyOutcome::Unconfirmed(reason)) => {
                 // We could not establish that the peer opened a shell. Say the
                 // weaker true sentence rather than a confident wrong one.
+<<<<<<< Updated upstream
                 crate::ui::problem(
                     &format!("shell could not be confirmed on '{peer}'"),
                     &reason,
                     &[],
                 );
+=======
+                crate::ui::problem(&format!("shell could not be confirmed on '{peer}'"), &reason, &[]);
+>>>>>>> Stashed changes
                 std::process::exit(1);
             }
             Ok(PtyOutcome::Dropped) => {
