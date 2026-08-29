@@ -7719,6 +7719,17 @@ fn first_screen_actions(owner: bool, joined: bool, device_count: usize) -> Vec<(
             ("Mount remote files", "mount"),
             ("Connect a device with me now", "add"),
             ("Invite a device or person", "add --for"),
+            // #209's shape once more, reported by the owner: `ephemeral mint`
+            // existed as a verb and this screen never offered it, so the only
+            // way to reach it was to already know it. A mint path whose claim
+            // surface never grew an entry, exactly like `join` before it.
+            //
+            // It is a THIRD thing, not a rewording of the two above. Both of
+            // those are pairing: a second party is present and consents live.
+            // An ephemeral key is for when nobody is there, a CI runner or a
+            // borrowed machine that enrols later, so it cannot be folded into
+            // either without losing what makes it different.
+            ("Mint a temporary key (CI, borrowed box)", "ephemeral mint"),
             ("Serve in the background", "up --install"),
             ("See every device", "devices"),
             ("View my identity", "id"),
