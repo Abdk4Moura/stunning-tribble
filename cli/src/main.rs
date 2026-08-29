@@ -5695,6 +5695,17 @@ fn resolve_for_kind(
     caps: &UiCapability,
     for_: Option<String>,
 ) -> Result<(String, Option<String>)> {
+    // `--for` with no value arrives as Some("") (clap's default_missing_value),
+    // and it MEANS "ask me". Normalised here rather than in the callers because
+    // it was normalised in exactly one of them: add_for_cmd filtered the empty
+    // string, the spoken-code path did not, so `filament add --for` fell through
+    // to the device-NAME arm below, silently resolved to kind=device with an
+    // empty invitee name, and never asked the question. The menu entry "Invite a
+    // device or person" is that argv, which is why it looked identical to
+    // "Connect a device with me now".
+    //
+    // One question, one place that knows every way it can be spelled.
+    let for_ = for_.filter(|v| !v.trim().is_empty());
     match for_.as_deref() {
         None => {
             if caps.interactive {
@@ -5726,11 +5737,9 @@ async fn add_for_cmd(
     out: Option<PathBuf>,
 ) -> Result<()> {
     use base64::Engine;
-    // `--for` with no value (Some("")) means "ask me on a terminal"; the
-    // one-shot path requires an explicit device|person value. The interactive
-    // prompt lives in the match below (the None arm), exactly once - a
-    // cancelled (Ctrl-C) picker must NOT re-prompt (#203).
-    let mut for_ = for_.filter(|v| !v.is_empty());
+    // The Some("") -> "ask me" normalisation now lives in resolve_for_kind, so
+    // both callers get it. Doing it here as well is what let the other caller
+    // look correct while it was not.
     // #187: `--for` reads like a name. A bare word that is not the literal
     // device/person is a DEVICE NAME: select device-kind and pre-fill the
     // invitation so the owner can name the invitee up front. The literals
@@ -24009,6 +24018,33 @@ mod tests {
             "certRevoked": true,
         }])).unwrap()).unwrap();
         assert!(device_cert_revoked(&[0x42u8; 32]), "a revoked record must refuse the gate on reconnect");
+    }
+
+    #[test]
+    fn bare_for_flag_asks_rather_than_defaulting_to_device() {
+        // `filament add --for` (which is what the menu entry "Invite a device or
+        // person" runs) arrives as Some("") from clap's default_missing_value and
+        // MEANS "ask me". It used to fall through resolve_for_kind's device-NAME
+        // arm to kind=device with an empty invitee name, silently, so the menu
+        // entry behaved identically to "Connect a device with me now" and the
+        // who-question was never asked. Reported from a real terminal.
+        //
+        // Non-interactive is the observable half of the same decision: an
+        // unanswered question must be REFUSED here, not guessed.
+        let caps = UiCapability { interactive: false, json: false, yes: true, color: false };
+        for spelled in [Some(String::new()), Some("   ".to_string())] {
+            let err = resolve_for_kind(&caps, spelled).expect_err("empty --for must not resolve silently");
+            assert!(
+                err.to_string().contains("requires device|person"),
+                "an unanswered --for must be refused, got: {err}"
+            );
+        }
+        // An explicit answer still resolves without asking.
+        assert_eq!(resolve_for_kind(&caps, Some("device".into())).unwrap().0, "device");
+        assert_eq!(resolve_for_kind(&caps, Some("person".into())).unwrap().0, "person");
+        // And a bare word is still a DEVICE NAME, which is why "" reached that arm.
+        let (kind, named) = resolve_for_kind(&caps, Some("my-laptop".into())).unwrap();
+        assert_eq!((kind.as_str(), named.as_deref()), ("device", Some("my-laptop")));
     }
 
     #[test]
