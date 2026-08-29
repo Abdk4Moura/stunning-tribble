@@ -5465,7 +5465,18 @@ fn resolve_for_kind(
                 // claim side too, because an invitation is useless if you do not
                 // know the other end runs `join`.
                 bail!(
-                    "--for needs to know who is joining:\n                       a device you own   filament add laptop --out laptop.invite\n                       someone else       filament add --for person --out alice.invite\n                       a CI runner        filament add --for runner --out ci.key\n\n                       A bare name means a device, so `add laptop` is `--for laptop`.\n                       They claim it with:  filament join <file>"
+                    "{}",
+                    [
+                        "--for needs to know who is joining:",
+                        "",
+                        "  a device you own   filament add laptop --out laptop.invite",
+                        "  someone else       filament add --for person --out alice.invite",
+                        "  a CI runner        filament add --for runner --out ci.key",
+                        "",
+                        "  A bare name means a device, so `add laptop` is `--for laptop`.",
+                        "  They claim it with:  filament join <file>",
+                    ]
+                    .join("\n")
                 )
             }
         }
@@ -5543,13 +5554,23 @@ async fn add_for_cmd(
         // They already said who. Do not re-explain --for; name the one missing
         // piece, with a filename derived from what they actually typed so the
         // suggestion is copy-pasteable rather than a template.
+        // Defensive: both call sites now supply a path (a bare `add laptop`
+        // defaults to filament-invite-laptop.txt and says so), so this cannot
+        // fire today. Kept because add_for_cmd is a function and a future caller
+        // could pass None, and written as lines because the continued literal it
+        // replaced dragged its source indentation into the output.
         let suggested = invite_path_for(_invitee_name.as_deref(), &kind);
+        let who = _invitee_name.clone().unwrap_or_else(|| format!("--for {kind}"));
         bail!(
-            "a script has to say where the invitation goes ({} would hold a credential):\n               filament add {} --out {}\n\n               Then on that machine:  filament join {}",
-            "nothing can ask you",
-            _invitee_name.clone().unwrap_or_else(|| format!("--for {kind}")),
-            suggested.display(),
-            suggested.display(),
+            "{}",
+            [
+                "a script has to say where the invitation goes (it holds a credential):".to_string(),
+                String::new(),
+                format!("  filament add {who} --out {}", suggested.display()),
+                String::new(),
+                format!("  Then on that machine:  filament join {}", suggested.display()),
+            ]
+            .join("\n")
         );
     }
     let owner_key = identity::UserKey::load(&crate::platform::PlatformKeyStore)?
@@ -13380,7 +13401,12 @@ async fn main() -> Result<()> {
                             None => return Err(cancelled()),
                         }
                     }
-                    None => Some("code".to_string()),
+                    // Nobody is present to hear a code read out, so `code` is
+                    // not a possible answer here, only a slower way to fail:
+                    // `add laptop` used to default to code and then bail with
+                    // the message for a bare `add`, telling an operator who HAD
+                    // named a device that they had named nothing.
+                    None => Some("file".to_string()),
                 };
 
                 // A runner is not a member: it gets a temporary KEY, which is

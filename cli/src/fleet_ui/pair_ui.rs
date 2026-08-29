@@ -133,28 +133,30 @@ pub fn render_inter_user_success(peer_name: &str, cap: &str, expiry: &str) -> St
 
 /// Non-TTY refusal: add is interactive.
 pub fn err_pair_interactive() -> (String, i32) {
-    (
+    // Built from lines rather than one continued literal: a `\`-continuation
+    // carries the source indentation into the output, which is how this message
+    // came to be printed with fifteen leading spaces on some lines and two on
+    // others. Text the user reads should be laid out where you can see it.
+    let lines = [
         format!(
-            "{err} `add` with no arguments needs a person at both ends: it reads out a code \
-             for someone to type. In a script, write an invitation they claim later instead:\n\n               {a}\n  {b}\n  {c}\n\n               A bare name means a device you own. They claim it with:  {j}",
-            err = ui::paint(Tone::Err, ui::glyph_err()),
-            // EVERY SUGGESTED COMMAND HERE RUNS. The previous version said
-            // `filament add --for device`, which fails with this very message
-            // (--out is required too), so the error told you to run the thing
-            // that produced it. A suggested command is a claim about behaviour,
-            // and that one had never been checked against the path it describes.
-            //
-            // Each line answers a different thing the operator might have meant,
-            // because "what did you want" is the question a bare `add` leaves
-            // open, and the claim side is named because an invitation nobody
-            // knows how to redeem is not a working instruction.
-            a = ui::paint(Tone::Brand, "filament add laptop --out laptop.invite      a device you own"),
-            b = ui::paint(Tone::Brand, "filament add --for person --out alice.invite  someone else"),
-            c = ui::paint(Tone::Brand, "filament add --for runner --out ci.key        a CI runner"),
-            j = ui::paint(Tone::Brand, "filament join <file>"),
+            "{} `add` with no arguments needs a person at both ends: it reads a code out for",
+            ui::paint(Tone::Err, ui::glyph_err())
         ),
-        super::EXIT_BAD_ARG,
-    )
+        "  someone to type. In a script, write an invitation they claim later instead:".to_string(),
+        String::new(),
+        // EVERY ONE OF THESE RUNS. This used to suggest `filament add --for
+        // device`, which fails with this very message because --out is required
+        // too, so the error told you to run the thing that produced it.
+        format!("  {}      a device you own", ui::paint(Tone::Brand, "filament add laptop --out laptop.invite")),
+        format!("  {}  someone else", ui::paint(Tone::Brand, "filament add --for person --out alice.invite")),
+        format!("  {}        a CI runner", ui::paint(Tone::Brand, "filament add --for runner --out ci.key")),
+        String::new(),
+        format!(
+            "  A bare name means a device you own. They claim it with:  {}",
+            ui::paint(Tone::Brand, "filament join <file>")
+        ),
+    ];
+    (lines.join("\n"), super::EXIT_BAD_ARG)
 }
 
 #[cfg(test)]
