@@ -667,6 +667,33 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    later gate at once). Verdicts are unchanged; only the diagnosis is. Fixing it
    here rather than by renaming gate output keeps main's test strings untouched.
 
+   ROOT CAUSE OF THE 11b FLAKE, found 2026-08-29. It is a race in the GATE, not
+   in the product, and it is arithmetic rather than mystery.
+
+   11b must observe a same-uid reconnect WHILE the transfer is still flowing.
+   It waits for 8 MB of an 80 MB file to land, polling every 0.5s, then starts
+   the second receiver. But gate 9 measures ~96 MB/s on the same runner, so the
+   whole 80 MB completes in about 0.83s. The 8 MB threshold is reached in ~0.08s,
+   inside the first poll interval, and by the time the loop notices and spawns a
+   process the transfer can already be finished. Then the sender never sees a
+   reconnect mid-flow, never logs "keeping active link", and the gate fails as
+   "flow-preserve (#28)".
+
+   So it fails when the machine is FAST. That matches everything observed: it
+   flips run to run on identical trees, and it is the gate most sensitive to
+   runner speed.
+
+   THE FIX HAS A PRECEDENT IN THIS FILE'S OWN SUITE. Gate 17b faced exactly this
+   ("same-machine pairs otherwise finish in ~1s") and solved it with a test hook,
+   `FILAMENT_TEST_PAIR_STALL`, so the ceremony budget fires deterministically
+   rather than racing the machine. 11b needs the transfer equivalent: a
+   feature-gated stall that holds the send mid-flight so the reconnect provably
+   lands inside the window. Enlarging the payload only buys margin; it does not
+   make the gate deterministic, and it makes every run slower.
+
+   Until then this gate will keep flipping, and a ratchet that fails the build on
+   it will keep blocking green PRs at random.
+
    THE DESIGN ISSUE. `gates-ratchet.sh` treats "no `PASS:` line" as a regression,
    which conflates FAILED, DID NOT RUN, and FLAKED. Against a suite where ~9-11
    gates are red and the green set drifts by one per run, it blocks merges at
