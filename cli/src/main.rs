@@ -510,6 +510,7 @@ COMMANDS
     devices                list your known devices
     requests               approve or deny access others asked for
     grant / revoke         give or take a capability on a device
+    ephemeral mint         a temporary key someone can enrol with (CI, borrowed box)
     status                 what the daemon is doing / recently received
   Mesh
     addr                   show your overlay address (or a device's)
@@ -1163,7 +1164,11 @@ enum Cmd {
         out: Option<PathBuf>,
     },
     /// Mint auth keys or enroll as an ephemeral delegated device.
-    #[command(hide = true)]
+    ///
+    /// Unhidden 2026-08-29. It was hidden while the banner did not mention it,
+    /// so the only way to find a working verb was to already know it existed.
+    /// `help_banner_agrees_with_clap_visibility` states the rule this now
+    /// satisfies: a command that works is discoverable, or it is removed.
     Ephemeral {
         #[command(subcommand)]
         action: EphemeralAction,
