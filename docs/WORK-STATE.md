@@ -247,22 +247,36 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    requires a secret, hiding the very records it should show), and the FLEET tier
    asked `load_owner_key()`, "do I hold the owner's PRIVATE key", so every joined
    device rendered its own siblings as EXTERNAL.
-   PARTLY CLOSED BY 1h, AND THE SPLIT IS EXACT. `send --to <sibling>` is now
-   brokered and reliable (58/58): the daemon mints a single-use secret over the
-   cert-verified link, so there IS a secret to dial with. Every other L2 verb
-   still cannot dial a sibling.
+   CLOSED BY 1h FOR SEND, THEN FOR THE REST. `send --to <sibling>` was brokered
+   first (58/58): the daemon mints a single-use secret over the cert-verified
+   link, so there IS a secret to dial with.
 
-   Verified by call site, not by assumption: `ctl::try_fleet_rendezvous` has
-   exactly one caller, `send_cmd` (cli/src/main.rs). `shell`, `forward`, `mount`
-   and `expose` never ask for a ticket, so they still hit the no-secret wall that
-   this item was opened for. Generalising "send works now" to "the L2 verbs work
-   now" would be the narrow-view error this file keeps recording.
+   For a while only send had it, and that was found by call site rather than by
+   assuming either way: `ctl::try_fleet_rendezvous` had exactly one caller,
+   `send_cmd`. `shell`, `forward` and `mount` never asked for a ticket, so they
+   still hit the no-secret wall this item was opened for. Generalising "send
+   works now" to "the L2 verbs work now" would have been the narrow-view error
+   this file keeps recording.
 
-   REMAINING WORK, and it is small because the mechanism exists: lift the broker
-   call out of `send_cmd` so any one-shot verb can request a ticket before it
-   dials. The 1h security rule has to move with it, unchanged: a ticket is
-   accepted only from a link whose certificate was already verified, or presence
-   on the fleet channel starts buying peerings again.
+   NOW DONE (commit "l2: let every verb dial a sibling, not just send"). The
+   broker call went into `bring_up_to_known` (cli/src/l2.rs), the ONE place an L2
+   verb turns a name into a secret, so pty (shell), shell_bootstrap (ssh), netcat
+   (forward), mount_cmd and establish_probe (doctor) all inherit it instead of
+   five call sites each carrying a copy.
+
+   Strictly additive: brokering is tried first and the fleet-secret fallback is
+   untouched, so no daemon, no verified link, or a non-fleet name behaves exactly
+   as before. `fleet_mode` is false for a brokered secret, matching send_cmd, and
+   the 1h rule holds unchanged at the daemon end, which brokers only over a link
+   with a Proven identity binding (`warm_link_for`), never on presence. Setting
+   `fleet_mode` true would BREAK it: the fleet challenge waits for the crowded
+   channel's hello, which a two-party brokered link never sends.
+
+   STILL UNMEASURED, and this is the honest gap: the sibling dial itself. It
+   needs three devices, two of them siblings not paired with each other, and the
+   record below is that sibling numbers from an unvalidated rig are worse than no
+   numbers. The mechanism is the one measured at 58/58 for send, but that is an
+   argument for expecting it to work, not evidence that it does.
    **RESOLVED (2026-08-26): the obligation is discharged.** The negative test has
    now been RUN and PASSED. With `laptop`'s shell acceptor armed for a different
    device, a fleet sibling with zero grants is denied by the gate itself:
