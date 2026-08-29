@@ -638,6 +638,43 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    Granted transfer already works today and is verified, so this affects the
    no-grant convenience case only.
 
+1j. **The gates' fault-injection hooks were compiled out, and the warning
+   ratchet hid it (2026-08-29).** Read this before trusting a P1 or P5 number
+   taken between the transport carve and this fix.
+
+   `filament-transport` was carved out of `cli/src` with its
+   `#[cfg(feature = "test-hooks")]` blocks intact, but the feature DECLARATIONS
+   stayed in `cli/Cargo.toml`. A cfg naming a feature its own crate does not
+   declare is unconditionally false, and `test-hooks = []` in the CLI enables
+   nothing in another crate. So ~20 hooks in `direct.rs` and `net.rs` were
+   stripped from every build, including the gates' `--features test-hooks` one:
+   the data-path freeze, the persistent freeze P1's relay fallback needs, the
+   unblock P5's upgrade needs, the flaky-standby no-flap probe.
+
+   NOT A MISSING FEATURE, A MISSING INSTRUMENT. P1 and P5 do not assert "a freeze
+   happened", they assert the transfer completed. With the freeze never injected
+   it completes directly, so the gate can report success while proving nothing
+   about fallback. A detector cannot be validated by its own clean-run count.
+
+   THE RATCHET IS WHY IT SURVIVED, and this is the transferable part. rustc
+   emitted "unexpected cfg condition value: test-hooks" on every build, 28 of
+   them counting `debug-logs`. They sat inside the ratchet's total of 185, and
+   the ratchet only forbids that number going UP. A warning already in the
+   baseline is invisible forever: the job stayed green while printing the defect
+   every run. A count is not a reading. Anything that classifies warnings, rather
+   than totalling them, would have caught this the day it landed.
+
+   Fixed by declaring both features on the crate and FORWARDING from the CLI.
+   Verified by building: all four env strings present under `--features
+   test-hooks`, all absent from release (CI's no-hooks-in-release assertion still
+   holds), the 28 cfg warnings gone.
+
+   THE GATE NUMBERS ARE NOW UNKNOWN, in both directions. If P1/P5 were among the
+   tracked-red gates this may turn them green; if they were passing they were
+   passing vacuously and should now fail honestly. Nothing was added to
+   EXPECTED_GREEN, because that list is measured and this invalidates the
+   measurement it would rest on. Re-run the gates and re-establish it.
+
 1i. **The deterministic-core ratchet flakes, measured (2026-08-28).** Recorded
    because it will be hit again and looks exactly like a regression.
 
