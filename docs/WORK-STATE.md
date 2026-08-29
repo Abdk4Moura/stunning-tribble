@@ -685,7 +685,7 @@ amendment section in `docs/design-mesh-network.md`. Proof:
        tree            Gates Core
        clean           56cc23b PASS, 8848880 PASS            2 of 2
        authz           44e91bf FAIL, 44e91bf PASS on re-run,
-                       f185f9c FAIL                          1 of 3
+                       f185f9c FAIL, e03a341 PASS            2 of 4
 
    THE SAME COMMIT BOTH FAILED AND PASSED. 44e91bf's two attempts ran the same
    tree and disagreed, which is the cleanest possible demonstration that this
@@ -697,11 +697,16 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    already have a result for is how you separate "this change broke it" from
    "this gate flips", and it cost nothing because the revert had to run anyway.
 
-   WHAT THE NUMBERS SUPPORT, which is less than it looks: clean 2/2 against
-   authz 1/3 leans toward a real difference and is nowhere near evidence. Fisher
-   exact is about p=0.4. At these sizes the honest answer is "unproven", and the
-   experiment that settles it is several samples per tree BEFORE interpreting
-   any single result.
+   WHAT THE NUMBERS SUPPORT. At 1 of 3 this leaned toward a real difference and
+   was already nowhere near evidence (Fisher exact about p=0.4). The fourth
+   sample came back PASS, so the authz tree is 2 of 4 and there is no visible
+   difference from clean at all. Two passes and two failures ON ONE TREE is the
+   flake demonstrated on the change itself rather than inferred from item 1i.
+
+   It does NOT prove the extraction is safe. The original safety argument was
+   too narrow whatever the gate says. What the samples establish is only that
+   the two reds carried no information about the change, which is the sole claim
+   those reds ever supported.
 
    THE FAILURE MODE, twice in one hour and in opposite directions. First I
    shipped the extraction claiming "every decision below the preamble is
