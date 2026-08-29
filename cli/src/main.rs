@@ -1170,9 +1170,9 @@ enum EphemeralAction {
         /// Peer device_pub(s) that may enroll this key (hex, comma-separated). Empty = any.
         #[arg(long, value_delimiter = ',')]
         audience: Vec<String>,
-        /// Time-to-live in seconds (max 30 days)
+        /// Time-to-live: a duration such as 15m, 1h, 30d, or plain seconds (max 30 days)
         #[arg(long, default_value = "86400")]
-        ttl: u64,
+        ttl: String,
         /// Reuse: Once, N(N), or Reusable
         #[arg(long, default_value = "Once")]
         reuse: String,
@@ -5085,11 +5085,15 @@ fn parse_mint_ttl(raw: &str) -> Result<u64> {
     let (number, unit) = raw.split_at(raw.trim_end_matches(|c: char| c.is_ascii_alphabetic()).len());
     let value: u64 = number.parse().map_err(|_| anyhow!("invalid --ttl '{raw}'"))?;
     let multiplier = match unit {
+        // A bare number is seconds. `ephemeral mint --ttl` was a raw u64 before
+        // the mint verbs were collapsed, and its default is still "86400", so
+        // dropping this arm would break every script that passes a number.
+        "" => 1,
         "s" => 1,
         "m" => 60,
         "h" => 3600,
         "d" => 86400,
-        _ => bail!("invalid --ttl '{raw}', use a duration such as 15m or 1h"),
+        _ => bail!("invalid --ttl '{raw}', use a duration such as 15m or 1h (or plain seconds)"),
     };
     Ok(value.saturating_mul(multiplier))
 }
@@ -5202,6 +5206,11 @@ fn human_duration(secs: u64) -> String {
 async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Result<()> {
     match action {
         EphemeralAction::Mint { caps, audience, ttl, reuse, tag, out } => {
+            // `add --for --expires` has always taken 1h/30d; --ttl took raw
+            // seconds. After the mint verbs collapsed, one concept spelled two
+            // ways is a difference the user has to remember for no reason, so
+            // both go through the same parser.
+            let ttl = parse_mint_ttl(&ttl)?;
             // Ask only when the operator did not already say. Passing --caps is a
             // deliberate answer, and a script that passes nothing must NOT be
             // prompted into a key it never asked for: it gets today's defaults.
@@ -24000,6 +24009,41 @@ mod tests {
             "certRevoked": true,
         }])).unwrap()).unwrap();
         assert!(device_cert_revoked(&[0x42u8; 32]), "a revoked record must refuse the gate on reconnect");
+    }
+
+    #[test]
+    fn mint_ttl_takes_durations_and_bare_seconds() {
+        // `add --for --expires` and `ephemeral mint --ttl` are the same concept.
+        // They went through different parsers until the mint verbs collapsed, so
+        // this pins the spellings that must keep working on BOTH.
+        assert_eq!(parse_mint_ttl("15m").unwrap(), 900);
+        assert_eq!(parse_mint_ttl("1h").unwrap(), 3600);
+        assert_eq!(parse_mint_ttl("30d").unwrap(), 30 * 24 * 3600);
+        assert_eq!(parse_mint_ttl("45s").unwrap(), 45);
+        // Case and surrounding space are the operator's, not the parser's.
+        assert_eq!(parse_mint_ttl(" 1H ").unwrap(), 3600);
+
+        // A BARE NUMBER IS SECONDS. --ttl was a raw u64 and still defaults to
+        // "86400"; if this regresses, every script passing a number breaks and
+        // the default value itself stops parsing.
+        assert_eq!(parse_mint_ttl("86400").unwrap(), 86400);
+        assert_eq!(parse_mint_ttl("0").unwrap(), 0);
+
+        for bad in ["", "h", "1y", "1 h", "abc", "-5", "1.5h"] {
+            assert!(parse_mint_ttl(bad).is_err(), "'{bad}' must not parse as a ttl");
+        }
+    }
+
+    #[test]
+    fn mint_ttl_default_parses() {
+        // The clap default is a string now, so a typo in it would only surface
+        // at runtime. Read it off the parser rather than restating the literal.
+        let cli = Cli::try_parse_from(["filament", "ephemeral", "mint"]).expect("defaults must parse");
+        if let Some(Cmd::Ephemeral { action: EphemeralAction::Mint { ttl, .. } }) = cli.cmd {
+            assert_eq!(parse_mint_ttl(&ttl).unwrap(), 86400, "the default ttl must be one day");
+        } else {
+            panic!("expected `ephemeral mint`");
+        }
     }
 
     #[test]
