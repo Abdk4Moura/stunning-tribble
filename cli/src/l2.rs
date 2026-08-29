@@ -1299,10 +1299,43 @@ async fn bring_up_to_known(
         .map(|(_, s)| s)
     {
         Some(s) => (s, false),
-        None => match (crate::fleet_indexed_name(peer_name), crate::fleet::rv()) {
-            (true, Some(rv)) => (rv, true),
-            _ => bail!("no known device named '{peer_name}', run `filament add` first (see `filament devices`)"),
-        },
+        None => {
+            // Ask the daemon to broker a PRIVATE rendezvous before falling back
+            // to the fleet secret. Same mechanism `send --to` uses (WORK-STATE
+            // 1h), which took sibling send from ~50% to 58/58: the fleet secret
+            // below meets the peer on the channel EVERY sibling sits on, and the
+            // dial then has to work out which of the answering peers is the
+            // target. A brokered secret has exactly two parties on it, so that
+            // race does not get safer, it stops existing.
+            //
+            // Condition mirrors send_cmd's: only a fleet-indexed name, only when
+            // this device is in a fleet. A typo must not cost a daemon round
+            // trip, and a paired device never reaches here at all.
+            //
+            // fleet_mode is FALSE for a brokered secret, also matching send_cmd,
+            // because the secret travelled over a link the daemon had ALREADY
+            // verified by certificate and so identifies the peer by itself. The
+            // daemon holds up that end: it brokers only over a link with a
+            // Proven identity binding (`warm_link_for`), never on presence, so a
+            // stranger on the fleet channel cannot obtain one.
+            let brokered = if crate::fleet_indexed_name(peer_name) && crate::fleet::rv().is_some() {
+                crate::ctl::try_fleet_rendezvous(peer_name).await
+            } else {
+                None
+            };
+            match brokered {
+                Some(sec) => {
+                    crate::ui::debug(&format!(
+                        "fleet: daemon brokered a private rendezvous with '{peer_name}' for {role}"
+                    ));
+                    (sec, false)
+                }
+                None => match (crate::fleet_indexed_name(peer_name), crate::fleet::rv()) {
+                    (true, Some(rv)) => (rv, true),
+                    _ => bail!("no known device named '{peer_name}', run `filament add` first (see `filament devices`)"),
+                },
+            }
+        }
     };
     let channel = crate::channel_of(&secret);
 
