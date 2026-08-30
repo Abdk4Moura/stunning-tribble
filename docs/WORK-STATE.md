@@ -675,6 +675,39 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1l. **`grant` skips the validations `revoke` runs (2026-08-29, found, not
+   fixed).** A TODO in main.rs (~13872) said "route grant through apply_cap_op
+   so there is one validated op-creation path (sig-verify + floor + monotonic +
+   ratchet), not two". Checked, and it is accurate:
+
+       revoke   build CapOp -> sign -> apply_cap_op(store, hdr, op, now)
+       grant    build CapOp -> sign -> store.push(op_json)
+
+   `apply_cap_op` verifies the signature against header.owner_pub, requires the
+   resource header to exist, and enforces the VERSION FLOOR. Grant does none of
+   these, then calls `update_ratchet` by hand to patch the one consequence
+   somebody noticed (evaluate() hitting "ratchet uninitialized").
+
+   THE FLOOR IS THE SUBSTANTIVE GAP. It is what stops an op being written below
+   the monotonic floor, and the comment beside the manual ratchet call describes
+   having already been bitten by a grant that "did NOT take" and would "deny
+   forever". A grant that bypasses the floor can land in the store and be
+   refused at evaluation.
+
+   NOT FIXED HERE, and the reason is track record rather than difficulty. This
+   is the same shape as the authz preamble (one decision, two paths, one
+   skipping checks), and that change is still unproven at 3 of 5 samples after I
+   over-claimed its safety, misread a flaky gate, reverted good work and undid
+   the revert. Routing grant through apply_cap_op will make some
+   currently-succeeding grants fail CORRECTLY, and telling "correctly rejected"
+   from "I broke grant" needs the gate suite this file records as flaky and that
+   I have now misread twice in one session.
+
+   WHAT THE FIX NEEDS: route the grant path through apply_cap_op, drop the
+   hand-rolled update_ratchet, and expect grant-gate churn. Establish the gate's
+   pass rate on an unchanged tree FIRST (item 1k has the method: a revert commit
+   is a free control), then change it, so a red can be read.
+
 1k. **The flake was measured again, and I misread it twice (2026-08-29).** Item
    1i said "a red here is not evidence on its own". I read that sentence, quoted
    it while analysing a red, and then treated the red as proof anyway. Recording
