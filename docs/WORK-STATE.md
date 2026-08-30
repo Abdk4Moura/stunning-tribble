@@ -675,6 +675,32 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1y. **A narrowing of the #161 predicate was designed and REJECTED (2026-08-30).**
+   Recorded so it is not re-proposed. The tempting fix for the probe panicking
+   debug builds on the primary flow (1v) is to thread an
+   `identity_resolution_attempted` flag into `cap_gate_effective` and fire only
+   when a path reaches the gate WITHOUT attempting resolution.
+
+   The 25 call sites are not the obstacle: adding a parameter is compiler
+   enforced, so a missed site is a build error rather than a silent bug.
+
+   **It is wrong on the semantics.** `resolve_peer_identity` reads the cert from
+   the LOCAL store, and a cert can arrive AFTER a first resolve attempt, pushed
+   by a later `fleet-hello` (which is exactly how owner-signed cap ops propagate,
+   see 2-DONE). In that state resolution was attempted, found nothing, and
+   identity is still genuinely PENDING. The narrowed predicate passes
+   `attempted = true` and goes quiet while the window is open.
+
+   That is the failure the comment at capability.rs:456 names: the assertion
+   going quiet because it was RELAXED rather than because the ordering was fixed.
+   The narrowing is not a refinement of the probe, it is the forbidden change in
+   better clothes.
+
+   The genuine fix remains what that comment says: resolve identity before the
+   gate is consulted, or deny when `device_pub` is None under legacy trust. Both
+   change authorization behaviour and are the owner's call. 1x is the evidence
+   base for making it.
+
 1x. **The revocation question now has evidence, not an argument (2026-08-30).**
    1v and 1w both turned on "does revocation actually hold?", which I had argued
    about from comments rather than measured. `revocation_is_only_consultable_once_identity_resolved`
