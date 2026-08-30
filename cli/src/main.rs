@@ -13401,11 +13401,21 @@ async fn main() -> Result<()> {
                             None => return Err(cancelled()),
                         }
                     }
-                    // Nobody is present to hear a code read out, so `code` is
-                    // not a possible answer here, only a slower way to fail:
-                    // `add laptop` used to default to code and then bail with
-                    // the message for a bare `add`, telling an operator who HAD
-                    // named a device that they had named nothing.
+                    // --word IS the code transport. It chooses the SPAKE2
+                    // password for a spoken code, and means nothing to a file,
+                    // so supplying it has already answered this question.
+                    //
+                    // Defaulting to file regardless broke exactly that: a
+                    // scripted `add --for device --word "..."`, which is how the
+                    // acceptance rig pairs, silently wrote an invitation file
+                    // instead of minting the code the caller had just chosen
+                    // words for. Caught by running the pairing, not by tests.
+                    None if word.is_some() => Some("code".to_string()),
+                    // Otherwise nobody is present to hear a code read out, so
+                    // `code` is not a possible answer here, only a slower way to
+                    // fail: `add laptop` used to default to code and then bail
+                    // with the message for a bare `add`, telling an operator who
+                    // HAD named a device that they had named nothing.
                     None => Some("file".to_string()),
                 };
 
