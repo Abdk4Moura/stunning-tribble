@@ -4429,91 +4429,11 @@ fn status_cmd(json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cap_status_cmd(json: bool) -> Result<()> {
-    let reply = crate::ctl::try_cap_status().await;
-    match reply {
-        Some(v) if json => {
-            println!("{}", serde_json::to_string_pretty(&v)?);
-        }
-        Some(v) => {
-            if let Some(summary) = v["summary"].as_str() {
-                ui::say(summary);
-            }
-            let flip = v["flip_ready"].as_bool().unwrap_or(false);
-            if v.get("counts").is_none() || v["counts"].is_null() {
-                ui::say(&format!(
-                    "  flip_ready: {} counts unavailable; cannot assess flip readiness",
-                    ui::paint(ui::Tone::Warn, "x"),
-                ));
-            } else {
-                let widening = v["counts"]["ld_authorized"].as_u64().unwrap_or(0);
-                let la_authorized = v["counts"]["la_authorized"].as_u64().unwrap_or(0);
-                if flip && widening == 0 {
-                    ui::say(&format!(
-                        "  flip_ready: {} no blockers detected (n={} legacy-allowed opens)",
-                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                        la_authorized,
-                    ));
-                } else if flip {
-                    ui::say(&format!(
-                        "  flip_ready: {} breakage-clean, but {} WIDENING opens will be NEWLY PERMITTED; review and cite them before flipping",
-                        ui::paint(ui::Tone::Warn, "x"),
-                        widening,
-                    ));
-                } else {
-                    ui::say(&format!(
-                        "  flip_ready: {} not ready",
-                        ui::paint(ui::Tone::Warn, "x"),
-                    ));
-                }
-            }
-            if let Some(counts) = v.get("counts") {
-                if !counts.is_null() {
-                    ui::say(&format!(
-                        "  la_authorized={}  la_denied={}  la_no_header={}",
-                        counts["la_authorized"].as_u64().unwrap_or(0),
-                        counts["la_denied"].as_u64().unwrap_or(0),
-                        counts["la_no_header"].as_u64().unwrap_or(0),
-                    ));
-                    ui::say(&format!(
-                        "  WIDENING(ld_authorized)={}  ld_denied={}  ld_no_header={}",
-                        counts["ld_authorized"].as_u64().unwrap_or(0),
-                        counts["ld_denied"].as_u64().unwrap_or(0),
-                        counts["ld_no_header"].as_u64().unwrap_or(0),
-                    ));
-                }
-            }
-            // Per-action breakdown: the coverage matrix for the flip decision.
-            if let Some(by_action) = v.get("by_action").and_then(|v| v.as_array()) {
-                if !by_action.is_empty() {
-                    ui::say(&ui::paint(ui::Tone::Dim, "  coverage matrix (per-action):"));
-                    for a in by_action {
-                        let action = a["action"].as_str().unwrap_or("?");
-                        let la = a["la_authorized"].as_u64().unwrap_or(0);
-                        let ld = a["la_denied"].as_u64().unwrap_or(0);
-                        let ln = a["la_no_header"].as_u64().unwrap_or(0);
-                        let wa = a["ld_authorized"].as_u64().unwrap_or(0);
-                        let wd = a["ld_denied"].as_u64().unwrap_or(0);
-                        let wn = a["ld_no_header"].as_u64().unwrap_or(0);
-                        ui::say(&format!(
-                            "    {action}: la_ok={la} la_deny={ld} la_nh={ln} | widen={wa} ld_deny={wd} ld_nh={wn}"
-                        ));
-                    }
-                }
-            }
-        }
-        None => {
-            ui::say(&format!("  {} daemon not running; counters are zero in a fresh process", ui::paint(ui::Tone::Dim, "·")));
-            if json {
-                println!("{}", serde_json::to_string_pretty(&json!({
-                    "ok": false,
-                    "err": "daemon not reachable; start with filament up",
-                }))?);
-            }
-        }
-    }
-    Ok(())
-}
+// `cap_status_cmd` lived here: an 85-line reader for `ctl::try_cap_status`
+// that no verb ever reached. NOT a disconnected feature: the ctl op it wraps
+// is consumed live in the shell-capability path, so this was a second,
+// unreached consumer. Deleted rather than wired.
+
 
 // ----------------------------------------------------------- consent queue --
 // Pending-request queue for live-approval consent (docs/design-identity-access-ux.md §2).

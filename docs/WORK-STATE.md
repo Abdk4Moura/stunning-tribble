@@ -675,6 +675,36 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1ac. **CORRECTION to 1u: all three "disconnected features" were leftovers, and
+   I verified one hop too shallow (2026-08-30).** 1u justified keeping the
+   never-used functions, and moving the baseline instead of deleting, partly on
+   three examples I called live-but-unreached. Checked them properly and all
+   three were wrong:
+
+   - `render_missing_steer` / `render_missing_json` are EXACT duplicates of the
+     inline json and plain branches of `set <key>` with no value
+     (settings.rs ~812-824). The nudge always DID render. I saw them call
+     `interact::render_steer` and `build_affordance`, concluded "wired into the
+     nudge system", and never checked whether that branch was already covered.
+   - `cap_status_cmd` wraps `ctl::try_cap_status`, which IS consumed live in the
+     shell-capability path (main.rs ~14129). It was a second, unreached consumer,
+     not an orphaned feature.
+
+   That is [[verify-one-layer-down]] exactly: I checked ONE hop (does it call
+   something real?) and ruled, when the answer was a layer below (is that thing
+   already reached elsewhere?). Same failure I had just finished documenting in
+   the code.
+
+   Deleted all three, 88 lines. Suite 393/0, warnings 120 -> 117, baseline
+   ratcheted DOWN to 117.
+
+   **What survives of 1u's argument, and what does not.** The PRINCIPLE stands
+   and was proven by the ack-loss hook (1s): a zero-caller instrument and a
+   zero-caller leftover are indistinguishable to `cargo check` and are opposites.
+   The three EXAMPLES did not support it. The wg.rs entries remain legitimate
+   keeps (staged L3, build-order item 5). The right rule is neither "bulk delete"
+   nor "bulk keep": read each one, two hops deep.
+
 1ab. **"Needs a two-box rig" was wrong a THIRD time, for a third reason
    (2026-08-30).** After 1z and 1aa I kept saying the cross-machine ack-loss run
    was blocked on "hardware I don't have". Checked instead of asserting:

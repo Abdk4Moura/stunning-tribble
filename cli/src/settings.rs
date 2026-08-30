@@ -1016,16 +1016,12 @@ fn render_missing_interactive(s: &Setting) {
     }
 }
 
-fn render_missing_steer(s: &Setting) {
-    let aff = build_affordance(s);
-    crate::interact::render_steer(&aff);
-}
 
-fn render_missing_json(s: &Setting) {
-    let aff = build_affordance(s);
-    crate::interact::render_json_steer(&aff);
-}
 
+// `render_missing_steer` / `render_missing_json` lived here. They were exact
+// duplicates of the inline json/plain branches of `set <key>` with no value, so
+// the nudge always DID render and these were leftovers, not a disconnected
+// affordance. Deleted after checking the branch that supersedes them.
 fn build_affordance(s: &Setting) -> crate::interact::Affordance {
     let (cur_val, _) = resolve(s, None);
     build_affordance_with_current(s, &cur_val)
