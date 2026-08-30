@@ -716,9 +716,11 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    Extracting the authorization preamble (five copies -> one function) produced:
 
        tree            Gates Core
-       clean           56cc23b PASS, 8848880 PASS            2 of 2
-       authz           44e91bf FAIL, 44e91bf PASS on re-run,
-                       f185f9c FAIL, e03a341 PASS            2 of 4
+       clean           56cc23b, 8848880                      2 pass, 0 fail
+       authz           44e91bf FAIL then PASS on re-run,
+                       f185f9c FAIL, then e03a341, 25587b3,
+                       f17c159, d591a56, 975d563, c9a0665
+                       all PASS                              7 pass, 2 fail
 
    THE SAME COMMIT BOTH FAILED AND PASSED. 44e91bf's two attempts ran the same
    tree and disagreed, which is the cleanest possible demonstration that this
@@ -730,16 +732,22 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    already have a result for is how you separate "this change broke it" from
    "this gate flips", and it cost nothing because the revert had to run anyway.
 
-   WHAT THE NUMBERS SUPPORT. At 1 of 3 this leaned toward a real difference and
-   was already nowhere near evidence (Fisher exact about p=0.4). The fourth
-   sample came back PASS, so the authz tree is 2 of 4 and there is no visible
-   difference from clean at all. Two passes and two failures ON ONE TREE is the
-   flake demonstrated on the change itself rather than inferred from item 1i.
+   SETTLED. Every commit after the restore kept the authz code and every one of
+   them passed, so the tally is 7 pass / 2 fail, a 78% pass rate against the ~67%
+   this item measured for the gate on an UNCHANGED tree. The authz tree passes at
+   or above the historical rate. There is no regression signal, and the two reds
+   were the flake this file had already warned about.
 
-   It does NOT prove the extraction is safe. The original safety argument was
-   too narrow whatever the gate says. What the samples establish is only that
-   the two reds carried no information about the change, which is the sole claim
-   those reds ever supported.
+   The arc is the lesson. At 1 of 3 the numbers leaned toward a real difference
+   and I read them as proof, reverting working code. At 2 of 4 the lean was gone.
+   At 7 of 9 it is clearly fine. Nothing about the code changed across those
+   readings; only the number of samples did.
+
+   It still does NOT prove the extraction safe. The original safety argument was
+   too narrow whatever the gate says: it examined cert_revoked and generalised to
+   four other inputs, and the borrows-to-owned-copies change was never reasoned
+   about. What the samples establish is that the reds carried no information,
+   which is the only claim they ever supported.
 
    THE FAILURE MODE, twice in one hour and in opposite directions. First I
    shipped the extraction claiming "every decision below the preamble is
