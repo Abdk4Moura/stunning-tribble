@@ -675,6 +675,51 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1q. **`filament --help` advertised a verb that no longer existed, and the test
+   written to prevent exactly that could not see it (2026-08-30).** The COMMANDS
+   banner listed `ephemeral mint`. That verb was removed when minting collapsed
+   into `add --for runner`; `EphemeralAction` has only `Enroll` left. So the
+   first thing a new user reads told them to type a command clap rejects.
+
+   `printed_hints_name_verbs_that_exist` exists for this exact class (it was
+   written after `filament unmount` survived in five places). It missed for two
+   structural reasons, and both are more interesting than the string:
+
+   - **It anchors on the literal `"filament "`.** The COMMANDS column lists bare
+     verbs in a column with no such prefix, so the banner, the single most-read
+     surface in the CLI, was never scanned at all. The guard covered every
+     sentence that mentions the binary and not the page that lists its commands.
+   - **It reads one word.** Even where it did look, `ephemeral mint` would have
+     passed on `ephemeral` alone, because a valid parent was treated as a valid
+     command.
+
+   Fixed both by adding `help_banner_names_commands_that_exist`, which parses the
+   `EXAMPLES` constant and walks each printed command through clap by token:
+   subcommand, then sub-subcommand, then flags, skipping flag VALUES (`--for
+   person`) and placeholders (`<device>`, `[code]`, `laptop:5432`). It validates
+   34 commands. It also asserts `checked >= 10`, so if the banner's shape ever
+   changes under it the test fails loudly instead of silently validating nothing,
+   which is the failure mode that made the older guard useless here.
+
+   The generalisable point, and it is the same one as 1e/1p: **the guard was not
+   weak, it was narrower than the thing it was believed to cover.** "We have a
+   test for printed verbs" was true. "Printed verbs are checked" was not. The
+   gap sat exactly where the two differ, and nothing about a green suite could
+   show it, because the test passed for the whole time the banner was wrong.
+
+1r. **`filament-transport` could not be built static outside this repo
+   (2026-08-30).** `cli/Cargo.toml` declares `static = ["dep:openssl-sys"]` with
+   vendored OpenSSL, because `rust_socketio` hard-depends on `native-tls`.
+   `filament-transport` carries that same `rust_socketio` dependency and declared
+   no such feature, so the CLI had an escape hatch for fully-static (musl) builds
+   that no other consumer of the crate could reach. The crate always compiled;
+   it was the STATIC build that was reachable only from inside this tree.
+
+   Added the mirrored `static` feature. Found by asking whether these crates are
+   usable elsewhere and measuring it, not by anything failing, which is the point
+   worth keeping: a carve that compiles looks finished, and the asymmetries it
+   leaves behind are invisible from inside the repo that still has the original.
+
 1p. **The right filter on the wrong candidate set (2026-08-30).** 1e-old says
    "identify a test daemon by its config dir in /proc/environ, never by its
    command line". The acceptance suite's FILTER did exactly that. Its CANDIDATE

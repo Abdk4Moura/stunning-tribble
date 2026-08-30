@@ -36,8 +36,22 @@ categories = ["network-programming"]
 # taken with the faults never injected.
 test-hooks = []
 debug-logs = []
+# Fully static builds (musl): compile OpenSSL from source instead of linking the
+# system one. rust_socketio below hard-depends on native-tls, so a rustls-only
+# tree is not possible without forking it upstream (ledger C16).
+#
+# THE CLI HAD THIS AND THIS CRATE DID NOT, which is the asymmetry that makes a
+# carve look finished and not be: `cli` could build fully static via its own
+# `static` feature, and anything else depending on filament-transport had no
+# equivalent escape hatch. The crate compiles either way; it was the STATIC
+# build that was reachable only from inside this repo.
+#
+# Found by asking whether these crates are usable in other things and measuring
+# it, rather than by anything failing.
+static = ["dep:openssl-sys"]
 
 [dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
 # Versions copied verbatim from cli/Cargo.toml, so behaviour is byte-identical.
 anyhow = "1.0.102"
 async-trait = "0.1.89"

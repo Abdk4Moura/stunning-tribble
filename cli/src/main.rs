@@ -510,7 +510,8 @@ COMMANDS
     devices                list your known devices
     requests               approve or deny access others asked for
     grant / revoke         give or take a capability on a device
-    ephemeral mint         a temporary key someone can enrol with (CI, borrowed box)
+    add --for runner       a temporary key someone can enrol with (CI, borrowed box)
+    ephemeral enroll       use such a key to enrol (run on the CI / borrowed box)
     status                 what the daemon is doing / recently received
   Mesh
     addr                   show your overlay address (or a device's)
@@ -24113,6 +24114,132 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn help_banner_names_commands_that_exist() {
+        // The banner printed `ephemeral mint`, a verb deleted when minting
+        // collapsed into `add --for runner`. A user reading --help typed it and
+        // got a usage error.
+        //
+        // `printed_hints_name_verbs_that_exist` exists to stop exactly this and
+        // could not see it, for two reasons worth keeping written down:
+        //   1. it anchors on the literal "filament ", and the COMMANDS column
+        //      lists bare verbs with no such prefix, so the banner was never
+        //      scanned at all;
+        //   2. it reads ONE word, so `ephemeral mint` would have passed on
+        //      `ephemeral` even where it did look.
+        // Both gaps are about depth, not about that one string, so this walks
+        // the whole token sequence: subcommand, sub-subcommand, and flags.
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+
+        // A token that is a placeholder rather than something to type.
+        let placeholder = |t: &str| {
+            t.starts_with('<') || t.starts_with('[') || t.contains('.') || t.contains(':')
+        };
+
+        let mut bad: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        for raw in EXAMPLES.lines() {
+            // Two shapes carry commands: the COMMANDS column (4-space indent,
+            // command, 2+ spaces, prose) and the EXAMPLES lines (`filament ...`).
+            let line = raw.trim_end();
+            let cmdtext = if let Some(rest) = line.trim_start().strip_prefix("filament ") {
+                rest.split("  ").next().unwrap_or("").trim().to_string()
+            } else if line.starts_with("    ") && !line.starts_with("     ") {
+                let body = &line[4..];
+                match body.find("  ") {
+                    Some(i) => body[..i].trim().to_string(),
+                    None => body.trim().to_string(),
+                }
+            } else {
+                continue;
+            };
+            if cmdtext.is_empty() {
+                continue;
+            }
+            // "grant / revoke" is two verbs on one row.
+            for alt in cmdtext.split(" / ") {
+                let toks: Vec<&str> = alt.split_whitespace().collect();
+                let Some(first) = toks.first() else { continue };
+                if placeholder(first) || first.starts_with('-') {
+                    continue;
+                }
+                let names = |c: &clap::Command| {
+                    let mut v: Vec<String> = vec![c.get_name().to_string()];
+                    v.extend(c.get_all_aliases().map(str::to_string));
+                    v
+                };
+                let Some(mut cur) = cmd
+                    .get_subcommands()
+                    .find(|sc| names(sc).iter().any(|n| n == first))
+                    .cloned()
+                else {
+                    bad.push(format!("  `{alt}`: clap has no verb `{first}`"));
+                    continue;
+                };
+                checked += 1;
+                let mut skip_value = false;
+                for t in &toks[1..] {
+                    if skip_value {
+                        skip_value = false;
+                        continue;
+                    }
+                    if placeholder(t) {
+                        break;
+                    }
+                    if let Some(long) = t.strip_prefix("--") {
+                        let long = long.split('=').next().unwrap_or(long);
+                        match cur.get_arguments().find(|a| a.get_long() == Some(long)) {
+                            Some(a) => {
+                                skip_value = a.get_num_args().map(|n| n.takes_values()).unwrap_or(false);
+                            }
+                            None => bad.push(format!(
+                                "  `{alt}`: `{}` has no flag `--{long}`",
+                                cur.get_name()
+                            )),
+                        }
+                        continue;
+                    }
+                    if t.starts_with('-') {
+                        continue;
+                    }
+                    // A bare word after a verb that HAS subcommands must be one.
+                    if cur.get_subcommands().next().is_some() {
+                        // Bound first: the iterator borrows `cur`, and assigning
+                        // to `cur` inside the match would still hold that borrow.
+                        let found = cur
+                            .get_subcommands()
+                            .find(|ss| names(ss).iter().any(|n| n == t))
+                            .cloned();
+                        match found {
+                            Some(next) => cur = next,
+                            None => {
+                                bad.push(format!(
+                                    "  `{alt}`: `{}` has no subcommand `{t}`",
+                                    cur.get_name()
+                                ));
+                                break;
+                            }
+                        }
+                    } else {
+                        break; // a positional value, not a verb
+                    }
+                }
+            }
+        }
+
+        assert!(
+            checked >= 10,
+            "parsed only {checked} commands out of the banner; the shape changed \
+             and this test is no longer reading it"
+        );
+        assert!(
+            bad.is_empty(),
+            "filament --help prints commands that clap will reject:\n{}",
+            bad.join("\n")
+        );
+    }
+
     fn printed_hints_name_verbs_that_exist() {
         // #229, and the reason this test exists rather than a fifth point fix:
         // `filament unmount` was printed after every successful mount and has
