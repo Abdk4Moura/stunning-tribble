@@ -21341,7 +21341,32 @@ async fn recv_cmd(
                                 let nm = inc.name.clone();
                                 if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from).await? {
                                     completed += 1;
-                                    if test_hooks::suppress_delivery_ack() {
+                                    // BUG-ACKLOSS reproducer: tear the link DOWN at the
+                                    // instant the ack is due, so the sender never sees it and
+                                    // its transport observes ApplicationClosed(0,""). In
+                                    // `=once` mode this fires only the FIRST time, so a daemon
+                                    // receiver recovers (delivers) on the re-dial.
+                                    //
+                                    // RESTORED 2026-08-30. This arm was wired in 12a8db82 and
+                                    // was gone by the next commit, with no commit deleting it;
+                                    // the else-if chain survived MINUS its first arm, which is
+                                    // what a botched conflict resolution looks like. For ~620
+                                    // commits `cli/tests/ack-loss-repro.sh` set
+                                    // FILAMENT_TEST_PREMATURE_CLOSE=1 and NOTHING READ IT, so
+                                    // its "premature" round ran an ordinary transfer and the
+                                    // promptness verdict measured the happy path.
+                                    // `hooks_that_nothing_calls` now fails if any hook loses
+                                    // its last call site again.
+                                    if test_hooks::premature_close_after_ack()
+                                        && !(test_hooks::premature_close_once()
+                                            && test_hooks::premature_already_fired())
+                                    {
+                                        if test_hooks::premature_close_once() {
+                                            test_hooks::premature_mark_fired();
+                                        }
+                                        ui::say(&ui::paint(ui::Tone::Warn, &format!("    [test] {nm} PREMATURE-CLOSE at ack (reproducing ack-loss / corpse)")));
+                                        conn.drop_link(&pid);
+                                    } else if test_hooks::suppress_delivery_ack() {
                                         ui::say(&ui::paint(ui::Tone::Warn, &format!("    [test] {nm} verified but SUPPRESSING delivery-ack")));
                                     } else if let Some(t) = conn.transport_of(&pid) {
                                         let _ = t.send_control(&protocol::delivery_ack_msg(&id, sid)).await;
@@ -21423,7 +21448,32 @@ async fn recv_cmd(
                                 let nm = inc.name.clone();
                                 if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from).await? {
                                     completed += 1;
-                                    if test_hooks::suppress_delivery_ack() {
+                                    // BUG-ACKLOSS reproducer: tear the link DOWN at the
+                                    // instant the ack is due, so the sender never sees it and
+                                    // its transport observes ApplicationClosed(0,""). In
+                                    // `=once` mode this fires only the FIRST time, so a daemon
+                                    // receiver recovers (delivers) on the re-dial.
+                                    //
+                                    // RESTORED 2026-08-30. This arm was wired in 12a8db82 and
+                                    // was gone by the next commit, with no commit deleting it;
+                                    // the else-if chain survived MINUS its first arm, which is
+                                    // what a botched conflict resolution looks like. For ~620
+                                    // commits `cli/tests/ack-loss-repro.sh` set
+                                    // FILAMENT_TEST_PREMATURE_CLOSE=1 and NOTHING READ IT, so
+                                    // its "premature" round ran an ordinary transfer and the
+                                    // promptness verdict measured the happy path.
+                                    // `hooks_that_nothing_calls` now fails if any hook loses
+                                    // its last call site again.
+                                    if test_hooks::premature_close_after_ack()
+                                        && !(test_hooks::premature_close_once()
+                                            && test_hooks::premature_already_fired())
+                                    {
+                                        if test_hooks::premature_close_once() {
+                                            test_hooks::premature_mark_fired();
+                                        }
+                                        ui::say(&ui::paint(ui::Tone::Warn, &format!("    [test] {nm} PREMATURE-CLOSE at ack (reproducing ack-loss / corpse)")));
+                                        conn.drop_link(&pid);
+                                    } else if test_hooks::suppress_delivery_ack() {
                                         ui::say(&ui::paint(ui::Tone::Warn, &format!("    [test] {nm} verified but SUPPRESSING delivery-ack")));
                                     } else if let Some(t) = conn.transport_of(&pid) {
                                         let _ = t.send_control(&protocol::delivery_ack_msg(&id, ack_sid)).await;
@@ -24115,6 +24165,87 @@ mod tests {
 
     #[test]
     #[test]
+    #[test]
+    fn hooks_that_nothing_calls() {
+        // A hook with no call site is not dead code, it is a DISCONNECTED
+        // INSTRUMENT, and that is strictly worse: the gate that injects with it
+        // still runs, still passes, and now measures the happy path.
+        //
+        // `cli/tests/ack-loss-repro.sh` set FILAMENT_TEST_PREMATURE_CLOSE=1 for
+        // roughly 620 commits while NOTHING READ the flag. The wiring was added
+        // in 12a8db82 and was already gone by the next commit, and no commit
+        // deletes it: the else-if chain survived minus its first arm, which is
+        // the shape a bad conflict resolution leaves. Nothing failed, because a
+        // reproducer that injects nothing reproduces nothing.
+        //
+        // The warning ratchet could not catch it either. `cargo check` reports
+        // the unused STUB, and the stub is one of 154 warnings against a
+        // baseline of 108, so it read as ordinary dead code.
+        //
+        // This is the sibling of `help_banner_names_commands_that_exist`: both
+        // ask whether a thing that LOOKS wired actually is.
+        let src = std::fs::read_to_string(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR")))
+            .expect("read main.rs");
+
+        // The no-op module (cfg(not(feature = "test-hooks"))) mirrors the real
+        // one exactly, so it is the authoritative list of hook names.
+        let start = src
+            .find("#[cfg(not(feature = \"test-hooks\"))]")
+            .expect("stub test_hooks module must exist");
+        let body = &src[start..];
+        let end = body.find("\n}").expect("stub module must close") + start;
+        let stub = &src[start..end];
+
+        let mut hooks: Vec<&str> = Vec::new();
+        for line in stub.lines() {
+            if let Some(rest) = line.trim().split("pub fn ").nth(1) {
+                if let Some(name) = rest.split(['(', '<']).next() {
+                    hooks.push(name);
+                }
+            }
+        }
+        assert!(
+            hooks.len() >= 10,
+            "parsed only {} hooks from the stub module; its shape changed and \
+             this test is no longer reading it",
+            hooks.len()
+        );
+
+        // Call sites live across the cli sources.
+        let mut all = String::new();
+        let dir = format!("{}/src", env!("CARGO_MANIFEST_DIR"));
+        let mut stack = vec![std::path::PathBuf::from(dir)];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    if let Ok(t) = std::fs::read_to_string(&path) {
+                        all.push_str(&t);
+                    }
+                }
+            }
+        }
+
+        let orphans: Vec<&str> = hooks
+            .iter()
+            .filter(|h| !all.contains(&format!("test_hooks::{h}")))
+            .copied()
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "these fault-injection hooks have NO call site, so anything that \
+             injects with them measures nothing:\n{}",
+            orphans
+                .iter()
+                .map(|o| format!("  {o}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
     fn help_banner_names_commands_that_exist() {
         // The banner printed `ephemeral mint`, a verb deleted when minting
         // collapsed into `add --for runner`. A user reading --help typed it and

@@ -675,6 +675,47 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1s. **The BUG-ACKLOSS reproducer injected nothing for ~620 commits
+   (2026-08-30). FIXED.** `cli/tests/ack-loss-repro.sh` exists to reproduce the
+   delivery-ack teardown race deterministically on a 1 MB transfer, something the
+   multi-stream push otherwise hit about 1-in-5 on 10 GB cross-machine runs. Its
+   whole mechanism is `FILAMENT_TEST_PREMATURE_CLOSE=1`, which is supposed to make
+   the receiver tear the link down at the instant the ack is due.
+
+   **Nothing read the flag.** `premature_close_after_ack`, `premature_close_once`,
+   `premature_already_fired` and `premature_mark_fired` had ZERO call sites. The
+   "premature" round ran an ordinary transfer, and the promptness verdict
+   (did the sender re-probe?) measured the happy path. It passed, and passing
+   meant nothing.
+
+   How it happened, which is the part worth keeping: the wiring WAS present in
+   12a8db82 (an ancestor of HEAD) at `main.rs:9616`, and was already gone by the
+   next commit. **No commit deletes it.** The if/else-if chain survived MINUS its
+   first arm, leaving `suppress_delivery_ack` (the second arm) correctly wired,
+   which is the shape a bad conflict resolution leaves, not a deliberate removal.
+   The other hooks in the family kept their call sites, so this was never a
+   blanket strip.
+
+   Three separate things failed to notice:
+   - The warning ratchet DID report the unused stub. It was 1 of 154 warnings
+     against a baseline of 108, so it read as ordinary dead code.
+   - The gate itself cannot notice. A detector is never validated by its own
+     clean-run count; see [[instrument-must-be-verified-present]].
+   - **I nearly made it permanent.** The stub was on my list of 20 "provably
+     dead" functions to delete to bring the ratchet back under baseline.
+     Deleting it would have erased the evidence and closed the gap for good.
+     A zero-caller INSTRUMENT and a zero-caller helper look identical to
+     `cargo check`, and they are opposites: one is safe to delete, the other is
+     a live defect. Never bulk-delete never-used functions in this tree without
+     asking, for each one, whether something was supposed to be calling it.
+
+   Fixed by restoring the arm at BOTH receiver sites (the inline fast path and
+   the `Ev::MaybeComplete` writer-completion path; the original had one, the code
+   has since split in two) and adding `hooks_that_nothing_calls`, which parses the
+   no-op module for hook names and fails if any has no call site. Verified in both
+   directions: stripping the arms makes it fail and name all four orphans;
+   restoring passes. Suite 391 passed / 0 failed.
+
 1q. **`filament --help` advertised a verb that no longer existed, and the test
    written to prevent exactly that could not see it (2026-08-30).** The COMMANDS
    banner listed `ephemeral mint`. That verb was removed when minting collapsed
