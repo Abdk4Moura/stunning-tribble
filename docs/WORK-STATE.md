@@ -698,6 +698,35 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    dies and the sender then reports "peer did not come back within 45s". That
    single panic explains 1t entirely.
 
+   **CORRECTION, same day, after tracing `resolve_peer_identity`.** The above
+   over-states the security impact and the correction matters. That function
+   returns early leaving `device_pub` None in two cases: no proven name, or NO
+   DEVICE CERT for the name. Two fresh installs doing a code-based transfer have
+   no cert for each other by design (that is the whole "send with a code, no
+   account" flow), so `legacy_allowed && device_pub.is_none()` is the NORMAL AND
+   PERMANENT state there, not a transient pre-resolution window. Revocation is a
+   property of CERTIFIED devices; with no cert there is nothing to revoke, so
+   nothing is bypassed in this instance.
+
+   So the probe's predicate is BROADER than the defect it targets: it cannot
+   distinguish "identity is pending and will settle" from "identity is absent by
+   design". Which is the same shape as the defect it was written to catch, now
+   in the probe itself, and the same shape as 1q and 1e: a condition that is true
+   but wider than the decision resting on it.
+
+   The REAL defect this leaves is not the revocation window, it is that the probe
+   PANICS the receiver on the primary user flow in every debug build. That is why
+   the ack-loss harness fails its baseline, and why three runs died identically.
+   Any debug-build harness doing a plain code transfer is unusable.
+
+   The fix is to narrow the predicate to "resolvable but unresolved" (verified
+   name present AND a cert exists for it), which needs an `identity_pending` flag
+   plumbed from the call site, since `cap_gate_effective` sees only device_pub.
+   **NOT done unilaterally.** The comment at capability.rs:456 explicitly says the
+   assertion must go quiet only by fixing the ordering, never by being relaxed,
+   and a narrowing that is wrong would hide a genuine revocation bug. It needs the
+   owner, plus the revocation test below to confirm the certified path is sound.
+
    **What is verified:** the probe fires on code-based receive with fresh state;
    the receiver exits 101; it is a `debug_assert!`, so RELEASE builds do not
    panic and the window is simply SILENT there.
