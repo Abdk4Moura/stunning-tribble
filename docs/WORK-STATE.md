@@ -675,6 +675,43 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1v. **The #161 revocation-ordering probe FIRES on the plainest flow there is
+   (2026-08-30). OPEN, and the most important thing found today.** Chasing why
+   the ack-loss harness failed, I ran a bare `send --word` + `receive <code>`
+   between two fresh config dirs on a debug build. The receiver PANICKED:
+
+     capability.rs:456: gate reached before identity resolution:
+     legacy trust with no resolved device identity
+
+   That is not a crash to silence. It is the deliberate #161 probe, and its own
+   comment states the consequence: `trusted` (pair-secret MAC, feeds
+   legacy_allowed) and `identity_device_pub` (lazy resolve_peer_identity, feeds
+   device_pub) are set by SEPARATE events, so if the gate is reached with legacy
+   trust and no resolved identity, `cert_revoked_for(None)` is false while
+   `legacy_allowed` is true, and **a revoked device is authorized until identity
+   settles**. The comment is explicit that it "goes quiet only because the
+   ordering is fixed, never because the assertion was relaxed."
+
+   `gate_live()` scopes the probe to real flows, so this IS an exercised path,
+   not a synthetic unit-test state. Reproduced three times: once directly, and
+   twice as the ack-loss harness failing its BASELINE round, where the receiver
+   dies and the sender then reports "peer did not come back within 45s". That
+   single panic explains 1t entirely.
+
+   **What is verified:** the probe fires on code-based receive with fresh state;
+   the receiver exits 101; it is a `debug_assert!`, so RELEASE builds do not
+   panic and the window is simply SILENT there.
+   **What is NOT verified:** that a genuinely revoked device is let through end
+   to end. That needs a revocation test built on this repro, and it is the next
+   thing to do.
+
+   Do NOT "fix" this by relaxing the assertion. The fix is the ordering: resolve
+   peer identity before the gate is consulted, or deny when `device_pub` is None
+   under legacy trust. Note the shape, which is the recurring one in this tree
+   (see [[decision-on-a-narrow-view]]): a decision resting on a fact that is true
+   but narrower than the decision, here "trusted" standing in for "trusted AND
+   identified".
+
 1u. **The warning ratchet was breached at 154/108, and the obvious fix was the
    wrong one (2026-08-30).** Measured with CI's exact command, exit status
    captured. Confirmed pre-existing, not from this session's commits: HEAD~1 also
