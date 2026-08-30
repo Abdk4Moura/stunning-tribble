@@ -675,8 +675,33 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
-1l. **`grant` skips the validations `revoke` runs (2026-08-29, found, not
-   fixed).** A TODO in main.rs (~13872) said "route grant through apply_cap_op
+1m. **A regression shipped past 389 tests, 7/7 CI, and my own live check
+   (2026-08-30, fixed in 7d11093).** Worth its own item because of what did NOT
+   catch it.
+
+   975d563 made non-interactive `add` default to the `file` transport, on the
+   correct reasoning that a spoken code has to be READ ALOUD to somebody. Applied
+   unconditionally, which ignored that `--word` IS the code transport: it sets
+   the SPAKE2 password for a spoken code and means nothing to a file. So a
+   scripted `add --for device --word "..."` silently wrote an invitation file
+   instead of minting the code the caller had just chosen words for.
+
+   THAT IS HOW THE ACCEPTANCE RIG PAIRS. The change would have broken the suite
+   that validated everything else in that session, and it reached the hub.
+
+   WHAT MISSED IT: 389 unit tests, all seven CI jobs on that commit, and a live
+   terminal check of the very feature. The live check ran `add`, `add --for`,
+   `add laptop` and the one-shot, and never `add --word`, because those were the
+   paths being thought about. Testing the paths you have in mind is the same
+   narrowness that produced the authz safety claim in 1k.
+
+   WHAT FOUND IT: trying to USE the feature for something else, building a rig
+   for the grant work in 1l, and noticing the pairing produced no code. It
+   presented as the fifth harness failure of the session and was a real product
+   regression. Harness failures are worth reading as signal.
+
+1l. **`grant` skipped the validations `revoke` runs. FIXED 2026-08-30
+   (7b314d6).** A TODO in main.rs (~13872) said "route grant through apply_cap_op
    so there is one validated op-creation path (sig-verify + floor + monotonic +
    ratchet), not two". Checked, and it is accurate:
 
@@ -694,19 +719,32 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    forever". A grant that bypasses the floor can land in the store and be
    refused at evaluation.
 
-   NOT FIXED HERE, and the reason is track record rather than difficulty. This
-   is the same shape as the authz preamble (one decision, two paths, one
-   skipping checks), and that change is still unproven at 3 of 5 samples after I
-   over-claimed its safety, misread a flaky gate, reverted good work and undid
-   the revert. Routing grant through apply_cap_op will make some
-   currently-succeeding grants fail CORRECTLY, and telling "correctly rejected"
-   from "I broke grant" needs the gate suite this file records as flaky and that
-   I have now misread twice in one session.
+   DEFERRED ONCE, THEN DONE, and the deferral had a stated condition rather than
+   a vague worry: knowing the gate's pass rate on an unchanged tree, so a red
+   could be READ instead of guessed at. Closing 1k supplied it (7 of 9, ~78%),
+   which is why the work happened an hour later and not before.
 
-   WHAT THE FIX NEEDS: route the grant path through apply_cap_op, drop the
-   hand-rolled update_ratchet, and expect grant-gate churn. Establish the gate's
-   pass rate on an unchanged tree FIRST (item 1k has the method: a revert commit
-   is a free control), then change it, so a red can be read.
+   A SECOND BUG SURFACED IN THE DOING. Grant used hlc_next(0, ..), starting from
+   zero and ignoring the store, where revoke uses hlc_next(existing_ver, ..). So
+   a REGRANT could be minted below the floor. That could never fail while the op
+   was pushed straight in; through apply_cap_op it is refused, which is the
+   point. Grant now computes existing_ver the way revoke does.
+
+   VERIFIED AGAINST A REAL STORE, because the floor only bites on the SECOND
+   grant to one target and no unit test reaches that:
+
+       grant / regrant / regrant-after-revoke   all succeed
+       versions   1788057406968 -> ...424611 -> ...424678, monotonic
+       store      cap_header, cap_ratchet, cap_grant
+                  ratchet written by apply_cap_op, not the deleted hand call
+                  one cap_grant entry, replaced in place, never duplicated
+
+   The risk was that routing through the validated path would start refusing
+   legitimate regrants. It does not.
+
+   AND THE RIG THAT PROVED IT CAUGHT A SHIPPED REGRESSION. Building it exposed
+   that 975d563 had broken scripted `add --word`: non-interactive was defaulting
+   to `file` unconditionally, and --word IS the code transport. See 1m.
 
 1k. **The flake was measured again, and I misread it twice (2026-08-29).** Item
    1i said "a red here is not evidence on its own". I read that sentence, quoted
