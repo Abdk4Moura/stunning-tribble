@@ -675,6 +675,42 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1p. **The right filter on the wrong candidate set (2026-08-30).** 1e-old says
+   "identify a test daemon by its config dir in /proc/environ, never by its
+   command line". The acceptance suite's FILTER did exactly that. Its CANDIDATE
+   LIST did not:
+
+       for p in $(pgrep -f "release/filament"); do
+           grep -q "FILAMENT_CONFIG_DIR=/tmp/claude-0" /proc/$p/environ && kill
+       done
+
+   A daemon launched from an INSTALLED binary (/root/hubtest/filament,
+   /root/finalcheck/filament) never reaches the filter, because pgrep never
+   offers it. And running the installed artifact is exactly the habit 1n
+   recommends, so the good practice manufactured daemons the purge could not
+   see. 36 were alive; two from hours earlier still held acc/O and acc/D.
+
+   COST: `send --to owner` failed on two consecutive runs of the shipped
+   binary, same error both times, immediately after a change to the grant path.
+   Reproducible, not flaky, and pointing straight at the most recent security
+   work. On a cleaned rig the same binary scores 24/0.
+
+   WHAT STOPPED THE WRONG CONCLUSION was reading the daemon log rather than the
+   pass count: `connection_key_divergence: device 'laptop' overlay key X !=
+   pinned cert device_pub Y`, several different overlay keys claiming one
+   device, which is the stale-daemon signature 1e-old describes. The failure
+   text the SENDER shows ("no peer connected within 60s") names ICE and mDNS and
+   points nowhere near the real cause.
+
+   FIXED both halves: enumerate by identity (pgrep -x filament plus a path-tail
+   match) and then ASSERT zero strays before running. A purge that silently
+   matched nothing is how these survived every earlier run while each reported
+   itself clean.
+
+   SEVENTH HARNESS DEFECT THIS SESSION. The lesson was already written down here
+   and applied to the part I was looking at. Recording a rule does not protect
+   the place you did not think to apply it.
+
 1n. **The hub served a binary that misreported its own commit (2026-08-30).**
    BUILDS said 7d11093, the binary said 975d5630, and the CODE was 7d11093: it
    minted a spoken code for `add --word`, which only the newer build does. The
