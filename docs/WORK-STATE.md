@@ -675,6 +675,39 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1w. **The relay->direct upgrade PROMOTED any link to owner-equivalence. FIXED
+   2026-08-30.** Following 1v's thread into who sets `trusted` without an
+   identity, `perform_upgrade` (the P5 relay->direct cutover) does this:
+
+     let known = ...expected_secret          // read from the old link
+     self.drop_link(pid);                    // destroys trust + principal state
+     self.adopt_direct_transport(pid, t, route, known);
+
+   and `adopt_direct_transport` rebuilt the Link with a HARDCODED
+   `trusted: true` and `principal_kind: OwnerDevice`. So whatever the link was
+   before the upgrade, it came back owner-equivalent.
+
+   This is not a hypothetical. The sibling constructor `adopt_direct` carries an
+   explicit fail-safe for exactly this, and its comment records the incident:
+   "a device whose transfer grant had been REVOKED still delivered a file,
+   because the acceptor had granted it owner-equivalence at link birth." **The
+   fix landed in `adopt_direct` and never in `adopt_direct_transport`.** One bug,
+   two constructors, fixed in one: the shape logged in
+   [[cross-impl-comparison-invariant]].
+
+   It also contradicted the function's own doc, which says it reuses the known
+   identity so "only the wire path changes". Minting a principal is not that.
+
+   Fixed by carrying `(trusted, principal_kind)` from the pre-upgrade link across
+   the swap. Owner links are unchanged; a fleet or delegated link keeps its lower
+   privilege instead of being promoted. Suite 391/0.
+
+   **Not verified end to end:** a fleet relay->direct upgrade carrying a REVOKED
+   device, which needs a live two-box rig. The change is sound by construction
+   (it can only ever lower privilege relative to the old behaviour, never raise
+   it), but the escalation itself was found by reading, not by a failing test,
+   and it deserves one.
+
 1v. **The #161 revocation-ordering probe FIRES on the plainest flow there is
    (2026-08-30). OPEN, and the most important thing found today.** Chasing why
    the ack-loss harness failed, I ran a bare `send --word` + `receive <code>`

@@ -11589,6 +11589,23 @@ impl Conn {
     async fn perform_upgrade(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
         let was_active = self.is_active(pid);
         let known = self.links.get(pid).and_then(|l| l.expected_secret.clone());
+        // CARRY the pre-upgrade principal across the swap. `drop_link` below
+        // destroys the old link, and `adopt_direct_transport` rebuilt it with a
+        // hardcoded `trusted: true` + OwnerDevice, so a relay->direct upgrade
+        // PROMOTED whatever the link was into owner-equivalence.
+        //
+        // That is the same escalation `adopt_direct` fail-safes against a
+        // thousand lines up, where the comment records it being caught live: "a
+        // device whose transfer grant had been REVOKED still delivered a file,
+        // because the acceptor had granted it owner-equivalence at link birth."
+        // The fix landed there and not in this sibling.
+        //
+        // It also contradicts this function's own contract, which says it reuses
+        // the known identity so only the wire path changes.
+        let carried = self
+            .links
+            .get(pid)
+            .map(|l| (l.trusted, l.principal_kind.clone()));
         // Clear the relay commitment FIRST so the new direct link isn't treated as
         // a known-bad path and so a future stall can escalate cleanly again.
         self.resil.relay_committed.remove(pid);
@@ -11600,7 +11617,7 @@ impl Conn {
         // transport via the same direct-link shape adopt_direct builds, but reusing
         // the existing identity so the session is preserved across the swap.
         self.drop_link(pid);
-        self.adopt_direct_transport(pid, t.clone(), route, known);
+        self.adopt_direct_transport(pid, t.clone(), route, known, carried);
         if was_active {
             self.active = Some(pid.to_string());
         }
@@ -11625,6 +11642,10 @@ impl Conn {
         t: Arc<dyn Transport>,
         route: &'static str,
         known: Option<(String, String)>,
+        // (trusted, principal_kind) carried from the pre-upgrade link. None only
+        // if the link vanished, where the previous defaults are kept so this
+        // change stays scoped to the escalation it fixes.
+        carried: Option<(bool, crate::capability::PrincipalKind)>,
     ) {
         let info = self
             .roster
@@ -11650,7 +11671,7 @@ impl Conn {
                 workers: vec![],
                 generation,
                 attempts: 0,
-                trusted: true,
+                trusted: carried.as_ref().map(|(t, _)| *t).unwrap_or(true),
                 verified_name: known.as_ref().map(|(n, _)| n.clone()),
                 expected_secret: known,
                 presence: Presence::Ready,
@@ -11661,7 +11682,9 @@ impl Conn {
                 identity_user_pub: None,
                 identity_binding: crate::capability::BindingStrength::None,
                 identity_cert_expires: None,
-                principal_kind: crate::capability::PrincipalKind::OwnerDevice,
+                principal_kind: carried
+                    .map(|(_, k)| k)
+                    .unwrap_or(crate::capability::PrincipalKind::OwnerDevice),
             },
         );
     }
