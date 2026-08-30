@@ -729,11 +729,28 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    label on a correct binary is the benign case; the same mechanism would hide a
    stale BINARY just as well.
 
-   FIXED at the publish boundary rather than by remembering: publish.sh now runs
-   the artifact, reads its stamp, and REFUSES when it disagrees with the commit
-   being published. Verified against the live mismatch before trusting it, and
-   it correctly skips Windows/macOS artifacts, which cannot be executed here.
-   Builders should pass FILAMENT_BUILD_SHA.
+   FIXED at the publish boundary rather than by remembering: publish.sh reads the
+   stamp and REFUSES when it disagrees with the commit being published.
+
+   THE FIRST VERSION OF THAT GUARD WAS ITSELF TOO NARROW. It read the stamp by
+   RUNNING the binary, which only works for the host's own target, so it skipped
+   Windows and macOS -- and the raw .exe promptly sailed past it, stamped
+   975d5630 while published as 7d11093. A guard that cannot inspect three of
+   four artifacts is not a guard. It now reads the string out of the binary with
+   `strings`, which works for every target and executes nothing, and it refuses
+   an UNREADABLE stamp too, because "could not check" must not read as "passed".
+
+   THE PATTERN, once all four were finally inspected: every locally cross-built
+   artifact had a stale stamp (musl, windows-gnu) and every CI-built one was
+   correct (msvc, darwin). CI checks out fresh, so build.rs re-runs; a local
+   cross build under its own CARGO_TARGET_DIR does not trip build.rs's watched
+   paths and recompiles against the cached value. Builders should pass
+   FILAMENT_BUILD_SHA.
+
+   Impact was contained: install.ps1 uses the MSVC artifact, which was correct.
+   Only the direct .exe download carried a possibly-stale binary under a current
+   label. Verified in both directions on a Windows binary before being trusted:
+   publishing it under the wrong commit is refused, under the right one accepted.
 
    FOUND BY running the acceptance suite against the INSTALLED binary rather
    than a local build, which is also what exposed 1m. Testing the artifact a
