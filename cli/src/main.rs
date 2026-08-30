@@ -13843,7 +13843,24 @@ async fn main() -> Result<()> {
                 }
                 let target_arr = peer_cert.user_pub;
 
-                let v = crate::capability::hlc_next(0, crate::capability::now_ms());
+                // Version must EXCEED any existing grant for this target, the
+                // same monotonic ratchet `revoke` respects. This was
+                // hlc_next(0, ..), which ignores what is already in the store,
+                // so a regrant could be minted below the floor. That could not
+                // fail while the op was pushed straight in; through
+                // apply_cap_op it would be refused, which is the point.
+                let existing_ver = store
+                    .iter()
+                    .filter(|e| {
+                        e.get("type").and_then(|v| v.as_str()) == Some("cap_grant")
+                            && e["grantor"].as_str() == Some(hex::encode(pk).as_str())
+                            && e["resource"].as_str() == Some("self")
+                            && e["target"].as_str() == Some(hex::encode(target_arr).as_str())
+                    })
+                    .filter_map(|e| e["version"].as_u64())
+                    .max()
+                    .unwrap_or(0);
+                let v = crate::capability::hlc_next(existing_ver, crate::capability::now_ms());
                 let mut op = crate::capability::CapOp {
                     op: crate::capability::CapOpKind::Grant,
                     grantor: pk,
@@ -13857,23 +13874,28 @@ async fn main() -> Result<()> {
                     sig: [0u8; 64],
                 };
                 op.sig = crate::capability::sign_cap_op(&op, &user_key.keypair());
-                let mut hdr_json = serde_json::json!({
-                    "type": "cap_grant",
-                });
-                let mut op_json = op.to_json();
-                op_json["type"] = serde_json::json!("cap_grant");
-                store.push(op_json);
-                // Grant must initialize the per-owner ratchet so evaluate()
-                // does not hit "ratchet uninitialized". apply_cap_op normally
-                // does this, but the grant command constructs CapOp JSON
-                // directly. On failure the grant did NOT take (evaluate()
-                // will deny forever), so fail the command instead of printing
-                // a misleading "granted" line.
-                // TODO: route grant through apply_cap_op so there is one
-                // validated op-creation path (sig-verify + floor + monotonic
-                // + ratchet), not two.
-                crate::capability::update_ratchet(&mut store, &pk, op.issued_at)
-                    .context("capability grant created but ratchet initialization failed; the grant will not be effective. Re-run the grant command")?;
+                // ONE VALIDATED OP-CREATION PATH. `revoke` already went through
+                // apply_cap_op; `grant` pushed its JSON straight into the store
+                // and then called update_ratchet by hand, patching the single
+                // consequence somebody had been bitten by. The TODO that asked
+                // for this is now discharged.
+                //
+                // What grant was skipping: signature verification against the
+                // header's owner_pub, the resource header existing at all, and
+                // the version FLOOR. apply_cap_op does the push and the ratchet
+                // itself, so both are removed here rather than duplicated.
+                let hdr = store
+                    .iter()
+                    .find(|e| {
+                        e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                            && e["resource"].as_str() == Some("self")
+                    })
+                    .and_then(crate::capability::CapHeader::from_json)
+                    .ok_or_else(|| {
+                        anyhow!("capability store has no header for 'self'; re-run the grant")
+                    })?;
+                crate::capability::apply_cap_op(&mut store, &hdr, &op, crate::capability::now_secs())
+                    .context("the grant was refused by the capability store, so it did NOT take. Nothing was written")?;
                 // save_and_list_revoked: persist THEN reconcile (reconciliation
                 // is a property of the write). GATED on authoritative: in shadow
                 // only REPORT what would be removed.
