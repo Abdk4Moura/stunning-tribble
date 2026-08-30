@@ -675,6 +675,25 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1x. **The revocation question now has evidence, not an argument (2026-08-30).**
+   1v and 1w both turned on "does revocation actually hold?", which I had argued
+   about from comments rather than measured. `revocation_is_only_consultable_once_identity_resolved`
+   pins both halves against the real gate:
+
+   - **resolved + revoked -> DENIED**, even with legacy trust present. The
+     security property HOLDS wherever identity resolves. That is the reassuring
+     half and it was previously assumed, not tested.
+   - **unresolved -> allowed on legacy trust**, because `cert_revoked_for(None)`
+     is false: revocation there is UNKNOWABLE, not absent.
+
+   So the exposure is precisely bounded: it exists only where identity never
+   resolves. Together with 1w closing the path that MINTED trusted-but-
+   unidentified links (the relay->direct upgrade), the practical surface is much
+   smaller than 1v first suggested.
+
+   This also gives the 1v predicate decision a base: if the ordering is ever
+   fixed, case 2 flips and the test says so in a diff. Suite 392/0.
+
 1w. **The relay->direct upgrade PROMOTED any link to owner-equivalence. FIXED
    2026-08-30.** Following 1v's thread into who sets `trusted` without an
    identity, `perform_upgrade` (the P5 relay->direct cutover) does this:
