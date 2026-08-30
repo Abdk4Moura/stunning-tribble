@@ -675,6 +675,38 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1aa. **BUG-ACKLOSS: first real verdict in the reproducer's life, and it is GREEN
+   (2026-08-30).** I twice called this blocked on "a two-box rig". Wrong twice
+   over: the reproducer runs BOTH ends on localhost, and what actually blocked it
+   was the #161 `debug_assert` panicking the receiver (1v). That assertion is
+   compiled out in RELEASE, so a `--release --features test-hooks` build has the
+   injection hooks AND no panic. Added a `FILAMENT_BIN` override to the script
+   (it hardcoded `/debug/`) and pointed it at such a build.
+
+     baseline (no hook)     : delivered + verified   [harness OK]
+     premature-close (recv) : not confirmed (77s)  [PROMPT: sender detected the
+                              dead conn, no re-probe -- correct]
+     TRUE EXIT: 0
+
+   Exit 0 is the ONLY passing outcome the script defines for that round.
+
+   Three things follow, and the middle one is the point of the whole exercise:
+   - The harness passed its own precondition for the first time.
+   - **The injection FIRED.** Baseline delivered, premature did not: behaviour
+     DIFFERED between rounds, which is direct evidence the hook restored in 1s is
+     live. For ~620 commits both rounds were the same code path.
+   - **BUG-ACKLOSS does not reproduce.** The sender detected the dead connection
+     and did NOT re-probe, which is the correct outcome; the keepalive leak is
+     fixed.
+
+   The lesson is 1z's again, one turn later: "needs hardware" was a property of
+   how I was RUNNING it, not of the test. Both times the block dissolved on
+   asking what specifically was in the way.
+
+   Caveat kept honest: this measures the LOCALHOST path with a release binary.
+   The original 1-in-5 failures were 10 GB cross-machine, and a two-box run is
+   still worth doing, but it is now a broader-coverage question, not a blocker.
+
 1z. **The escalation fix now has the regression test it deserved (2026-08-30).**
    1w fixed the relay->direct cutover minting owner-equivalence but shipped with
    only reading to defend it, and I twice called that "needs a two-box rig". It
