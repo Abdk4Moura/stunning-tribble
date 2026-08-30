@@ -2992,8 +2992,21 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     // finds no session and the acceptor closes it, so we exit cleanly.
     // TODO: distinguish clean-exit from transport-drop at the warm layer.
     //   Currently the bridge sees an opaque socket close for both cases.
-    //   A `ctl::session_alive(peer)` probe before the cold loop would skip
-    //   unnecessary transport establishment after a clean logout.
+    //
+    //   INVESTIGATED 2026-08-30, and the `ctl::session_alive(peer)` probe this
+    //   note used to propose DOES NOT WORK. The initiating daemon's warm_ptys
+    //   entry is dropped for both outcomes -- its own comment says "Bridge ended
+    //   (shell exit / client gone / link drop): drop our entry" -- so the probe
+    //   answers "not alive" either way. It would skip the cold path for both,
+    //   which breaks the warm-drop reattach this path exists to provide, or for
+    //   neither, which changes nothing.
+    //
+    //   The fact lives on the PEER: does its acceptor still hold the session?
+    //   Asking costs a transport establishment, which is the thing being
+    //   avoided. So the real fix is a PROTOCOL addition, the acceptor sending an
+    //   explicit clean-exit marker before it closes, which the initiator records
+    //   so the next attach can tell the two apart locally. Bigger than a ctl op,
+    //   and worth knowing before someone builds a probe that cannot answer.
     let mut warm_ended = false;
 
     #[cfg(unix)]
