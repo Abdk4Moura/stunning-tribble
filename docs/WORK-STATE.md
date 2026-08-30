@@ -675,6 +675,35 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1t. **The ack-loss reproducer had a SECOND independent break, and its first real
+   run still produced no verdict (2026-08-30).** Beyond the missing hook wiring
+   (1s), the script hardcoded `BIN="$CLI_DIR/target/debug/filament"`. This box
+   sets a shared `target-dir` in `~/.cargo/config.toml`, so that path does not
+   exist: the script BUILT fine and then looked for the binary somewhere cargo
+   never writes. Fixed to ask `cargo metadata` for the effective target
+   directory, honouring CARGO_TARGET_DIR and falling back to ./target.
+
+   Ran it with both breaks fixed. **It still gives no verdict:** the BASELINE
+   round (no hook, must simply deliver) came back `NOT confirmed [HARNESS
+   BROKEN]`, with a stall on a peer that disconnected and did not return inside
+   45s. Per the script's own contract that is a setup failure, not a result, so
+   this run says NOTHING about whether BUG-ACKLOSS still reproduces. Do not read
+   it as either a pass or a fix.
+
+   The likely cause is environment, not code: 8 filament processes were already
+   running before the run (including two `/root/finalcheck2/filament up` pointed
+   at PRODUCTION and a shell that has been alive 8 days), which is the same
+   contamination that once made `send --to owner` fail twice and read as a grant
+   regression. The run also leaked its own autostarted backend on :8077 because
+   the cleanup trap does not fire when `timeout` kills the wrapper. A verdict
+   needs a clean rig first.
+
+   And a self-inflicted one worth naming: I captured the script's exit status as
+   `bash repro.sh | tail -30; echo $?`, which reports TAIL's status, always 0.
+   That is precisely the swallowed-exit-code trap `.github/workflows/warning-
+   ratchet.yml` documents in its own comments, and I walked into it while
+   verifying an instrument. The reported "EXIT: 0" was meaningless.
+
 1s. **The BUG-ACKLOSS reproducer injected nothing for ~620 commits
    (2026-08-30). FIXED.** `cli/tests/ack-loss-repro.sh` exists to reproduce the
    delivery-ack teardown race deterministically on a 1 MB transfer, something the
