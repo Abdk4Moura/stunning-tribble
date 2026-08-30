@@ -675,6 +675,29 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1ab. **"Needs a two-box rig" was wrong a THIRD time, for a third reason
+   (2026-08-30).** After 1z and 1aa I kept saying the cross-machine ack-loss run
+   was blocked on "hardware I don't have". Checked instead of asserting:
+   `interserver-0x0` is ONLINE, 78ms, warm direct link. And the premature-close
+   hook is RECEIVER-side, so only this box needs the test-hooks build; the remote
+   sends with a stock binary and no deployment is required.
+
+   So the block was imaginary again. The real reason not to run it now is a
+   better one, and it is about DISCRIMINATION, not access: the verdict turns on
+   whether the sender RE-PROBES, gated by ack_wait=15s and ack_reprobe=5s. At
+   78ms RTT a 1 MB cross-machine run differs from localhost by three orders of
+   magnitude LESS than the thresholds that decide it, so it cannot distinguish
+   pass from fail any better than 1aa already did. The run that WOULD
+   discriminate is the 10 GB transfer where the original 1-in-5 failures lived,
+   because the bug is a duration/scale effect, not an RTT effect. That is a real
+   bandwidth and time commitment on the owner's link, which is a cost decision
+   rather than a capability one.
+
+   Three "blocked on hardware" claims today, all false, each dissolving the
+   moment I asked what SPECIFICALLY was in the way instead of reasoning from the
+   category. Same defect shape as the code findings: a statement true in general
+   but wider than the decision resting on it.
+
 1aa. **BUG-ACKLOSS: first real verdict in the reproducer's life, and it is GREEN
    (2026-08-30).** I twice called this blocked on "a two-box rig". Wrong twice
    over: the reproducer runs BOTH ends on localhost, and what actually blocked it
