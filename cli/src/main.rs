@@ -9366,6 +9366,26 @@ struct DirectPending {
     probe: bool,
 }
 
+/// What principal a relay->direct upgrade's rebuilt Link should carry.
+///
+/// Extracted as a PURE fn so the invariant is testable: `Conn::for_command`
+/// needs a live socket.io client, so the calling method cannot be unit-tested,
+/// and before this the only check on the rule was reading it.
+///
+/// The rule: carry the pre-upgrade principal. `adopt_direct_transport` used to
+/// hardcode `(true, OwnerDevice)`, so an upgrade PROMOTED any link to
+/// owner-equivalence, the escalation `adopt_direct` fail-safes against and whose
+/// comment records a REVOKED device delivering a file. `None` keeps the old
+/// default, since it means the link vanished and that is a separate question.
+fn upgrade_principal(
+    carried: &Option<(bool, crate::capability::PrincipalKind)>,
+) -> (bool, crate::capability::PrincipalKind) {
+    match carried {
+        Some((trusted, kind)) => (*trusted, kind.clone()),
+        None => (true, crate::capability::PrincipalKind::OwnerDevice),
+    }
+}
+
 impl Conn {
     /// Single constructor for the `pair`/`send`/`recv` command event loops, which
     /// built the identical ~17-field `Conn` literal three times (the only
@@ -11671,7 +11691,7 @@ impl Conn {
                 workers: vec![],
                 generation,
                 attempts: 0,
-                trusted: carried.as_ref().map(|(t, _)| *t).unwrap_or(true),
+                trusted: upgrade_principal(&carried).0,
                 verified_name: known.as_ref().map(|(n, _)| n.clone()),
                 expected_secret: known,
                 presence: Presence::Ready,
@@ -11682,9 +11702,7 @@ impl Conn {
                 identity_user_pub: None,
                 identity_binding: crate::capability::BindingStrength::None,
                 identity_cert_expires: None,
-                principal_kind: carried
-                    .map(|(_, k)| k)
-                    .unwrap_or(crate::capability::PrincipalKind::OwnerDevice),
+                principal_kind: upgrade_principal(&carried).1,
             },
         );
     }
@@ -24266,6 +24284,49 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+    }
+
+    #[test]
+    fn upgrade_never_promotes_a_link_to_owner() {
+        // Regression test for the escalation fixed in the relay->direct cutover.
+        // `adopt_direct_transport` hardcoded `(true, OwnerDevice)`, so ANY link
+        // came back owner-equivalent after an upgrade. The sibling constructor
+        // `adopt_direct` already fail-safes against that, and its comment records
+        // the incident: "a device whose transfer grant had been REVOKED still
+        // delivered a file, because the acceptor had granted it owner-equivalence
+        // at link birth." The fix landed there and not here.
+        //
+        // The calling method cannot be unit-tested (Conn::for_command needs a
+        // live socket.io client), which is WHY the rule was only ever enforced by
+        // reading it. Hence the pure `upgrade_principal`.
+        use crate::capability::PrincipalKind;
+
+        // A fleet device stays a fleet device, and stays untrusted.
+        let fleet = upgrade_principal(&Some((false, PrincipalKind::FleetDevice)));
+        assert!(!fleet.0, "an untrusted link must not become trusted by upgrading");
+        assert_eq!(
+            fleet.1,
+            PrincipalKind::FleetDevice,
+            "a fleet device must not be promoted to OwnerDevice by upgrading"
+        );
+
+        // A trusted fleet device keeps its KIND even though it is trusted, which
+        // is the case the old code silently collapsed into OwnerDevice.
+        let trusted_fleet = upgrade_principal(&Some((true, PrincipalKind::FleetDevice)));
+        assert!(trusted_fleet.0);
+        assert_eq!(trusted_fleet.1, PrincipalKind::FleetDevice);
+
+        // An owner device is unchanged, so the fix is not a behaviour regression
+        // for the ordinary path.
+        let owner = upgrade_principal(&Some((true, PrincipalKind::OwnerDevice)));
+        assert!(owner.0);
+        assert_eq!(owner.1, PrincipalKind::OwnerDevice);
+
+        // None means the link vanished; the previous default is deliberately kept
+        // so this stays scoped to the escalation it fixes.
+        let gone = upgrade_principal(&None);
+        assert!(gone.0);
+        assert_eq!(gone.1, PrincipalKind::OwnerDevice);
     }
 
     fn help_banner_names_commands_that_exist() {

@@ -675,6 +675,28 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1z. **The escalation fix now has the regression test it deserved (2026-08-30).**
+   1w fixed the relay->direct cutover minting owner-equivalence but shipped with
+   only reading to defend it, and I twice called that "needs a two-box rig". It
+   does not: the rig is only needed to demo the EXPLOIT, not to pin the RULE.
+
+   `Conn::for_command` needs a live socket.io client, so the calling method
+   genuinely cannot be unit-tested, and that is precisely WHY the rule went
+   unenforced. Extracted the decision into a pure `upgrade_principal` and tested
+   that: a fleet device stays FleetDevice and stays untrusted; a TRUSTED fleet
+   device keeps its kind (the case the old code silently collapsed to
+   OwnerDevice); an owner device is unchanged, so the fix is not a regression for
+   the ordinary path; None keeps the old default.
+
+   Verified both directions: reverting `upgrade_principal` to the pre-fix
+   `(true, OwnerDevice)` fails with "an untrusted link must not become trusted by
+   upgrading"; restoring passes. Suite 393/0.
+
+   The transferable bit: "untestable" was a property of the CALL SITE, not of the
+   rule. When a rule cannot be tested where it lives, move the rule, not the
+   goalpost. A two-box rig is still wanted to demonstrate the revoked-device path
+   end to end, but it is no longer what stands between this fix and a guard.
+
 1y. **A narrowing of the #161 predicate was designed and REJECTED (2026-08-30).**
    Recorded so it is not re-proposed. The tempting fix for the probe panicking
    debug builds on the primary flow (1v) is to thread an
