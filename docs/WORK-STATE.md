@@ -675,6 +675,53 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1n. **The hub served a binary that misreported its own commit (2026-08-30).**
+   BUILDS said 7d11093, the binary said 975d5630, and the CODE was 7d11093: it
+   minted a spoken code for `add --word`, which only the newer build does. The
+   label was a commit stale, not the artifact.
+
+   CAUSE. cli/build.rs stamps the sha from `git rev-parse` and re-runs only when
+   its watched git paths change. In the cross-target musl build that did not
+   re-fire, so the crate recompiled against the CACHED FILAMENT_BUILD_INFO from
+   the previous publish. build.rs already supports FILAMENT_BUILD_SHA for
+   exactly this ("CI can override"), and no publish path ever set it.
+
+   WHY IT MATTERS MORE THAN IT LOOKS. "The installer reports the commit it
+   actually installed, read from BUILDS rather than baked in" is the property
+   this hub exists to provide, and it is the thing I used all session to confirm
+   what was deployed. It was quietly false for at least one publish. A stale
+   label on a correct binary is the benign case; the same mechanism would hide a
+   stale BINARY just as well.
+
+   FIXED at the publish boundary rather than by remembering: publish.sh now runs
+   the artifact, reads its stamp, and REFUSES when it disagrees with the commit
+   being published. Verified against the live mismatch before trusting it, and
+   it correctly skips Windows/macOS artifacts, which cannot be executed here.
+   Builders should pass FILAMENT_BUILD_SHA.
+
+   FOUND BY running the acceptance suite against the INSTALLED binary rather
+   than a local build, which is also what exposed 1m. Testing the artifact a
+   user receives keeps finding things that testing the tree does not.
+
+1o. **The acceptance suite went stale at the unification and I stopped noticing
+   (2026-08-30).** The run above reported 21 passed / 4 failed, which reads as a
+   product regression. All four were in the ephemeral section, driving
+   `ephemeral mint --caps ... --ttl ...`, a verb removed in cb05567 when it
+   collapsed into `add --for runner`. Harness stale, product fine.
+
+   The suite had been green at 25/0 before the unification, and I ran unit tests
+   and CI afterwards instead of it, so nothing said the checks had stopped
+   describing the product. A suite that tests a removed verb does not fail
+   loudly as "removed"; it fails as four ordinary-looking FAILs.
+
+   Updated to `add --for runner --allow ... --expires ...`, and it now also
+   asserts the artifact is the ONE credential format, which is the property the
+   unification actually bought.
+
+   SIXTH HARNESS DEFECT THIS SESSION, and the second that presented as a product
+   result. Reading the failure NAMES rather than the pass count is what
+   separated them.
+
 1m. **A regression shipped past 389 tests, 7/7 CI, and my own live check
    (2026-08-30, fixed in 7d11093).** Worth its own item because of what did NOT
    catch it.
