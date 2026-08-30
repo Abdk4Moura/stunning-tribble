@@ -24,7 +24,6 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -333,7 +332,7 @@ impl L3 {
     /// Reverse MagicDNS: the petname of a verified peer by overlay address, so an
     /// `expose --peer` allowlist can match an incoming connection's source.
     pub async fn petname_of(&self, addr: IpAddr) -> Option<String> {
-        self.names.lock().await.values().find(|(n, v6, v4)| {
+        self.names.lock().await.values().find(|(_n, v6, v4)| {
             matches!(addr, IpAddr::V6(a) if a == *v6)
                 || matches!(addr, IpAddr::V4(a) if v4.map_or(false, |v| a == v))
         }).map(|(n, _, _)| n.clone())

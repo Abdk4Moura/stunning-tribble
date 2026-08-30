@@ -41,9 +41,8 @@ pub fn reuse_disabled() -> bool {
 
 #[cfg(unix)]
 pub use imp::{
-    daemon_present, send_reply, serve, serve_at, try_approve_request, try_bootstrap,
-    try_cap_status, try_deny_request, try_dial, try_fleet_rendezvous, try_list_mounts, try_list_pending, try_list_warm, try_mount,
-    try_mount_health, try_open, try_open_at, try_ping, try_pty, try_pty_reason, try_reconfigure, try_reload,
+    daemon_present, send_reply, serve_at, try_approve_request, try_bootstrap,
+    try_cap_status, try_deny_request, try_dial, try_fleet_rendezvous, try_list_pending, try_list_warm, try_mount, try_open, try_ping, try_pty_reason, try_reconfigure, try_reload,
     try_reload_expose, try_resize, try_unmount, Req, ReqKind,
 };
 

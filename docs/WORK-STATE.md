@@ -675,6 +675,59 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1u. **The warning ratchet was breached at 154/108, and the obvious fix was the
+   wrong one (2026-08-30).** Measured with CI's exact command, exit status
+   captured. Confirmed pre-existing, not from this session's commits: HEAD~1 also
+   measured 154. CI would have failed on the next push.
+
+   Brought 154 -> 120 by fixing causes rather than counting:
+   - **`mount-macos` was never declared** in `cli/Cargo.toml` while FIVE cfgs
+     gate on it (`mount_fuse.rs` plus four sites in `main.rs`). A cfg naming an
+     undeclared feature is unconditionally false, so the macOS FUSE adapter was
+     compiled out of every build AND `cargo build --features mount-macos` failed
+     as an unknown feature: there was no way to turn macOS mount on at all.
+     Declared it, and made `fuser` an optional macOS dep so the feature pulls
+     what it needs. Same shape as the test-hooks bug (1j) and found the same way.
+   - `cargo fix` for the mechanical rest (unused imports, unnecessary `mut`,
+     unused bindings) across 11 files. Suite still 391/0.
+
+   **The remaining 12 were NOT deleted, deliberately.** 21 functions have zero
+   references, and the tempting move is to delete enough of them to get under
+   108. Three that I checked turned out to be DISCONNECTED FEATURES, not dead
+   code:
+   - `render_missing_steer` / `render_missing_json` (settings.rs) call
+     `interact::render_steer` and `build_affordance`, i.e. the NUDGE affordance
+     system. Unused means the missing-value nudge never renders.
+   - `cap_status_cmd` (main.rs) calls the real ctl op `ctl::try_cap_status`, so
+     the op exists with no verb reaching it.
+   - The four `wg.rs` entries are the staged WireGuard L3 data plane (master
+     build order item 5, "built + measured, ready"), not garbage.
+
+   That is the THIRD instance today of "never used" meaning "wired wrong" rather
+   than "dead" (see 1s, and 1j before it). `cargo check` cannot tell a
+   zero-caller instrument or a zero-caller feature from a zero-caller leftover;
+   they are opposites, and only reading each one distinguishes them. Deleting to
+   satisfy a counter would have destroyed working code and closed the gaps
+   permanently, which is exactly what nearly happened to the ack-loss hook.
+
+   So the baseline is updated to 120 INTENTIONALLY (the gate's own message
+   sanctions this) to restore its real function, which is "no NEW warnings".
+   This is not a claim that the 21 are fine. Each needs a per-item wire-or-delete
+   decision, and the three above should be WIRED:
+
+     settings.rs      render_missing_steer, render_missing_json, run_get
+     main.rs          cap_status_cmd, devices_name_taken
+     ctl.rs           try_list_mounts, try_mount_health
+     wg.rs            gen_keypair, create_iface, configure_peer, network_cidr
+     l3.rs            run_point_to_point
+     l2.rs            ssh_transport_args
+     mount.rs         print_mount_help, interactive_mount_fancy
+     sshd.rs          is_configured
+     local.rs         from_stream
+     ui.rs            glyph_deliberate
+     fleet_ui/mod.rs  confirm_mistype, err_bad_arg
+     recovery.rs      render_guardians_header
+
 1t. **The ack-loss reproducer had a SECOND independent break, and its first real
    run still produced no verdict (2026-08-30).** Beyond the missing hook wiring
    (1s), the script hardcoded `BIN="$CLI_DIR/target/debug/filament"`. This box

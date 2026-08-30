@@ -1209,7 +1209,7 @@ fn readout(json_out: bool) -> Result<()> {
         }
         // Print peer overrides grouped under this key
         let key = k;
-        for (pk, pv, _pwh, _ph, _pd, _pc, pn) in peer_rows.iter().filter(|r| r.0 == *key) {
+        for (_pk, pv, _pwh, _ph, _pd, _pc, pn) in peer_rows.iter().filter(|r| r.0 == *key) {
             let indent = "   |- ";
             let label = "peer";
             let child = format!("{indent}{pn:wpad$}  {pv:w1$}  {label:w2$}",

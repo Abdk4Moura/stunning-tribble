@@ -98,7 +98,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
@@ -6350,7 +6349,7 @@ async fn respond_to_auth_key_enroll_request(
     // Verify the principal under our trusted owner, then reconstruct the full
     // auth key (Compact: fingerprint + compact signature; Legacy: full-issuer
     // verify) for the principal registration that follows.
-    let ak = match &ak {
+    let _ak = match &ak {
         crate::ephemeral::EnrollmentPrincipal::Compact(inv) => {
             if !inv.verify_against_owner(&owner_pub) {
                 ui::debug("enroll request auth-key rejected (fingerprint or signature)");
@@ -6490,7 +6489,7 @@ async fn handle_auth_key_enroll_response(
             }
             let secret = fresh_secret();
             let now = identity::now_secs();
-            let certificate_ttl = ak.expires.saturating_sub(now);
+            let _certificate_ttl = ak.expires.saturating_sub(now);
             // ONE enrolment builder, shared with the pairing ceremony. Minting a
             // certificate for a peer happens in exactly one place.
             let (device_cert, enrolment) =
@@ -15234,7 +15233,7 @@ async fn send_cmd(
         // may simply be a sibling that never speaks fleet to us (see the paired
         // owner above), and the device we asked for may still be out there.
         if fleet_target {
-            let now = Instant::now();
+            let _now = Instant::now();
             for p in fleet_sess.lapsed(Instant::now()) {
                 ui::debug(&format!(
                     "fleet: pid={p} did not prove itself within {}s; releasing the slot",
@@ -20708,7 +20707,7 @@ async fn recv_cmd(
                                 let caps = "transfer";
                                 let caps_d = crate::identity::caps_digest(caps);
                                 let chash = crate::identity::cert_hash(&local_cert);
-                                let mut sender_dpub = local_cert.device_pub;
+                                let sender_dpub = local_cert.device_pub;
                                 // Possession_msg 8-field: tag, type 0x02, nonce, scope, caps_digest, cert_hash, sender, receiver
                                 let msg = crate::identity::possession_msg(0x02, &nonce_arr, scope, &caps_d, &chash, &sender_dpub, &recv_dpub_arr);
                                 if let Ok(sig) = crate::overlay::overlay_sign_possession(&msg) {
@@ -20717,7 +20716,7 @@ async fn recv_cmd(
                                     // sealing with HKDF(fresh_secret) (which introducer CAN open, since it minted fresh_secret). DTLS gives true A-B E2E,
                                     // introducer is BLIND (cannot read cert), which is stronger. No sealing needed for introduce when sent over direct A-B transport.
                                     // For pair path (0x01), we DO seal via signal path with HKDF(K) because signal goes via server.
-                                    let inner = json!({
+                                    let _inner = json!({
                                         "cert": local_cert.to_json(),
                                         "possession_sig": hex::encode(sig)
                                     });
@@ -21569,7 +21568,7 @@ async fn recv_cmd(
                         // byte-writing primitive. The primitive returns the fact
                         // now and the decision to report it lives out here.
                         let wrote = pwrite_at(&file, &data, pos);
-                        if let Err(e) = &wrote {
+                        if let Err(_e) = &wrote {
                             // Write failed: do NOT record coverage (leaves the gap).
                             // The whole-file digest will fail and trigger a re-fetch.
                             dlog!("[recv] pwrite_at FAILED at pos={pos} len={data_len}: {e}");
@@ -21913,7 +21912,7 @@ async fn verify_incoming(inc: &IncomingFile) -> protocol::VerifyResult {
     {
         let r = inc.ranges.lock().unwrap();
         if !coverage_complete(&r, inc.size) {
-            let gap = first_gap(&r, inc.size);
+            let _gap = first_gap(&r, inc.size);
             dlog!("[recv] INCOMPLETE at verify: {} ranges, received {}/{}, first gap at {:?}",
                   r.len(), recvd, inc.size, gap);
             drop(r);

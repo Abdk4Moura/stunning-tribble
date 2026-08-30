@@ -38,6 +38,13 @@ debug-logs = ["filament-transport/debug-logs"]
 # not require a feature. macOS needs macFUSE SDK; Windows needs WinFsp SDK.
 # These are OFF by default so stock CI runners (which lack the SDKs) stay green.
 mount-windows = ["dep:winfsp", "dep:winfsp-sys"]
+# DECLARED HERE because five cfgs already gate on it (mount_fuse.rs and four
+# sites in main.rs), and a cfg naming a feature its own crate does not declare is
+# UNCONDITIONALLY FALSE. So the macOS FUSE adapter was compiled out of every
+# build, and `cargo build --features mount-macos` failed outright as an unknown
+# feature: there was no way to turn macOS mount on at all. Same shape as the
+# test-hooks bug, found the same way, by reading what the warnings said.
+mount-macos = ["dep:fuser"]
 
 
 [dependencies]
@@ -131,6 +138,11 @@ libc = "0.2"
 # by mount-gates.sh.
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = "0.17"
+
+# macOS needs the macFUSE SDK, so the adapter is opt-in via `mount-macos`; the
+# dependency is optional so a default macOS build neither needs nor builds it.
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { version = "0.17", optional = true }
 
 
 
