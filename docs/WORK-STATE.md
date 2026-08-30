@@ -675,6 +675,37 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1ad. **Two-hop sweep of the rest of 1u's list, and it cuts BOTH ways
+   (2026-08-30).** Applied the corrected methodology (1ac) to the remaining
+   never-used functions. Reference counts are all zero; the second hop is whether
+   the CAPABILITY is reached another way. Results:
+
+   - **`wg.rs` (4 fns): KEEP, confirmed staged.** Reachable only via `mod wg;`.
+     It implements `docs/adr-0001-wireguard-as-l3-data-plane.md`, whose **Status
+     is Proposed**, dated 2026-07-25, decider = project owner. That is a live
+     proposal awaiting a decision, not abandoned code. The two-hop check CONFIRMS
+     here rather than refuting, which is the point of doing it.
+
+   - **`devices_name_taken`: KEEP, and it is a possible BUG.** The live collision
+     check is INLINE at main.rs:1624, `d["name"].as_str() == Some(name)`, which is
+     case-SENSITIVE. The unused fn lowercases both sides and its doc comment says
+     "(case-insensitive)". So the unwired function is the STRICTER, more correct
+     one, and today `Laptop` and `laptop` register as two distinct devices.
+     Deleting it would erase the evidence that case-insensitive collision was
+     intended. **Open: wire it, or decide case-sensitive petnames are correct.**
+
+   - Superseded-and-deletable on the evidence so far: `ssh_transport_args` (l2.rs
+     builds the `-o` args inline at 4357+), `try_mount_health` (live equivalent
+     `check_mount_health` at mount.rs:156, called three times), `run_get`
+     (no `Cmd::Get` exists; `set <key>` with no value displays the value).
+     NOT deleted yet: each still wants the same care 1ac shows is needed, and the
+     `devices_name_taken` result is exactly why.
+
+   The generalisable finding: "unused" partitions into at least THREE kinds, not
+   two. A leftover (delete), a disconnected instrument or staged design (keep),
+   and **a stricter check that was written and never wired** (keep AND fix). Only
+   the last was invisible to every heuristic I tried today.
+
 1ac. **CORRECTION to 1u: all three "disconnected features" were leftovers, and
    I verified one hop too shallow (2026-08-30).** 1u justified keeping the
    never-used functions, and moving the baseline instead of deleting, partly on
