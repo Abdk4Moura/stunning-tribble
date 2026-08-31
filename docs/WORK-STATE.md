@@ -675,6 +675,34 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1af. **Petname collision is case-SENSITIVE; the fix is ready and deliberately
+   HELD until testing ends (2026-08-31).** Re-examined 1ad's "design decision"
+   and it is closer to a bug. The live check is inline at main.rs:1624:
+
+       arr.iter().any(|d| d["name"].as_str() == Some(name))
+
+   an exact compare, so `Laptop` and `laptop` become two devices. Petnames are
+   what `send --to <name>` targets, so near-duplicate names are a targeting
+   footgun, and the unused `devices_name_taken` already implements the
+   case-insensitive version with a doc comment saying so. Documented intent,
+   unwired.
+
+   The clean fix is NOT to call `devices_name_taken` there: it re-reads from disk
+   via `devices_load()` while the call site works on an in-memory `arr` that is
+   mid-modification. Make the inline compare case-insensitive instead:
+
+       arr.iter().any(|d| d["name"].as_str()
+           .is_some_and(|n| n.eq_ignore_ascii_case(name)))
+
+   and the same inside the suffix `while`. `devices_name_taken` then becomes a
+   true duplicate and can go, taking warnings 117 -> 116.
+
+   **HELD, not undecided.** The owner is mid-test against the hub artifact at
+   9be1b809 and a daemon built from it. Landing a user-visible naming change now
+   would make HEAD diverge from what is being tested, which is exactly the
+   version-skew trap that produced the stale-daemon incident in 1ae. Apply after
+   testing concludes, then re-arm the hub.
+
 1ae. **Hub armed at 9be1b809 for linux-musl and windows-gnu; msvc/macOS
    deliberately NOT (2026-08-31).** `publish.sh` + end-to-end verification: the
    Linux `install.sh` was run for real into a throwaway prefix (fetch, checksum,
