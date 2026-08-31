@@ -675,6 +675,36 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1ah. **Gates Core red on 991c5e08 was a TIMEOUT, not a failing gate
+   (2026-08-31).** Recorded because "Gates Core is red" invites the wrong
+   diagnosis. The annotation is:
+
+     The job has exceeded the maximum execution time of 1h30m0s
+     deterministic core ratchet ... The operation was canceled.
+
+   No gate asserted. It ran out of wall clock at GitHub's ceiling.
+
+   Two independent reasons it is not the petname change: the SAME tree passed
+   Gates Core on 4c15dfdb (991c5e08 plus a docs-only commit), and the failure is
+   a cancellation rather than an assertion.
+
+   Likely cause, visible in the same log: **sccache reported `0 hits, 0 misses,
+   0 errors`**, so the cache did nothing and the run compiled cold. An earlier
+   run of this job was also cancelled at 1h30m, so this is the flake in 1i/1k
+   showing its mechanism rather than a new fault: the job is sized so close to
+   the ceiling that a cold cache pushes it over.
+
+   **The fix is not a re-run.** A gate whose pass/fail depends on cache warmth
+   measures the runner, not the tree, which is the same "instrument, not result"
+   problem as 1s. Either the job needs splitting, its cache made reliable, or the
+   ceiling raised deliberately. Until then a red Gates Core must be read by
+   checking the annotation BEFORE assuming a regression.
+
+   Also worth noting for my own tooling: my first read said "FAILED: Gates Core"
+   while it was still IN PROGRESS, because I compared `conclusion != 'success'`
+   and a running job has conclusion None. A check true in general, wider than the
+   decision resting on it, in the very session spent cataloguing that shape.
+
 1ag. **1ad's three "superseded, delete later" candidates are all UNWIRED
    CAPABILITIES. Keep all three (2026-08-31).** Ran the two-hop check properly
    instead of deleting on first-hop evidence. Every one turned out to be a
