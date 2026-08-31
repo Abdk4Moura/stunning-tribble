@@ -675,6 +675,42 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1ag. **1ad's three "superseded, delete later" candidates are all UNWIRED
+   CAPABILITIES. Keep all three (2026-08-31).** Ran the two-hop check properly
+   instead of deleting on first-hop evidence. Every one turned out to be a
+   feature that exists and cannot be reached, not a duplicate:
+
+   - **`ssh_transport_args` (l2.rs)** builds a `ProxyCommand` that tunnels ssh
+     through `filament forward <peer>:<port> --stdio`, with `--relay` support.
+     The live `spawn_ssh_direct` has NO ProxyCommand: it ssh's straight to the
+     mesh hostname, which only works when the L3 overlay is up. So this is the
+     FALLBACK for no-L3 environments (no CAP_NET_ADMIN, containers, relay-only
+     paths). The `-o` flags matching is what made it look like a duplicate;
+     the transport underneath is different.
+
+   - **`try_mount_health` (ctl.rs)** sends `op: "mount-health"` to the daemon over
+     the control socket, and **the daemon HANDLES it** (ctl.rs:733). The live
+     `check_mount_health` (mount.rs:156) is a LOCAL stat. Different authority: the
+     daemon owns the mount, so asking it is the stronger check. Server side live,
+     client side unreachable.
+
+   - **`run_get` (settings.rs)** implements `get <key> [--show-origin] [--default]
+     [--json] [--peer]`, and its doc comment describes that verb. `get` was
+     unified into `set <key>` with no value and `unset` into `set --reset`, which
+     covers key/value/peer/json but NOT `--show-origin`. Checked whether
+     provenance surfaces anywhere else: `build_affordance` DISCARDS origin
+     (`let (cur_val, _)`), and the only other use is inside `get_str`, an internal
+     reader that uses it to tell default-empty from set-empty. **No live path
+     shows provenance to a user**, though the settings design called for it.
+
+   So the "21 never-used functions" are not 21 deletions. Counting what has now
+   been checked two hops: 3 were genuine leftovers (deleted, 1ac), 1 was a
+   stricter unwired check that became a bug fix (1af), 4 are staged design
+   (wg.rs/ADR-0001), and these 3 are unwired capabilities. **Zero of the ones
+   examined carefully were safe bulk deletions.** The warning count is a poor
+   proxy for dead code in this tree, which is the standing argument for the
+   baseline being a ratchet rather than a target.
+
 1af. **Petname collision is case-SENSITIVE; the fix is ready and deliberately
    HELD until testing ends (2026-08-31).** Re-examined 1ad's "design decision"
    and it is closer to a bug. The live check is inline at main.rs:1624:
