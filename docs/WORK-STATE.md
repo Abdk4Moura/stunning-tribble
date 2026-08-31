@@ -694,11 +694,19 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    showing its mechanism rather than a new fault: the job is sized so close to
    the ceiling that a cold cache pushes it over.
 
-   **The fix is not a re-run.** A gate whose pass/fail depends on cache warmth
-   measures the runner, not the tree, which is the same "instrument, not result"
-   problem as 1s. Either the job needs splitting, its cache made reliable, or the
-   ceiling raised deliberately. Until then a red Gates Core must be read by
-   checking the annotation BEFORE assuming a regression.
+   **FIXED by scoping sccache correctly.** The cause was not a cold cache, it was
+   that `RUSTC_WRAPPER`/`SCCACHE_GHA_ENABLED` were set ONLY on the "Build the gate
+   binary" step. The expensive work is `bash tests/gates.sh --with-relay`, which
+   runs its own RELEASE cargo builds, and those were entirely OUTSIDE the
+   wrapper's scope. That is why the stats read `0 hits, 0 MISSES, 0 errors`: zero
+   misses means the wrapper never saw the build, not that it missed. Hoisted the
+   env to workflow level, which is exactly what `test.yml` already does (and
+   test.yml finishes fast), so this is the existing working pattern.
+
+   The general point: a gate whose pass/fail depends on cache warmth measures the
+   runner, not the tree, which is the "instrument, not result" problem of 1s. And
+   `0 misses` was the tell that distinguished a misconfigured wrapper from a cold
+   cache; `0 hits` alone would have sent me to the wrong fix.
 
    Also worth noting for my own tooling: my first read said "FAILED: Gates Core"
    while it was still IN PROGRESS, because I compared `conclusion != 'success'`

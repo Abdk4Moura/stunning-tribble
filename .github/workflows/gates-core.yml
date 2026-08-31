@@ -32,6 +32,21 @@ on:
       - "backend/**"
       - ".github/workflows/gates-core.yml"
 
+# WORKFLOW-LEVEL, not per-step. The sccache env used to be set ONLY on the
+# "Build the gate binary" step, so the expensive work (`tests/gates.sh`, which
+# runs its own RELEASE cargo builds) compiled completely uncached. That is why
+# a run reported `sccache: 0 hits, 0 misses, 0 errors` -- not a cache miss, the
+# wrapper was never in scope for the build that matters -- and then hit the
+# 1h30m ceiling and was CANCELLED. Read as "Gates Core is red" that invites a
+# hunt for a failing gate; no gate asserted (WORK-STATE 1ah).
+#
+# test.yml already does it this way and finishes fast, so this is the existing
+# working pattern rather than a new idea.
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   ratchet:
     name: deterministic core ratchet
