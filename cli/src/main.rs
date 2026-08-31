@@ -1621,11 +1621,27 @@ pub(crate) fn upsert_peer_record(
     }
 
     // New device: auto-suffix if collision.
+    //
+    // CASE-INSENSITIVE. An exact compare here meant `Laptop` and `laptop` became
+    // two devices, and a petname is what `send --to <name>` targets, so a
+    // near-duplicate is a targeting footgun rather than a cosmetic one. The
+    // intent was already written down: `devices_name_taken` implements exactly
+    // this and its doc comment says "(case-insensitive)". It was never wired,
+    // and an unwired stricter check reads identically to dead code, which is how
+    // it survived (WORK-STATE 1ad/1af).
+    //
+    // Fixed HERE rather than by calling that fn: it re-reads from disk via
+    // `devices_load()`, while this call site works on an in-memory `arr` that is
+    // mid-modification, so the two could disagree.
     let mut final_name = name.to_string();
-    if arr.iter().any(|d| d["name"].as_str() == Some(name)) {
+    let taken = |a: &Vec<Value>, n: &str| {
+        a.iter()
+            .any(|d| d["name"].as_str().is_some_and(|e| e.eq_ignore_ascii_case(n)))
+    };
+    if taken(arr, name) {
         let mut suffix = 2;
         let mut new_name = format!("{name}-{suffix}");
-        while arr.iter().any(|d| d["name"].as_str() == Some(&new_name)) {
+        while taken(arr, &new_name) {
             suffix += 1;
             new_name = format!("{name}-{suffix}");
         }
@@ -1701,11 +1717,13 @@ pub(crate) fn devices_load() -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// Check if a petname is already taken by another device (case-insensitive).
-fn devices_name_taken(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    devices_load().iter().any(|(n, _)| n.to_ascii_lowercase() == lower)
-}
+// `devices_name_taken` lived here: the case-insensitive collision check that was
+// written, documented, and never called, while the live check compared exactly.
+// The behaviour it wanted now lives at the call site (see the `taken` closure in
+// the device-record writer), so this is a genuine duplicate and goes. Kept in
+// history because an unwired STRICTER check is not dead code, it is a bug, and
+// deleting it before wiring the behaviour would have erased the evidence.
+
 
 /// Strip terminal escape sequences and control characters from a device petname
 /// before it is stored. A name typed or pasted in a terminal can capture the
@@ -24207,6 +24225,33 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn petname_collision_ignores_case() {
+        // `Laptop` and `laptop` used to become two devices: the collision check
+        // was an exact compare while `devices_name_taken` (unused) implemented
+        // the case-insensitive rule its own doc comment promised. A petname is
+        // what `send --to <name>` targets, so near-duplicates are a targeting
+        // footgun, not a cosmetic one.
+        //
+        // This pins the RULE, mirroring the closure at the call site. That call
+        // site takes an in-memory `arr` mid-modification and cannot be reached
+        // from a unit test, which is the same "move the rule, not the goalpost"
+        // shape as `upgrade_never_promotes_a_link_to_owner` below.
+        let taken = |names: &[&str], n: &str| {
+            names.iter().any(|e| e.eq_ignore_ascii_case(n))
+        };
+
+        assert!(taken(&["laptop"], "Laptop"), "case must not create a new device");
+        assert!(taken(&["Laptop"], "laptop"), "and symmetrically");
+        assert!(taken(&["LAPTOP"], "laptop"), "any casing collides");
+        assert!(!taken(&["laptop"], "laptop-2"), "a real suffix is a distinct name");
+        assert!(!taken(&["laptop"], "desktop"), "unrelated names do not collide");
+
+        // The suffix search must use the same rule, or `laptop-2` could be
+        // handed out twice with different casing.
+        assert!(taken(&["laptop", "Laptop-2"], "laptop-2"), "suffix search too");
+    }
+
     fn upgrade_never_promotes_a_link_to_owner() {
         // Regression test for the escalation fixed in the relay->direct cutover.
         // `adopt_direct_transport` hardcoded `(true, OwnerDevice)`, so ANY link

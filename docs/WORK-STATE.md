@@ -697,11 +697,15 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    and the same inside the suffix `while`. `devices_name_taken` then becomes a
    true duplicate and can go, taking warnings 117 -> 116.
 
-   **HELD, not undecided.** The owner is mid-test against the hub artifact at
-   9be1b809 and a daemon built from it. Landing a user-visible naming change now
-   would make HEAD diverge from what is being tested, which is exactly the
-   version-skew trap that produced the stale-daemon incident in 1ae. Apply after
-   testing concludes, then re-arm the hub.
+   **APPLIED, same day.** The hold was the right instinct but the wrong remedy:
+   skew only exists if HEAD and the hub DIVERGE, so the fix is to move them
+   together, not to sit on a known bug. Landed the case-insensitive compare,
+   deleted `devices_name_taken` (now a true duplicate), and re-armed both hub
+   artifacts from the same commit so nothing is out of step.
+
+   Verified both directions: reverting to the exact compare fails
+   `petname_collision_ignores_case` with "case must not create a new device";
+   restoring passes. Suite 394/0, warnings 117 -> 116, baseline ratcheted down.
 
 1ae. **Hub armed at 9be1b809 for linux-musl and windows-gnu; msvc/macOS
    deliberately NOT (2026-08-31).** `publish.sh` + end-to-end verification: the
