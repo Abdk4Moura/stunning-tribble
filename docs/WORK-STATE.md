@@ -675,6 +675,38 @@ amendment section in `docs/design-mesh-network.md`. Proof:
    EXPECTED_GREEN, because that list is measured and this invalidates the
    measurement it would rest on. Re-run the gates and re-establish it.
 
+1ae. **Hub armed at 9be1b809 for linux-musl and windows-gnu; msvc/macOS
+   deliberately NOT (2026-08-31).** `publish.sh` + end-to-end verification: the
+   Linux `install.sh` was run for real into a throwaway prefix (fetch, checksum,
+   extract, execute, correct stamp), and the Windows artifact was checked for
+   checksum, `./filament.exe` contents, and stamp. Branch pushed; 8/8 CI green on
+   the commit, including Gates Core and the ratcheted-down Warning Ratchet.
+
+   **msvc and macOS stay at 22fed78, and the reason is provenance, not
+   capability.** `cli-release.yml` is TAG-ONLY with no `workflow_dispatch`, and a
+   `cli-v*` tag also fires `publish-registries` (crates.io) and `winget-publish`.
+   Both are irreversible, so arming those targets is a release decision.
+
+   I first wrote that msvc "can't be cross-built here". **That was imprecise**:
+   `cargo-xwin` cross-compiles MSVC targets from Linux and is installable. The
+   real reason to refuse is that an xwin-built binary is a DIFFERENT TOOLCHAIN
+   from CI's, so publishing it into the `x86_64-pc-windows-msvc` slot would make
+   BUILDS assert a provenance that is false: someone installing "the msvc build"
+   would get something CI never produced. That is the same defect shape this
+   whole session was spent removing (a label true in a narrow sense, wider than
+   the decision resting on it), and the distribution path is the last place to
+   introduce it.
+
+   Consequence to remember: `irm .../install.ps1 | iex` hardcodes msvc, so it
+   serves PRE-SESSION code with nothing signalling that. Windows testing at HEAD
+   must use the raw-exe artifact directly.
+
+   Also caught while arming: the local `filament up` daemon was executing a
+   DELETED inode (`/proc/PID/exe -> ... (deleted)`) because the install replaced
+   the file underneath it, so it served 1.5-day-old code while the new binary sat
+   on disk. Restarted and hash-verified against the on-disk binary. **Any machine
+   installed to needs the same restart**, or it tests the old build and passes.
+
 1ad. **Two-hop sweep of the rest of 1u's list, and it cuts BOTH ways
    (2026-08-30).** Applied the corrected methodology (1ac) to the remaining
    never-used functions. Reference counts are all zero; the second hop is whether
