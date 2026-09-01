@@ -40,13 +40,17 @@ use serde_json::Value;
 pub const CAP_SHELL: &str = "shell";
 pub const CAP_TRANSFER: &str = "transfer";
 pub const CAP_MOUNT: &str = "mount";
+/// Advertise a subnet route. Unlike the others this is meaningless without its
+/// RESOURCE: `route` alone authorizes nothing, because the whole question is
+/// *which prefix*. See `route_resource_id`.
+pub const CAP_ROUTE: &str = "route";
 
 /// The wire reason a live session is closed with when the peer's certificate is
 /// revoked mid-session (#235/#235-shape). The initiator keys its remedy on this
 /// exact string, so it must be one shared value, never a substring sniff.
 pub const REVOKED_REASON: &str = "access revoked";
 
-pub const CANONICAL_CAPABILITIES: &[&str] = &[CAP_SHELL, CAP_TRANSFER, CAP_MOUNT];
+pub const CANONICAL_CAPABILITIES: &[&str] = &[CAP_SHELL, CAP_TRANSFER, CAP_MOUNT, CAP_ROUTE];
 
 /// Scoped-default actions classified by the fleet gate.
 pub const SCOPED_DEFAULT_ACTIONS: &[&str] = &[CAP_TRANSFER, CAP_MOUNT];
@@ -107,6 +111,80 @@ pub fn self_resource_nonce() -> [u8; 32] {
 
 pub fn self_resource_id(owner_pub: &[u8; 32]) -> String {
     make_resource_id(owner_pub, &self_resource_nonce())
+}
+
+/// Domain constant for route-resource nonces. Separate from SELF so a route id
+/// can never collide with the self id, and so the two namespaces can evolve
+/// independently.
+pub const ROUTE_RESOURCE_DOMAIN: &[u8] = b"filament-route-resource-v1";
+
+/// Deterministic nonce for a CIDR, so the same prefix always names the same
+/// resource. Deterministic rather than random because a grant made today must
+/// still match the advertisement that arrives tomorrow, on a device that never
+/// saw the grant being minted.
+fn route_resource_nonce(normalized_cidr: &str) -> [u8; 32] {
+    use sha2_pake::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(ROUTE_RESOURCE_DOMAIN);
+    h.update(normalized_cidr.as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
+/// Canonical text for a CIDR, so one prefix has exactly one resource id.
+///
+/// NOT a caller convention, because a caller that forgets is an authorization
+/// bypass rather than a cosmetic slip: `10.0.0.0/24 ` with a trailing space, or
+/// `10.0.0.5/24` with host bits set, would otherwise hash to a DIFFERENT
+/// resource than the one the owner granted, and the grant would silently not
+/// apply. Host bits are masked off, text is trimmed, v6 is lowercased by
+/// `Ipv6Addr`'s own Display.
+pub fn normalize_cidr(cidr: &str) -> Result<String> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let t = cidr.trim();
+    let (addr, len) = t
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("'{t}' is not a CIDR: expected ADDRESS/LENGTH"))?;
+    let len: u8 = len
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("'{t}': prefix length is not a number"))?;
+    let ip: IpAddr = addr
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("'{t}': '{addr}' is not an IP address"))?;
+    match ip {
+        IpAddr::V4(a) => {
+            if len > 32 {
+                anyhow::bail!("'{t}': /{len} is not valid for IPv4 (max 32)");
+            }
+            let bits = u32::from(a);
+            let masked = if len == 0 { 0 } else { bits & (u32::MAX << (32 - len)) };
+            Ok(format!("{}/{len}", Ipv4Addr::from(masked)))
+        }
+        IpAddr::V6(a) => {
+            if len > 128 {
+                anyhow::bail!("'{t}': /{len} is not valid for IPv6 (max 128)");
+            }
+            let bits = u128::from(a);
+            let masked = if len == 0 { 0 } else { bits & (u128::MAX << (128 - len)) };
+            Ok(format!("{}/{len}", Ipv6Addr::from(masked)))
+        }
+    }
+}
+
+/// Resource id for "the owner's authority over this prefix".
+///
+/// THE POINT: an overlay address is self-certifying because it derives from the
+/// peer's key, so an announce proves it. A prefix derives from nothing, so
+/// advertising one is an unbacked claim. Binding the prefix to the OWNER's key
+/// here is what makes it checkable: the grant says the owner designated this
+/// device to carry this prefix, and `CapOp::verify` already refuses any op whose
+/// grantor is not the resource owner.
+pub fn route_resource_id(owner_pub: &[u8; 32], cidr: &str) -> Result<String> {
+    let normalized = normalize_cidr(cidr)?;
+    Ok(make_resource_id(owner_pub, &route_resource_nonce(&normalized)))
 }
 
 /// Self-certifying resource id: hex(SHA-256(owner_pub || nonce)).
@@ -572,7 +650,20 @@ pub fn is_scoped_default_action(action: &str) -> bool {
 
 /// Deliberate capability classified by the grant-only gate.
 pub fn is_deliberate_capability(action: &str) -> bool {
-    action == CAP_SHELL
+    // ROUTE IS DELIBERATE, NOT SCOPED-DEFAULT, and that is a security choice
+    // rather than caution. A scoped default is auto-granted to any proven
+    // same-owner device (`fleet_auto_trust`), which is right for transfer and
+    // mount: those act on the OWNER'S OWN resources, and the blast radius is the
+    // owner's own data.
+    //
+    // Advertising a route is not that shape. It is a claim about the world
+    // ("traffic for 10.0.0.0/24 should come to me") that nothing in the peer's
+    // key can substantiate, and believing it silently redirects other peers'
+    // traffic. Auto-granting it would mean one compromised laptop in the fleet
+    // can become the path to anything, which is the exact failure the
+    // accept-routes default exists to prevent. Same tier as shell, for the same
+    // reason: high blast radius, never implied by membership.
+    action == CAP_SHELL || action == CAP_ROUTE
 }
 
 /// True when an action is classified by one of the capability gate predicates.
@@ -1462,6 +1553,71 @@ pub fn apply_cap_op(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cidr_normalization_closes_the_bypasses_it_exists_for() {
+        // Host bits set. `10.0.0.5/24` and `10.0.0.0/24` are the SAME prefix, and
+        // if they hashed differently a grant would silently not apply to the
+        // advertisement it was written for.
+        assert_eq!(normalize_cidr("10.0.0.5/24").unwrap(), "10.0.0.0/24");
+        assert_eq!(normalize_cidr("10.0.0.0/24").unwrap(), "10.0.0.0/24");
+
+        // Whitespace, which is the cheapest bypass of a text-keyed resource.
+        assert_eq!(normalize_cidr("  10.0.0.0/24  ").unwrap(), "10.0.0.0/24");
+        assert_eq!(normalize_cidr("10.0.0.0 / 24").unwrap(), "10.0.0.0/24");
+
+        // v6 casing, normalized by Ipv6Addr's own Display.
+        assert_eq!(normalize_cidr("FD00::1/16").unwrap(), "fd00::/16");
+
+        // /0 is legal and means everything; the mask must not be a UB shift.
+        assert_eq!(normalize_cidr("1.2.3.4/0").unwrap(), "0.0.0.0/0");
+        assert_eq!(normalize_cidr("fd00::1/0").unwrap(), "::/0");
+
+        // Refusals, rather than a resource id for nonsense.
+        assert!(normalize_cidr("10.0.0.0/33").is_err(), "over-long v4");
+        assert!(normalize_cidr("fd00::/129").is_err(), "over-long v6");
+        assert!(normalize_cidr("10.0.0.0").is_err(), "no length");
+        assert!(normalize_cidr("not-an-ip/24").is_err(), "not an address");
+    }
+
+    #[test]
+    fn route_resource_binds_prefix_to_owner_and_ignores_spelling() {
+        let owner = [7u8; 32];
+        let other = [8u8; 32];
+
+        // Same prefix spelled differently is ONE resource. This is the property
+        // the whole grant depends on: the id computed when the owner grants must
+        // equal the id computed when an advertisement is checked, on a different
+        // machine that never saw the grant being minted.
+        let a = route_resource_id(&owner, "10.0.0.0/24").unwrap();
+        let b = route_resource_id(&owner, " 10.0.0.5/24 ").unwrap();
+        assert_eq!(a, b, "spelling must not change the resource");
+
+        // Different prefix is a different resource, so a grant for one LAN does
+        // not authorize another.
+        let c = route_resource_id(&owner, "10.0.1.0/24").unwrap();
+        assert_ne!(a, c, "different prefix, different resource");
+
+        // Different length is a different resource: /8 is not /24.
+        let d = route_resource_id(&owner, "10.0.0.0/8").unwrap();
+        assert_ne!(a, d, "different length, different resource");
+
+        // BOUND TO THE OWNER. Another owner granting the same prefix produces a
+        // different id, so one owner's grant cannot be replayed into another's
+        // store; CapOp::verify separately refuses a grantor that is not the
+        // resource owner.
+        let e = route_resource_id(&other, "10.0.0.0/24").unwrap();
+        assert_ne!(a, e, "resource must be owner-bound");
+
+        // And it never collides with the self resource.
+        assert_ne!(a, self_resource_id(&owner), "route id must not collide with self id");
+    }
+
+    #[test]
+    fn route_is_a_canonical_capability() {
+        assert!(CANONICAL_CAPABILITIES.contains(&CAP_ROUTE));
+        assert_eq!(canonical_capability(" Route ").unwrap(), CAP_ROUTE);
+    }
+
     use super::*;
     use ring::rand::SystemRandom;
     use ring::signature::KeyPair;
