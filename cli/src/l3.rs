@@ -128,7 +128,7 @@ pub struct L3 {
     /// path, written as links come and go. A dual-stack peer has TWO entries here (its
     /// v6 ULA and its v4 address) both pointing at the same transport. The hot path
     /// takes the lock only to clone one Arc.
-    routes: Arc<Mutex<HashMap<IpAddr, Arc<dyn Transport>>>>,
+    routes: Arc<Mutex<RouteTable>>,
     /// pid -> that link's datagram->TUN pump. ONE reader per link (a peer's datagrams
     /// carry both families; the pump just forwards each to the TUN, which demuxes by
     /// dest), aborted when the link is replaced/removed so it is never leaked (fix #2).
@@ -206,7 +206,7 @@ impl L3 {
             },
         };
         let userspace = netstack.is_some();
-        let routes: Arc<Mutex<HashMap<IpAddr, Arc<dyn Transport>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let routes: Arc<Mutex<RouteTable>> = Arc::new(Mutex::new(RouteTable::default()));
         let l3 = Arc::new(L3 {
             tun: tun.clone(),
             routes: routes.clone(),
@@ -235,7 +235,7 @@ impl L3 {
                     Err(_) => break, // TUN closed -> daemon shutting down
                 };
                 let Some(dst) = dest_ip(&buf[..n]) else { continue };
-                let peer = routes.lock().await.get(&dst).cloned();
+                let peer = routes.lock().await.lookup(dst);
                 if let Some(t) = peer {
                     let _ = t.send_datagram(&buf[..n]);
                 }
@@ -326,7 +326,7 @@ impl L3 {
     /// datagram on filament0 already came from a paired peer, so this is the
     /// membership check the expose allowlist builds on.
     pub async fn is_verified_peer(&self, addr: IpAddr) -> bool {
-        self.routes.lock().await.contains_key(&addr)
+        self.routes.lock().await.contains_host(&addr)
     }
 
     /// Reverse MagicDNS: the petname of a verified peer by overlay address, so an
@@ -463,14 +463,14 @@ impl L3 {
         // Install/replace every route for this peer, all pointing at the fresh transport.
         let mut map = self.routes.lock().await;
         for ip in &ips {
-            map.insert(*ip, t.clone());
+            map.insert_host(*ip, t.clone());
         }
     }
 
     /// Drop the route for a specific overlay IP. The datagram pump is keyed by pid,
     /// not by IP, so it is aborted separately (add_peer supersede / remove_by_pid).
     async fn retract_route(&self, ip: IpAddr) {
-        self.routes.lock().await.remove(&ip);
+        self.routes.lock().await.remove_host(&ip);
     }
 
     /// Retract every route a link (by pid) installed and abort its pump. NOT called
@@ -481,7 +481,7 @@ impl L3 {
         if let Some(ips) = self.by_pid.lock().await.remove(pid) {
             let mut map = self.routes.lock().await;
             for ip in ips {
-                map.remove(&ip);
+                map.remove_host(&ip);
             }
         }
         if let Some(r) = self.readers.lock().await.remove(pid) {
@@ -733,6 +733,108 @@ pub async fn run_point_to_point(
 
 /// Destination IP of a raw IP packet (v4 header dst at [16..20], v6 at [24..40]).
 /// `None` for a truncated or non-IP frame.
+/// Does `addr` fall inside the prefix `net/len`?
+///
+/// Pure, so the matching rule is testable without a Transport or a running L3.
+/// Families never mix: a v4 destination cannot match a v6 prefix even when the
+/// bits would line up, which is the bug you get from comparing octet slices
+/// without checking the family first.
+fn prefix_contains(net: IpAddr, len: u8, addr: IpAddr) -> bool {
+    match (net, addr) {
+        (IpAddr::V4(n), IpAddr::V4(a)) => {
+            if len > 32 {
+                return false;
+            }
+            if len == 0 {
+                return true; // /0 is the default route, and shifting by 32 is UB
+            }
+            let mask = u32::MAX << (32 - len);
+            (u32::from(n) & mask) == (u32::from(a) & mask)
+        }
+        (IpAddr::V6(n), IpAddr::V6(a)) => {
+            if len > 128 {
+                return false;
+            }
+            if len == 0 {
+                return true;
+            }
+            let mask = u128::MAX << (128 - len);
+            (u128::from(n) & mask) == (u128::from(a) & mask)
+        }
+        _ => false,
+    }
+}
+
+/// Overlay routing table: exact host routes, plus advertised subnet prefixes.
+///
+/// SPLIT DELIBERATELY. Host routes keep their own `HashMap` and their exact-match
+/// fast path completely unchanged, because that path works and carries every
+/// transfer today. Prefixes are consulted ONLY on a host miss, so adding subnet
+/// routing cannot alter how an existing peer-to-peer packet is routed.
+///
+/// Precedence is host-before-prefix, then longest prefix. A host route is just a
+/// /32 or /128, so "most specific wins" is the single rule; keeping hosts separate
+/// is a performance and blast-radius choice, not a semantic one.
+#[derive(Default)]
+pub(crate) struct RouteTable {
+    hosts: HashMap<IpAddr, Arc<dyn Transport>>,
+    /// (network, prefix_len, via). Small and read on every packet that misses the
+    /// host map, so a linear longest-match scan is the right shape until a node
+    /// carries enough prefixes for that to show up in a profile.
+    subnets: Vec<(IpAddr, u8, Arc<dyn Transport>)>,
+}
+
+impl RouteTable {
+    fn lookup(&self, dst: IpAddr) -> Option<Arc<dyn Transport>> {
+        if let Some(t) = self.hosts.get(&dst) {
+            return Some(t.clone());
+        }
+        self.subnets
+            .iter()
+            .filter(|(net, len, _)| prefix_contains(*net, *len, dst))
+            .max_by_key(|(_, len, _)| *len)
+            .map(|(_, _, t)| t.clone())
+    }
+
+    fn insert_host(&mut self, ip: IpAddr, t: Arc<dyn Transport>) {
+        self.hosts.insert(ip, t);
+    }
+
+    fn remove_host(&mut self, ip: &IpAddr) {
+        self.hosts.remove(ip);
+    }
+
+    fn contains_host(&self, ip: &IpAddr) -> bool {
+        self.hosts.contains_key(ip)
+    }
+
+    /// Test-only, and marked so rather than `allow(dead_code)`: an unused method
+    /// and a test-only method look identical to the compiler, and this tree has
+    /// already been bitten by treating the first as the second.
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.hosts.is_empty() && self.subnets.is_empty()
+    }
+
+    /// Total installed routes, hosts plus prefixes. Total rather than hosts-only
+    /// because the caller asking is checking for LEAKS, and a leaked prefix counts.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.hosts.len() + self.subnets.len()
+    }
+
+    /// Replace every prefix advertised via one peer. Advertisement is a full
+    /// restatement, not a delta: a peer that stops advertising a prefix must have
+    /// it withdrawn, and diffing deltas is how stale routes survive a retraction.
+    #[allow(dead_code)]
+    fn set_subnets(&mut self, via: &Arc<dyn Transport>, prefixes: &[(IpAddr, u8)]) {
+        self.subnets.retain(|(_, _, t)| !Arc::ptr_eq(t, via));
+        for (net, len) in prefixes {
+            self.subnets.push((*net, *len, via.clone()));
+        }
+    }
+}
+
 fn dest_ip(pkt: &[u8]) -> Option<IpAddr> {
     match pkt.first()? >> 4 {
         4 if pkt.len() >= 20 => Some(IpAddr::from([pkt[16], pkt[17], pkt[18], pkt[19]])),
@@ -747,8 +849,9 @@ fn dest_ip(pkt: &[u8]) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dest_ip, render_hosts, sanitize_host};
+    use super::{dest_ip, prefix_contains, render_hosts, sanitize_host, RouteTable, Transport};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::sync::Arc;
 
     #[test]
     fn magicdns_block_roundtrips_without_clobbering() {
@@ -816,6 +919,68 @@ mod tests {
 
     // A transport that carries datagrams but never delivers one, so add_peer's pump
     // parks; we only inspect the route/reader bookkeeping it leaves behind.
+    #[test]
+    fn prefix_matching_is_family_aware_and_handles_the_edges() {
+        let v4 = |s: &str| IpAddr::V4(s.parse::<Ipv4Addr>().unwrap());
+        let v6 = |s: &str| IpAddr::V6(s.parse::<Ipv6Addr>().unwrap());
+
+        assert!(prefix_contains(v4("10.0.0.0"), 24, v4("10.0.0.5")));
+        assert!(!prefix_contains(v4("10.0.0.0"), 24, v4("10.0.1.5")));
+        assert!(prefix_contains(v4("10.0.0.0"), 8, v4("10.9.9.9")));
+
+        // /0 is the default route. Also the shift that would be UB if written
+        // as `<< (32 - 0)`, which is why it is special-cased rather than trusted.
+        assert!(prefix_contains(v4("0.0.0.0"), 0, v4("8.8.8.8")));
+        assert!(prefix_contains(v6("::"), 0, v6("fd00::1")));
+
+        // A full-length prefix is an exact match.
+        assert!(prefix_contains(v4("10.0.0.5"), 32, v4("10.0.0.5")));
+        assert!(!prefix_contains(v4("10.0.0.5"), 32, v4("10.0.0.6")));
+
+        // FAMILIES NEVER MIX, even where the bits would line up.
+        assert!(!prefix_contains(v4("10.0.0.0"), 24, v6("::a00:5")));
+        assert!(!prefix_contains(v6("::"), 0, v4("10.0.0.1")));
+
+        // Nonsense lengths are refused rather than wrapping.
+        assert!(!prefix_contains(v4("10.0.0.0"), 33, v4("10.0.0.1")));
+        assert!(!prefix_contains(v6("fd00::"), 129, v6("fd00::1")));
+
+        assert!(prefix_contains(v6("fd00::"), 16, v6("fd00::1")));
+        assert!(!prefix_contains(v6("fd00::"), 16, v6("fd01::1")));
+    }
+
+    #[test]
+    fn route_lookup_prefers_host_then_longest_prefix() {
+        let v4 = |s: &str| IpAddr::V4(s.parse::<Ipv4Addr>().unwrap());
+        // Distinct Arcs so ptr_eq can tell them apart; the value is irrelevant.
+        let a: Arc<dyn Transport> = Arc::new(DgramTransport);
+        let b: Arc<dyn Transport> = Arc::new(DgramTransport);
+        let c: Arc<dyn Transport> = Arc::new(DgramTransport);
+
+        let mut rt = RouteTable::default();
+        rt.set_subnets(&a, &[(v4("10.0.0.0"), 8)]);
+        rt.set_subnets(&b, &[(v4("10.1.0.0"), 16)]);
+        rt.insert_host(v4("10.1.0.7"), c.clone());
+
+        // Most specific wins: host beats /16 beats /8.
+        assert!(Arc::ptr_eq(&rt.lookup(v4("10.1.0.7")).unwrap(), &c), "host route wins");
+        assert!(Arc::ptr_eq(&rt.lookup(v4("10.1.0.8")).unwrap(), &b), "longer prefix wins");
+        assert!(Arc::ptr_eq(&rt.lookup(v4("10.9.9.9")).unwrap(), &a), "falls back to /8");
+        assert!(rt.lookup(v4("192.168.1.1")).is_none(), "no route is None, not a default");
+
+        // Advertisement is a RESTATEMENT: re-advertising without a prefix withdraws
+        // it. Diffing deltas instead is how a retracted route survives.
+        rt.set_subnets(&a, &[]);
+        assert!(rt.lookup(v4("10.9.9.9")).is_none(), "withdrawn prefix must not linger");
+        assert!(Arc::ptr_eq(&rt.lookup(v4("10.1.0.8")).unwrap(), &b), "other peers unaffected");
+
+        // Host routes are untouched by subnet churn, which is the whole point of
+        // keeping them in a separate map.
+        assert!(Arc::ptr_eq(&rt.lookup(v4("10.1.0.7")).unwrap(), &c));
+        rt.remove_host(&v4("10.1.0.7"));
+        assert!(Arc::ptr_eq(&rt.lookup(v4("10.1.0.7")).unwrap(), &b), "now covered by the /16");
+    }
+
     struct DgramTransport;
     #[async_trait::async_trait]
     impl super::Transport for DgramTransport {
@@ -853,13 +1018,14 @@ mod tests {
 
     // Build an L3 backed by the userspace netstack (no privilege, and refresh_hosts
     // early-returns so the test never touches /etc/hosts). Routing bookkeeping is the
-    // same in kernel and userspace mode - it is just a HashMap keyed by dest IP.
+    // same in kernel and userspace mode - it is a RouteTable: exact host routes
+    // plus advertised prefixes, consulted in that order.
     fn test_l3() -> std::sync::Arc<super::L3> {
         use super::*;
         let ns = std::sync::Arc::new(NetstackTun::open(IFNAME, "fdf1:1af7:c30d::1/128", 1280).unwrap());
         std::sync::Arc::new(L3 {
             tun: ns.clone() as std::sync::Arc<dyn TunDevice>,
-            routes: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            routes: std::sync::Arc::new(tokio::sync::Mutex::new(RouteTable::default())),
             readers: tokio::sync::Mutex::new(HashMap::new()),
             by_pid: tokio::sync::Mutex::new(HashMap::new()),
             identity: None,
@@ -881,8 +1047,8 @@ mod tests {
         l3.add_peer("pidA", "alice", v6, Some(v4), t.clone()).await;
         {
             let map = l3.routes.lock().await;
-            assert!(map.contains_key(&v6), "v6 route installed");
-            assert!(map.contains_key(&v4), "v4 route installed");
+            assert!(map.contains_host(&v6), "v6 route installed");
+            assert!(map.contains_host(&v4), "v4 route installed");
         }
         assert_eq!(l3.readers.lock().await.len(), 1, "exactly one pump per link");
 
@@ -893,8 +1059,8 @@ mod tests {
         l3.add_peer("pidA", "alice", v6b, Some(v4b), t.clone()).await;
         {
             let map = l3.routes.lock().await;
-            assert!(!map.contains_key(&v6) && !map.contains_key(&v4), "stale pair retracted on re-key");
-            assert!(map.contains_key(&v6b) && map.contains_key(&v4b), "new pair installed");
+            assert!(!map.contains_host(&v6) && !map.contains_host(&v4), "stale pair retracted on re-key");
+            assert!(map.contains_host(&v6b) && map.contains_host(&v4b), "new pair installed");
             assert_eq!(map.len(), 2, "no leaked routes");
         }
         assert_eq!(l3.readers.lock().await.len(), 1, "still one pump after supersede");
