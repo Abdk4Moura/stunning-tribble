@@ -467,6 +467,40 @@ impl L3 {
         }
     }
 
+    /// Install the subnet routes a peer is authorized to carry, replacing any it
+    /// previously had.
+    ///
+    /// A RESTATEMENT, matching how the advertisement itself works: whatever the
+    /// peer no longer advertises (or is no longer granted) stops being routed.
+    /// The alternative, adding without removing, is how a revoked route outlives
+    /// its revocation.
+    pub async fn set_peer_subnets(
+        &self,
+        pid: &str,
+        t: &Arc<dyn Transport>,
+        cidrs: &[String],
+    ) {
+        let mut prefixes: Vec<(IpAddr, u8)> = Vec::new();
+        for c in cidrs {
+            // Parsed here rather than trusted: these strings crossed the wire.
+            // A malformed one is dropped, not defaulted, because there is no
+            // safe default for "which network is this".
+            let Some((net, len)) = c.split_once('/') else { continue };
+            let (Ok(net), Ok(len)) = (net.trim().parse::<IpAddr>(), len.trim().parse::<u8>())
+            else {
+                continue;
+            };
+            let max = if net.is_ipv4() { 32 } else { 128 };
+            if len > max {
+                continue;
+            }
+            prefixes.push((net, len));
+        }
+        let mut map = self.routes.lock().await;
+        map.set_subnets(t, &prefixes);
+        let _ = pid; // routes are keyed by transport; pid retracts via remove_by_pid
+    }
+
     /// Drop the route for a specific overlay IP. The datagram pump is keyed by pid,
     /// not by IP, so it is aborted separately (add_peer supersede / remove_by_pid).
     async fn retract_route(&self, ip: IpAddr) {
@@ -733,6 +767,39 @@ pub async fn run_point_to_point(
 
 /// Destination IP of a raw IP packet (v4 header dst at [16..20], v6 at [24..40]).
 /// `None` for a truncated or non-IP frame.
+/// Which advertised prefixes may actually be installed from one peer.
+///
+/// TWO GATES, both required, and they answer different questions:
+///
+/// - `accept_routes` is the RECEIVER's decision: "do I take routes from this
+///   device at all". Off by default, per peer.
+/// - `authorized` is the OWNER's decision, carried by a signed CAP_ROUTE grant
+///   naming that exact prefix as its resource.
+///
+/// Requiring both is not belt-and-braces. The grant says the owner designated
+/// this device to carry this prefix; accept-routes says this machine wants to
+/// route through it. A device can be legitimately granted a prefix that a given
+/// peer still has no business sending its traffic through, and a peer can want
+/// routes from a device the owner never authorized. Neither implies the other.
+///
+/// A verified signature on the advertisement is a THIRD, prior condition handled
+/// by the caller (`Announce::verify_routes`): it establishes who said it, which
+/// is what makes asking these two questions meaningful at all.
+pub(crate) fn installable_routes<F>(
+    advertised: &[String],
+    accept_routes: bool,
+    authorized: F,
+) -> Vec<String>
+where
+    F: Fn(&str) -> bool,
+{
+    if !accept_routes {
+        // Cheap and total: no grant can override the receiver declining.
+        return Vec::new();
+    }
+    advertised.iter().filter(|c| authorized(c)).cloned().collect()
+}
+
 /// Does `addr` fall inside the prefix `net/len`?
 ///
 /// Pure, so the matching rule is testable without a Transport or a running L3.
@@ -826,7 +893,6 @@ impl RouteTable {
     /// Replace every prefix advertised via one peer. Advertisement is a full
     /// restatement, not a delta: a peer that stops advertising a prefix must have
     /// it withdrawn, and diffing deltas is how stale routes survive a retraction.
-    #[allow(dead_code)]
     fn set_subnets(&mut self, via: &Arc<dyn Transport>, prefixes: &[(IpAddr, u8)]) {
         self.subnets.retain(|(_, _, t)| !Arc::ptr_eq(t, via));
         for (net, len) in prefixes {
@@ -919,6 +985,31 @@ mod tests {
 
     // A transport that carries datagrams but never delivers one, so add_peer's pump
     // parks; we only inspect the route/reader bookkeeping it leaves behind.
+    #[test]
+    fn installing_a_route_needs_the_receiver_and_the_owner_to_agree() {
+        let adv = vec!["10.0.0.0/24".to_string(), "192.168.1.0/24".to_string()];
+        let granted = |c: &str| c == "10.0.0.0/24";
+
+        // Both gates open: only the granted prefix installs. An advertisement
+        // for something ungranted is simply not taken, not an error: a peer may
+        // advertise to several receivers with different grants.
+        assert_eq!(
+            super::installable_routes(&adv, true, granted),
+            vec!["10.0.0.0/24".to_string()]
+        );
+
+        // Receiver declines: nothing installs, however well granted. The owner's
+        // grant does not oblige this machine to route through anyone.
+        assert!(super::installable_routes(&adv, false, granted).is_empty());
+
+        // Owner granted nothing: nothing installs, however willing the receiver.
+        assert!(super::installable_routes(&adv, true, |_| false).is_empty());
+
+        // Nothing advertised is trivially nothing installed, which is also the
+        // shape an older peer and a failed route signature both produce.
+        assert!(super::installable_routes(&[], true, |_| true).is_empty());
+    }
+
     #[test]
     fn prefix_matching_is_family_aware_and_handles_the_edges() {
         let v4 = |s: &str| IpAddr::V4(s.parse::<Ipv4Addr>().unwrap());

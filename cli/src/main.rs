@@ -19695,9 +19695,86 @@ async fn recv_cmd(
                                                 ));
                                                 continue;
                                             }
-                                            l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t).await;
+                                            l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t.clone()).await;
                                             ui::say(&format!("  {} L3 peer {who}.mesh ({ip} / {v4})", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                                             devices_touch(&who, Some(ip), Some(v4));
+
+                                            // Subnet routes, after the peer is on
+                                            // the overlay. Three conditions, in
+                                            // increasing cost: the advertisement
+                                            // must be SIGNED (verify_routes, which
+                                            // also covers seq so a withdrawn prefix
+                                            // cannot be resurrected), this machine
+                                            // must ACCEPT routes from this device,
+                                            // and the owner must have GRANTED each
+                                            // prefix by name.
+                                            let advertised = ann.verify_routes(&cb);
+                                            if !advertised.is_empty() {
+                                                let accept = crate::settings::get_str(
+                                                    "accept-routes",
+                                                    Some(&who),
+                                                )
+                                                .map(|v| v == "on" || v == "true")
+                                                .unwrap_or(false);
+                                                let config_dir = crate::settings::config_dir();
+                                                let owner_pk = crate::identity::UserKey::load(
+                                                    &crate::platform::PlatformKeyStore,
+                                                )
+                                                .ok()
+                                                .flatten()
+                                                .map(|k| k.public_key_bytes());
+                                                let idev = conn
+                                                    .link(&pid)
+                                                    .and_then(|l| l.identity_device_pub);
+                                                let iusr = conn
+                                                    .link(&pid)
+                                                    .and_then(|l| l.identity_user_pub);
+                                                let ok = crate::l3::installable_routes(
+                                                    &advertised,
+                                                    accept,
+                                                    |cidr| {
+                                                        let Some(pk) = owner_pk else { return false };
+                                                        let Ok(res) =
+                                                            crate::capability::route_resource_id(
+                                                                &pk, cidr,
+                                                            )
+                                                        else {
+                                                            return false;
+                                                        };
+                                                        matches!(
+                                                            crate::capability::cap_authorize(
+                                                                &config_dir,
+                                                                &res,
+                                                                crate::capability::CAP_ROUTE,
+                                                                idev.as_ref(),
+                                                                iusr.as_ref(),
+                                                                None,
+                                                            ),
+                                                            crate::capability::CapOutcome::Authorized
+                                                        )
+                                                    },
+                                                );
+                                                let declined = advertised.len() - ok.len();
+                                                if declined > 0 {
+                                                    // Say so rather than silently
+                                                    // dropping: an advertisement
+                                                    // that vanishes without a word
+                                                    // is indistinguishable from one
+                                                    // that was never sent.
+                                                    ui::debug(&format!(
+                                                        "  {declined} of {} route(s) from {who} not installed (accept-routes={accept}, or not granted)",
+                                                        advertised.len()
+                                                    ));
+                                                }
+                                                if !ok.is_empty() {
+                                                    l3.set_peer_subnets(&pid, &t, &ok).await;
+                                                    ui::say(&format!(
+                                                        "  {} routes via {who}: {}",
+                                                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                                        ok.join(", ")
+                                                    ));
+                                                }
+                                            }
                                         }
                                         Err(e) => ui::debug(&ui::paint(ui::Tone::Warn, &format!("  L3 announce rejected: {e}"))),
                                     },
