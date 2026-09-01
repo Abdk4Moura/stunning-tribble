@@ -122,6 +122,12 @@ impl OverlayListener {
 /// The TUN interface name the daemon creates for the overlay.
 const IFNAME: &str = "filament0";
 
+/// The overlay interface name, for callers that must name it to the kernel
+/// (the subnet-router forwarding rules).
+pub fn ifname() -> &'static str {
+    IFNAME
+}
+
 pub struct L3 {
     tun: Arc<dyn TunDevice>,
     /// overlay dest IP -> the transport that peer's packets ride. Read on the TUN hot

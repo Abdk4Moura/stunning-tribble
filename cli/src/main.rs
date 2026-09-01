@@ -18,6 +18,7 @@
 mod codeentry;
 mod armed;
 mod ctl;
+mod subnet_forward;
 mod diag;
 use filament_transport::direct;
 mod doctor;
@@ -6703,6 +6704,11 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
         let n = interrupted.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
+            // Remove any subnet-router forwarding rules this process installed.
+            // A FORWARD ACCEPT that outlives the daemon keeps the machine
+            // forwarding for an overlay that is gone, and nothing would report
+            // it.
+            subnet_forward::cleanup();
             n.notify_one();
         });
     }
@@ -17325,6 +17331,43 @@ async fn recv_cmd(
                     match l3::L3::start(&cidr, 1280, identity, mode) {
                         Ok(m) => {
                             let addr = m.my_addr().map(|a| a.to_string()).unwrap_or(cidr);
+
+                            // Subnet router: if this machine offers prefixes, make
+                            // the kernel actually carry them. Only in kernel-TUN
+                            // mode, because userspace has no kernel route to
+                            // forward FROM, and saying "routing" while forwarding
+                            // nothing is the failure this whole module is written
+                            // against.
+                            let advertised: Vec<String> = settings::get_str("advertise-routes", None)
+                                .unwrap_or_default()
+                                .split(',')
+                                .map(|c| c.trim().to_string())
+                                .filter(|c| !c.is_empty())
+                                .collect();
+                            if !advertised.is_empty() {
+                                if m.is_userspace() {
+                                    ui::say(&ui::paint(ui::Tone::Warn, &format!(
+                                        "  advertise-routes is set ({}) but L3 is in userspace mode; a subnet router needs the kernel TUN, so nothing is being carried",
+                                        advertised.join(", ")
+                                    )));
+                                } else {
+                                    let snat = settings::get_bool("route-snat", None);
+                                    match subnet_forward::enable(l3::ifname(), &advertised, snat) {
+                                        Ok(_applied) => ui::say(&format!(
+                                            "  {} carrying {} for peers{}",
+                                            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                            advertised.join(", "),
+                                            if snat { " (masqueraded)" } else { "" }
+                                        )),
+                                        // LOUD, not swallowed: a router that cannot
+                                        // forward must not look like one that can.
+                                        Err(e) => ui::say(&ui::paint(ui::Tone::Err, &format!(
+                                            "  cannot carry {}: {e}",
+                                            advertised.join(", ")
+                                        ))),
+                                    }
+                                }
+                            }
                             if m.is_userspace() {
                                 ui::say(&format!(
                                     "  {} L3 overlay {} (userspace, zero privilege)",

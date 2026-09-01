@@ -183,6 +183,21 @@ pub fn registry() -> &'static [Setting] {
             help: "CIDRs this machine can reach and offers to carry for peers (a subnet router). Reaching a LAN needs this on the machine that sits on it; peers additionally need accept-routes for this device.",
         },
         Setting {
+            key: "route-snat",
+            aliases: &["masquerade"],
+            kind: Kind::Bool,
+            store: "route-snat",
+            // ON by default: a LAN host replying to an overlay address it has no
+            // route for is the common case, and without masquerading the reply is
+            // simply lost. Off is correct only when the LAN routes back to the
+            // overlay, which is the rarer, deliberate setup.
+            default: "on",
+            scope: ScopeKind::GlobalOnly,
+            env: None,
+            daemon: true,
+            help: "Masquerade forwarded subnet traffic as this machine, so LAN hosts can reply without a route back to the overlay. Turn off only if the LAN already routes to your overlay range.",
+        },
+        Setting {
             key: "accept-routes",
             aliases: &["accept"],
             store: "accept-routes",
