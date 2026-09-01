@@ -59,6 +59,61 @@ pub const SCOPED_DEFAULT_ACTIONS: &[&str] = &[CAP_TRANSFER, CAP_MOUNT];
 // can still pass an unregistered literal. A typed Action newtype is a follow-up
 // hardening task; current predicates and tests cover the declared vocabulary.
 
+/// Split a grant spec into (action, resource) for the cap store.
+///
+/// `shell` -> ("shell", "self"): the capability acts on the owner's own machine,
+/// which is the only resource those verbs have ever had.
+///
+/// `route:10.0.0.0/24` -> ("route", <owner-bound resource id>): the prefix IS the
+/// resource, so the capability name alone cannot express the grant. Carried in
+/// the capability argument rather than behind a new flag, so the whole grant is
+/// one token and `grant <device> route:10.0.0.0/24` reads as one thing.
+///
+/// Refuses a route with no prefix, and a non-route with one. Both are the same
+/// mistake in opposite directions: a resource that does not match the action's
+/// arity, which would otherwise store a grant that can never be matched at
+/// enforcement time and so silently authorize nothing.
+pub struct GrantSpec {
+    pub action: String,
+    pub resource: String,
+    /// The nonce the resource id was derived from. Returned rather than
+    /// recomputed by the caller: the genesis header must be filed under the same
+    /// (owner_pub, nonce) the id came from, and a second parse in a second place
+    /// is how two implementations of one rule drift apart.
+    pub nonce: [u8; 32],
+}
+
+pub fn parse_grant_spec(spec: &str, owner_pub: &[u8; 32]) -> Result<GrantSpec> {
+    let (name, rest) = match spec.split_once(':') {
+        Some((n, r)) => (n, Some(r)),
+        None => (spec, None),
+    };
+    let action = canonical_capability(name)?;
+    if action == CAP_ROUTE {
+        let Some(cidr) = rest.map(str::trim).filter(|c| !c.is_empty()) else {
+            anyhow::bail!(
+                "'route' authorizes a specific prefix, so it needs one: try 'route:10.0.0.0/24'"
+            );
+        };
+        let normalized = normalize_cidr(cidr)?;
+        let nonce = route_resource_nonce(&normalized);
+        Ok(GrantSpec {
+            action,
+            resource: make_resource_id(owner_pub, &nonce),
+            nonce,
+        })
+    } else {
+        if rest.is_some() {
+            anyhow::bail!("'{action}' applies to the device itself and takes no ':' resource");
+        }
+        Ok(GrantSpec {
+            action,
+            resource: "self".to_string(),
+            nonce: self_resource_nonce(),
+        })
+    }
+}
+
 /// Normalize and validate a capability name at an API boundary.
 pub fn canonical_capability(name: &str) -> Result<String> {
     let normalized = name.trim().to_ascii_lowercase();
@@ -1553,6 +1608,43 @@ pub fn apply_cap_op(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grant_spec_arity_is_enforced_in_both_directions() {
+        let owner = [3u8; 32];
+
+        // Ordinary capabilities act on "self" and take no resource.
+        let g = parse_grant_spec("shell", &owner).unwrap();
+        assert_eq!((g.action.as_str(), g.resource.as_str()), ("shell", "self"));
+        let g = parse_grant_spec(" Transfer ", &owner).unwrap();
+        assert_eq!((g.action.as_str(), g.resource.as_str()), ("transfer", "self"));
+
+        // A route carries its prefix, and the resource is the owner-bound id.
+        let g = parse_grant_spec("route:10.0.0.0/24", &owner).unwrap();
+        assert_eq!(g.action, "route");
+        let r = g.resource.clone();
+        assert_eq!(r, route_resource_id(&owner, "10.0.0.0/24").unwrap());
+        // The returned nonce must be the one the id came from, or the genesis
+        // header would be filed under a resource it does not describe.
+        assert_eq!(make_resource_id(&owner, &g.nonce), r);
+
+        // Spelling still does not matter, because the id normalizes.
+        let g2 = parse_grant_spec("route: 10.0.0.5/24 ", &owner).unwrap();
+        assert_eq!(r, g2.resource);
+
+        // BOTH arity mistakes are refused. A route with no prefix would store a
+        // grant that matches nothing; a non-route with one would store a resource
+        // enforcement never asks about. Either way the grant silently authorizes
+        // nothing, which is worse than an error because it looks like it worked.
+        assert!(parse_grant_spec("route", &owner).is_err(), "route needs a prefix");
+        assert!(parse_grant_spec("route:", &owner).is_err(), "empty prefix is not a prefix");
+        assert!(parse_grant_spec("shell:10.0.0.0/24", &owner).is_err(), "shell takes no resource");
+
+        // And a malformed prefix is refused rather than hashed into a resource
+        // that can never match.
+        assert!(parse_grant_spec("route:not-a-cidr", &owner).is_err());
+        assert!(parse_grant_spec("route:10.0.0.0/33", &owner).is_err());
+    }
+
     #[test]
     fn cidr_normalization_closes_the_bypasses_it_exists_for() {
         // Host bits set. `10.0.0.5/24` and `10.0.0.0/24` are the SAME prefix, and

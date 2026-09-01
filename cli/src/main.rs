@@ -1035,7 +1035,7 @@ enum Cmd {
     Grant {
         /// Known device (petname), or omit with --tag
         device: String,
-        /// Capability to grant (e.g. `shell`)
+        /// Capability to grant (e.g. `shell`, or `route:10.0.0.0/24`)
         capability: String,
         /// Target a tag instead of a device
         #[arg(long)]
@@ -13730,7 +13730,10 @@ async fn main() -> Result<()> {
             doctor::doctor_cmd(&server, device, watch, repeat, json || ui_caps.json, relay).await
         }
         Cmd::Grant { device, capability, tag } => {
-            let capability = crate::capability::canonical_capability(&capability)?;
+            // The owner key resolves the RESOURCE, so it is needed before the
+            // capability name is final: `route:10.0.0.0/24` names an owner-bound
+            // resource, while `shell` names "self".
+            let spec = capability;
             let config_dir = crate::settings::config_dir();
             let mut store = crate::capability::load_cap_store(&config_dir);
 
@@ -13740,6 +13743,8 @@ async fn main() -> Result<()> {
                     bail!("identity not initialized");
                 };
                 let pk = user_key.public_key_bytes();
+                let g = crate::capability::parse_grant_spec(&spec, &pk)?;
+                let (capability, resource) = (g.action.clone(), g.resource.clone());
                 let target_bytes = crate::capability::make_tag_target(&pk, t);
                 let ver = crate::capability::hlc_next(0, crate::capability::now_ms());
                 let mut op = crate::capability::CapOp {
@@ -13747,7 +13752,7 @@ async fn main() -> Result<()> {
                     grantor: pk,
                     target_kind: 0x03,
                     target: target_bytes,
-                    resource: "self".to_string(),
+                    resource: resource.clone(),
                     permissions: vec![capability.clone()],
                     expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
                     issued_at: crate::capability::now_secs(),
@@ -13761,7 +13766,36 @@ async fn main() -> Result<()> {
                 println!("granted '{capability}' to tag '{t}'.");
                 return Ok(());
             }
-            // Original device grant path (unchanged)
+            // Device path. The owner key is needed up front for the same reason
+            // as the tag path: it resolves a `route:CIDR` spec to its owner-bound
+            // resource id. A route grant therefore requires an identity, which is
+            // correct rather than incidental: the resource IS the owner's
+            // authority over that prefix, so there is nothing to bind it to
+            // without one.
+            let owner_pk = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
+                .ok()
+                .flatten()
+                .map(|k| k.public_key_bytes());
+            let (capability, cap_resource, cap_nonce) = match owner_pk {
+                Some(pk) => {
+                    let g = crate::capability::parse_grant_spec(&spec, &pk)?;
+                    (g.action, g.resource, g.nonce)
+                }
+                None => {
+                    // No identity: only the legacy self-scoped verbs are possible.
+                    if spec.contains(':') {
+                        bail!(
+                            "'{spec}' names a resource, which needs an identity to bind it to. Run `filament init` first."
+                        );
+                    }
+                    (
+                        crate::capability::canonical_capability(&spec)?,
+                        "self".to_string(),
+                        crate::capability::self_resource_nonce(),
+                    )
+                }
+            };
+
             // A delegated device's authority comes from its enrollment ceiling,
             // which enforcement reads from its fleet certificate; a grant targets
             // a key the device never presents, so it cannot bind. Refuse rather
@@ -13784,15 +13818,22 @@ async fn main() -> Result<()> {
                 let mut store = crate::capability::load_cap_store(&config_dir);
                 let pk = user_key.public_key_bytes();
 
-                // Ensure a genesis header exists for resource "self"
+                // Ensure a genesis header exists for the resource being granted.
+                // Keyed by the RESOURCE, so a route prefix gets its own header
+                // rather than riding on "self": each prefix is a distinct
+                // resource with its own succession, which is what lets one
+                // prefix be revoked without touching another.
                 let has_header = store.iter().any(|e| {
                     e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
-                        && e["resource"].as_str() == Some("self")
+                        && e["resource"].as_str() == Some(cap_resource.as_str())
                 });
                 if !has_header {
                     let pk = user_key.public_key_bytes();
-                    let nonce = crate::capability::self_resource_nonce();
-                    let resource = crate::capability::self_resource_id(&pk);
+                    // The nonce must match the one the resource id was derived
+                    // from, or the header does not describe the resource it is
+                    // filed under.
+                    let nonce = cap_nonce;
+                    let resource = cap_resource.clone();
                     let mut hdr = crate::capability::CapHeader {
                         resource,
                         epoch: 0,
@@ -13813,7 +13854,7 @@ async fn main() -> Result<()> {
                     // the grant-creation path, not the authorize path). Consistent with
                     // Cmd::Grant which does the same. The header is trusted local state
                     // in the owner's own caps.json, not a cross-verified object.
-                    hdr_json["resource"] = serde_json::json!("self");
+                    hdr_json["resource"] = serde_json::json!(cap_resource.clone());
                     store.push(hdr_json);
                 }
 
@@ -13855,7 +13896,7 @@ async fn main() -> Result<()> {
                     grantor: pk,
                     target_kind: 0x00, // User
                     target: target_arr,
-                    resource: "self".to_string(),
+                    resource: cap_resource.clone(),
                     permissions: vec![capability.clone()],
                     expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
                     issued_at: crate::capability::now_secs(),
