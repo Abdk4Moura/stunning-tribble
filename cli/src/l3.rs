@@ -578,12 +578,34 @@ impl L3 {
         if self.netstack.is_some() {
             return;
         }
-        let desired: std::collections::HashSet<String> = self
+        // A DEFAULT ROUTE IS NOT A SUBNET ROUTE. `10.66.0.0/24 dev filament0` is
+        // additive; `0.0.0.0/0 dev filament0` captures every packet this machine
+        // sends, including the ones carrying the overlay. Installed into the main
+        // table it routes the tunnel through the tunnel: the link dies, the route
+        // is withdrawn, the link returns, and the machine oscillates, having
+        // usually lost the path to the signaling server first, so it cannot even
+        // be told to stop.
+        //
+        // Accepting one safely needs the policy-routing plan in `exit_route`
+        // (separate table, rule, and carve-outs for the peer's own endpoint and
+        // the signaling server). The carve-out for the PEER needs its underlay
+        // address, and `net::Transport` does not expose one, so this refuses
+        // loudly instead of installing something that disconnects the machine.
+        // Advertising a default route already works; it is accepting one that
+        // waits on that accessor.
+        let (defaults, subnets): (Vec<_>, Vec<_>) = self
             .subnet_prefixes()
             .await
             .into_iter()
-            .map(|(n, l)| format!("{n}/{l}"))
-            .collect();
+            .partition(|(n, l)| crate::exit_route::is_default_route(*n, *l));
+        for (n, l) in &defaults {
+            crate::ui::say(&format!(
+                "  {} not installing default route {n}/{l} from a peer: accepting an exit node needs the underlay carve-out (see exit_route)",
+                crate::ui::paint(crate::ui::Tone::Warn, crate::ui::glyph_warn())
+            ));
+        }
+        let desired: std::collections::HashSet<String> =
+            subnets.into_iter().map(|(n, l)| format!("{n}/{l}")).collect();
         let mut installed = self.kernel_subnets.lock().await;
         for cidr in desired.difference(&installed).cloned().collect::<Vec<_>>() {
             match crate::tun::add_route(&cidr, ifname()) {

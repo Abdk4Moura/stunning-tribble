@@ -172,3 +172,58 @@ two phases is the owner-signed ceiling.
 
     ceiling without route:  refused, LAN unreachable
     ceiling with route:     10.66.0.0/24 dev filament0, LAN REACHABLE
+
+## Exit nodes (2026-09-02): the plan, and why only the guard is landed
+
+An exit node is a subnet router advertising a default route, so the wire
+protocol, the capability, the ceiling and the forwarding are already done. The
+ADVERTISING side works today: set `advertise-routes 0.0.0.0/0` and the router
+masquerades and forwards exactly as it does for a LAN prefix.
+
+Accepting one is a different problem. `10.66.0.0/24 dev filament0` is additive.
+`0.0.0.0/0 dev filament0` captures every packet the machine sends, including the
+ones carrying the overlay. Installed into the main table it routes the tunnel
+through the tunnel: the link dies, the route is withdrawn, the link returns, and
+the machine oscillates. The first packet lost is usually the one to the
+signaling server, so the node cannot even be told to stop.
+
+### The plan
+
+Put the default route in a dedicated table (51820) with a rule at priority 5182,
+above the main-table rule, and carve the untouchable traffic back out by longest
+prefix INSIDE that table. Carve-outs belong in the table rather than as
+higher-priority rules so that tearing the table down removes them too; a
+carve-out that outlives its default route is a silent hole in the user's routing.
+
+Carved out, each mandatory rather than tidy:
+
+- **the peer's own underlay address**, or the tunnel runs through the tunnel.
+- **the signaling server**, or the node cannot renegotiate, cannot be told to
+  stop, and cannot recover by itself.
+- **loopback and link-local**, which were never ours to capture.
+- **RFC1918 by default.** An exit node is for reaching the internet. Silently
+  capturing the LAN breaks printers and NAS boxes with no symptom other than
+  "the network broke when I turned this on". A subnet route deliberately
+  advertised for a LAN prefix still wins inside the table by being longer.
+
+Two ordering constraints make partial states safe. On the way IN, carve-outs are
+installed before the default route: a crash then leaves a table of exceptions,
+which is harmless, rather than a table containing only a trap. On the way OUT,
+the rule is deleted before the table is flushed: while the rule exists a
+consulted-but-empty table black-holes instead of falling through.
+
+### What is landed, and what blocks the rest
+
+Landed and wired: detection, plus a guard in `L3::sync_kernel_subnets` that
+refuses a peer's default route out loud instead of installing it. That guard
+fixes a real hazard introduced when subnet routes landed, because until now a
+peer advertising `0.0.0.0/0` to a node with `accept-routes` on would have had it
+written straight into the main table.
+
+Not landed: the planner. The carve-out for the peer needs its underlay address
+and `net::Transport` has no endpoint accessor, so the code would have been
+correct, tested, and called by nothing. This repository has already been burned
+by exactly that (the WireGuard L3 module: declared, zero callers, described in
+the roadmap as ready), and the artifact registry's own rule is that the unwired
+set may only shrink. Adding `Transport::remote_endpoint` is the next step, and
+the plan above is the specification for what to wire to it.
