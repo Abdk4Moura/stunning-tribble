@@ -124,6 +124,20 @@ const IFNAME: &str = "filament0";
 
 /// The overlay interface name, for callers that must name it to the kernel
 /// (the subnet-router forwarding rules).
+/// The prefixes this machine offers to carry, as configured.
+///
+/// One reader for every announce path, so a route cannot be forwarded by the
+/// kernel but omitted from the wire (or the reverse) because two call sites
+/// parsed the same setting differently.
+pub fn advertised_prefixes() -> Vec<String> {
+    crate::settings::get_str("advertise-routes", None)
+        .unwrap_or_default()
+        .split(',')
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
 pub fn ifname() -> &'static str {
     IFNAME
 }
@@ -145,6 +159,11 @@ pub struct L3 {
     /// This node's overlay identity (crypto mode) for signing announces; `None` in
     /// manual/PSK addressing mode (no announce, routes added out of band).
     identity: Option<Identity>,
+    /// Subnet prefixes THIS node has installed into the kernel routing table, so
+    /// reconciliation can withdraw one that is no longer advertised. Tracked
+    /// rather than re-read from the kernel so filament only ever deletes routes
+    /// it created, and never a route the operator put there.
+    kernel_subnets: Mutex<std::collections::HashSet<String>>,
     /// Highest announce sequence ACCEPTED from each peer identity, so a stale
     /// announce cannot roll an address back. Keyed by the announcing PUBKEY,
     /// not by pid: pid is a session artefact, and the signature binds the key.
@@ -219,6 +238,7 @@ impl L3 {
             readers: Mutex::new(HashMap::new()),
             by_pid: Mutex::new(HashMap::new()),
             identity,
+            kernel_subnets: Mutex::new(std::collections::HashSet::new()),
             seen_seq: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
             netstack,
@@ -365,7 +385,20 @@ impl L3 {
         // PERSISTED, not an in-process counter. See overlay::next_announce_seq
         // for why: a counter that restarts at zero gets a restarted peer
         // rejected forever by the very check below.
-        Some(id.announce(crate::overlay::next_announce_seq(), cb))
+        let seq = crate::overlay::next_announce_seq();
+        // CARRY THE ADVERTISED PREFIXES. This used to call `announce`, which
+        // hardcodes `routes: Vec::new()`, so a router configured with
+        // advertise-routes set up its own forwarding, printed "carrying
+        // 10.66.0.0/24 for peers", and then told no one. The receiving half was
+        // complete and correct the whole time: it called verify_routes, found an
+        // empty set, and installed nothing. Nothing logged an error at either
+        // end, because neither end was wrong on its own.
+        let routes = advertised_prefixes();
+        if routes.is_empty() {
+            Some(id.announce(seq, cb))
+        } else {
+            Some(id.announce_with_routes(seq, cb, routes))
+        }
     }
 
     /// Accept an announce's sequence number, or reject it as stale.
@@ -480,6 +513,15 @@ impl L3 {
     /// peer no longer advertises (or is no longer granted) stops being routed.
     /// The alternative, adding without removing, is how a revoked route outlives
     /// its revocation.
+    /// Every subnet prefix currently carried, across all peers.
+    ///
+    /// The kernel table is reconciled against this UNION rather than against one
+    /// peer's list, because two peers may advertise overlapping prefixes and a
+    /// withdrawal by one must not delete a route the other still provides.
+    pub async fn subnet_prefixes(&self) -> Vec<(IpAddr, u8)> {
+        self.routes.lock().await.subnets.iter().map(|(n, l, _)| (*n, *l)).collect()
+    }
+
     pub async fn set_peer_subnets(
         &self,
         pid: &str,
@@ -502,9 +544,55 @@ impl L3 {
             }
             prefixes.push((net, len));
         }
-        let mut map = self.routes.lock().await;
-        map.set_subnets(t, &prefixes);
+        {
+            let mut map = self.routes.lock().await;
+            map.set_subnets(t, &prefixes);
+        }
         let _ = pid; // routes are keyed by transport; pid retracts via remove_by_pid
+        self.sync_kernel_subnets().await;
+    }
+
+    /// Make the KERNEL routing table match the prefixes we accepted.
+    ///
+    /// Without this the whole path is invisible to the operating system: the
+    /// advertisement verifies, authorization passes, the prefix lands in the
+    /// in-process table, `filament` prints "routes via <peer>", and `ip route`
+    /// still shows nothing, so the kernel never hands those packets to the TUN
+    /// and every ping fails. The in-process table decides which TRANSPORT a
+    /// packet rides once it reaches us; it cannot make the kernel deliver the
+    /// packet in the first place. A peer's overlay address needs no such route
+    /// because it falls inside the TUN's own prefix. A foreign LAN prefix does
+    /// not, which is exactly what a subnet route is.
+    ///
+    /// Reconciles rather than appends, so a withdrawn prefix is removed.
+    async fn sync_kernel_subnets(&self) {
+        // Kernel-TUN mode only. In userspace mode there is no such device, and
+        // "ip route replace dev filament0" would fail on every announcement;
+        // checking for the interface says so once, honestly, instead.
+        if !std::path::Path::new(&format!("/sys/class/net/{}", ifname())).exists() {
+            return;
+        }
+        let desired: std::collections::HashSet<String> = self
+            .subnet_prefixes()
+            .await
+            .into_iter()
+            .map(|(n, l)| format!("{n}/{l}"))
+            .collect();
+        let mut installed = self.kernel_subnets.lock().await;
+        for cidr in desired.difference(&installed).cloned().collect::<Vec<_>>() {
+            match crate::tun::add_route(&cidr, ifname()) {
+                Ok(()) => {
+                    installed.insert(cidr);
+                }
+                Err(e) => crate::ui::debug(&format!("  could not install route {cidr}: {e}")),
+            }
+        }
+        for cidr in installed.difference(&desired).cloned().collect::<Vec<_>>() {
+            if let Err(e) = crate::tun::del_route(&cidr, ifname()) {
+                crate::ui::debug(&format!("  could not withdraw route {cidr}: {e}"));
+            }
+            installed.remove(&cidr);
+        }
     }
 
     /// Drop the route for a specific overlay IP. The datagram pump is keyed by pid,
@@ -1126,6 +1214,7 @@ mod tests {
             readers: tokio::sync::Mutex::new(HashMap::new()),
             by_pid: tokio::sync::Mutex::new(HashMap::new()),
             identity: None,
+            kernel_subnets: tokio::sync::Mutex::new(std::collections::HashSet::new()),
             seen_seq: Mutex::new(HashMap::new()),
             names: tokio::sync::Mutex::new(HashMap::new()),
             netstack: Some(ns),

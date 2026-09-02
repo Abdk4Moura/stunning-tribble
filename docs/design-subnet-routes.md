@@ -103,3 +103,72 @@ transit. `Announce` lives in the `filament-overlay` crate, so this is a publishe
 wire-format change and needs forward compatibility: an older peer must ignore an
 unknown field rather than reject the announce. There is precedent in the same
 message (`dg_relay`, which older peers discard silently).
+
+## What the two-machine experiment changed (2026-09-01)
+
+The design above was complete and every unit test passed while the feature did
+not work at all. Running it between two real machines (do-vm and a KVM VPS,
+`experiments/subnet-route-e2e.sh`) found six defects, five of which no unit test
+could have caught because each lived in the seam between two components that
+were individually correct.
+
+1. **The advertisement was never sent.** Both announce paths called
+   `announce()`, which hardcodes `routes: Vec::new()`. The router configured its
+   own forwarding and printed "carrying 10.66.0.0/24 for peers"; the receiver
+   called `verify_routes`, got an empty set, and installed nothing. Neither end
+   was wrong on its own, so neither logged an error.
+
+2. **No kernel route was installed.** An accepted prefix updated only the
+   in-process `RouteTable`, which decides which transport a packet rides *after*
+   it reaches us. It cannot make the kernel deliver the packet in the first
+   place. `filament` printed "routes via <peer>" while `ip route` showed nothing.
+
+3. **`route` was missing from the invitation bitmask**, and the encoder ended in
+   `.unwrap_or(0)`, so an unencodable capability silently collapsed the WHOLE
+   ceiling to empty. `add --allow transfer,mount,route` minted a valid, signed
+   invitation conferring nothing. Now rejected at mint, with a round-trip test
+   over `CANONICAL_CAPABILITIES` so a future capability cannot repeat it.
+
+4. **`mint_capability` was a second hardcoded capability list** that never
+   learned about `route`, so `add --allow route` was refused outright. The CLI
+   printed "re-invite with route in the invitation" as the remedy for a ceiling
+   error and then rejected that exact command. Now derived from
+   `CANONICAL_CAPABILITIES`.
+
+5. **Enforcement read the owner key the wrong way.** `UserKey::load` returns
+   `None` on a joined device, so deriving the resource id from it made every
+   fleet member refuse every route: precisely the population subnet routes exist
+   for. Verification needs only the owner's PUBLIC key, which a joined device
+   carries in its own certificate.
+
+6. **The ceiling was read from the link's principal.** A peer reconnecting
+   through fleet-hello is admitted by `admit_fleet` as `FleetDevice`, which
+   carries no caps; only a fresh enrollment yields `Delegated { caps }`. Matching
+   on `Delegated` worked exactly once per join and silently stopped after the
+   first reconnect. The persisted record is now the single source, the same one
+   `devices` renders and `grant` consults.
+
+### Authorization model, as it actually resolved
+
+For a FLEET MEMBER the invitation ceiling IS the grant. No CapOp can bind to
+one: a CapOp targets the owner user key that every member presents, so it cannot
+name a single device, and `grant` refuses outright rather than report a success
+enforcement would not honour. Authorization therefore comes from the
+owner-signed invitation, the same place `transfer` and `mount` come from.
+
+**Known coarseness, recorded rather than hidden.** A ceiling carries an ACTION
+and no resource, so `route` in a ceiling authorizes ANY prefix that member
+advertises, including `0.0.0.0/0`. Two things bound it: `accept-routes` is off by
+default and is settable per peer, so nothing installs without the receiver opting
+in. Narrowing it to a per-prefix ceiling needs a v3 invitation token, because v2
+encodes capabilities as an 8-bit mask with nowhere to put a CIDR. Until then the
+prefix-bound `route:<cidr>` resource is the model for owner-to-owner grants,
+and the ceiling is the model for fleet members.
+
+### The result
+
+Two real machines, one prefix, one code path; the only difference between the
+two phases is the owner-signed ceiling.
+
+    ceiling without route:  refused, LAN unreachable
+    ceiling with route:     10.66.0.0/24 dev filament0, LAN REACHABLE

@@ -40,7 +40,7 @@ pub use netstack::{NetstackListener, NetstackStream, NetstackTun};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{add_addr, add_route, ensure_hosts_writable, ensure_net_admin_for_l3, KernelTun};
+pub use linux::{add_addr, add_route, del_route, ensure_hosts_writable, ensure_net_admin_for_l3, KernelTun};
 
 #[cfg(target_os = "macos")]
 mod macos;
