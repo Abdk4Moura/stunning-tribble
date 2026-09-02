@@ -45,9 +45,9 @@ pub use linux::{add_addr, add_route, del_route, ensure_hosts_writable, ensure_ne
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::{add_addr, add_route, ensure_hosts_writable, ensure_net_admin_for_l3, KernelTun};
+pub use macos::{add_addr, add_route, del_route, ensure_hosts_writable, ensure_net_admin_for_l3, KernelTun};
 
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-pub use windows::{add_addr, add_route, ensure_hosts_writable, ensure_net_admin_for_l3, KernelTun};
+pub use windows::{add_addr, add_route, del_route, ensure_hosts_writable, ensure_net_admin_for_l3, KernelTun};

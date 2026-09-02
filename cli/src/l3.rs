@@ -566,10 +566,16 @@ impl L3 {
     ///
     /// Reconciles rather than appends, so a withdrawn prefix is removed.
     async fn sync_kernel_subnets(&self) {
-        // Kernel-TUN mode only. In userspace mode there is no such device, and
-        // "ip route replace dev filament0" would fail on every announcement;
-        // checking for the interface says so once, honestly, instead.
-        if !std::path::Path::new(&format!("/sys/class/net/{}", ifname())).exists() {
+        // Kernel-TUN mode only: in userspace mode there is no OS device to route
+        // at, and the route command would fail on every announcement.
+        //
+        // Asked of the endpoint, not of the filesystem. This was a
+        // /sys/class/net/<if> existence check, which is Linux-only: on macOS the
+        // path never exists, so the guard would have returned early forever and
+        // silently disabled subnet-route RECEPTION on that platform, with no
+        // error anywhere. `netstack` is Some exactly when we fell back to
+        // userspace, which is the question actually being asked.
+        if self.netstack.is_some() {
             return;
         }
         let desired: std::collections::HashSet<String> = self
