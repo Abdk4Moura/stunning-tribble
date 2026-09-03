@@ -20054,7 +20054,23 @@ async fn recv_cmd(
                                             // and the owner must have GRANTED each
                                             // prefix by name.
                                             let advertised = ann.verify_routes(&cb);
-                                            if !advertised.is_empty() {
+                                            // NO EMPTY-SET SHORTCUT. An announce
+                                            // carrying no routes is not "nothing
+                                            // to do", it is a WITHDRAWAL, and
+                                            // set_peer_subnets is a full
+                                            // restatement of what this peer
+                                            // carries. Skipping the block left a
+                                            // withdrawn route installed forever:
+                                            // the operator cleared
+                                            // advertise-routes, the peer stopped
+                                            // advertising, and the receiver kept
+                                            // routing through it. For an exit
+                                            // node that is not a stale entry, it
+                                            // is a default route pointing into a
+                                            // tunnel nobody is carrying, which
+                                            // is indistinguishable from the
+                                            // machine losing the internet.
+                                            {
                                                 let accept = crate::settings::get_str(
                                                     "accept-routes",
                                                     Some(&who),
@@ -20182,8 +20198,24 @@ async fn recv_cmd(
                                                         advertised.len()
                                                     ));
                                                 }
+                                                // ALWAYS restate, including the
+                                                // empty case. set_peer_subnets is
+                                                // a full restatement of what this
+                                                // peer carries, so an empty list
+                                                // is how a WITHDRAWAL is applied.
+                                                // Skipping it left a withdrawn
+                                                // route installed forever: the
+                                                // operator ran
+                                                // `set advertise-routes ''`, the
+                                                // peer stopped advertising, and
+                                                // the receiver kept routing
+                                                // through it. With an exit node
+                                                // that is not a stale route, it
+                                                // is a machine with a default
+                                                // route pointing into a tunnel
+                                                // nobody is carrying.
+                                                l3.set_peer_subnets(&pid, &t, &ok).await;
                                                 if !ok.is_empty() {
-                                                    l3.set_peer_subnets(&pid, &t, &ok).await;
                                                     ui::say(&format!(
                                                         "  {} routes via {who}: {}",
                                                         ui::paint(ui::Tone::Ok, ui::glyph_ok()),

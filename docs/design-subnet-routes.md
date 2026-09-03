@@ -227,3 +227,52 @@ by exactly that (the WireGuard L3 module: declared, zero callers, described in
 the roadmap as ready), and the artifact registry's own rule is that the unwired
 set may only shrink. Adding `Transport::remote_endpoint` is the next step, and
 the plan above is the specification for what to wire to it.
+
+## Exit nodes: working, measured on two machines (2026-09-03)
+
+`experiments/exit-node-e2e.sh` measures the only thing that settles it, the public
+address the receiver presents to the world:
+
+    before:         165.22.207.231   (the receiver's own address)
+    with exit node: 162.35.114.254   (the router's address)
+
+Reproduced on three consecutive runs. The link carrying the route stays up
+throughout, which is the hard part.
+
+The receiver runs inside a network namespace while the control channel runs in
+the root namespace. That is not tidiness: a wrong default route disconnects the
+machine that installs it, and this arrangement means a failure costs a namespace
+rather than the box.
+
+### Corrections the rig forced, none of which a unit test could reach
+
+1. **`Transport::remote_addr` already existed.** An earlier note here claimed
+   exit nodes were blocked on adding it. That was wrong, and wrong in a specific
+   way worth naming: the trait was inspected with a line-range that stopped at
+   line 400, and the method is at 474. A blocker asserted from a truncated read.
+2. **IPv6 carve-outs killed every install.** `signaling_addrs` returns AAAA
+   records too, and `ip route ... via <v4 gateway>` rejects a v6 destination
+   ("inet6 address is expected"). An IPv4 default route never captures v6
+   traffic, so those carve-outs were both impossible and unnecessary.
+3. **The router masqueraded to loopback.** `egress_for` asked
+   `ip route get 0.0.0.0`, which answers `local 0.0.0.0 dev lo`, because 0.0.0.0
+   is a local special address and not a destination. The receiver's policy
+   routing was perfect and the packets went nowhere. A default route must probe
+   a routable address to learn which interface reaches the internet.
+4. **Clearing a list setting was refused.** `set advertise-routes ''` failed with
+   "needs a comma-separated list", so a node could start carrying its peers'
+   traffic with no supported way to stop.
+5. **An empty advertisement was treated as nothing to do.** Both the outer and
+   inner guards skipped the block when a peer advertised no routes, but
+   `set_peer_subnets` is a full restatement, so an empty set is precisely how a
+   WITHDRAWAL is applied. A withdrawn route stayed installed forever.
+
+### Known gap, stated rather than papered over
+
+Nothing tears the exit route down when the link carrying it DIES. While a peer
+is unreachable the receiver still holds a default route pointing into a tunnel
+nobody is carrying, which is indistinguishable from losing the internet. The
+withdrawal arm of the experiment fails for exactly this reason: it withdraws by
+restarting the router, so it exercises the dead-link case first. The fix is to
+treat a default route whose transport is not alive as absent, and to reconcile
+on the daemon's periodic tick rather than only on an inbound announce.
