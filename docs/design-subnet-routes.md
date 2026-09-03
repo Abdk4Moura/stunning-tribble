@@ -267,12 +267,22 @@ rather than the box.
    `set_peer_subnets` is a full restatement, so an empty set is precisely how a
    WITHDRAWAL is applied. A withdrawn route stayed installed forever.
 
-### Known gap, stated rather than papered over
+### Withdrawal and dead links (closed)
 
-Nothing tears the exit route down when the link carrying it DIES. While a peer
-is unreachable the receiver still holds a default route pointing into a tunnel
-nobody is carrying, which is indistinguishable from losing the internet. The
-withdrawal arm of the experiment fails for exactly this reason: it withdraws by
-restarting the router, so it exercises the dead-link case first. The fix is to
-treat a default route whose transport is not alive as absent, and to reconcile
-on the daemon's periodic tick rather than only on an inbound announce.
+The exit route is now torn down both when a peer WITHDRAWS it and when the link
+carrying it DIES, and the difference matters: a withdrawal arrives as an
+announce, and a dead peer sends nothing at all. An announce-driven reconciler is
+deaf to exactly the event it most needs to hear, so reconciliation also runs on a
+15s timer.
+
+Liveness is applied to default routes ONLY, deliberately. A stale subnet route is
+a nuisance, packets for one prefix go nowhere until the link returns, and links
+drop and re-establish constantly, so evicting on every transient drop would churn
+the table for no gain. A stale default route is a disconnected machine, because
+it captures everything, so it must not outlive its link even briefly.
+
+Measured end to end, the full cycle:
+
+    before:           165.22.207.231
+    with exit node:   162.35.114.254
+    after withdrawal: 165.22.207.231

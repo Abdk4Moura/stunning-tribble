@@ -17938,6 +17938,7 @@ async fn recv_cmd(
     // deadline, the sweep is what makes LAPSED visible in `devices`.
     let mut last_sweep = Instant::now();
     let mut last_renewal_check = Instant::now();
+    let mut last_route_reconcile = Instant::now();
     // Owner-only roster push: mint + push the mesh roster on membership change,
     // validity refresh, or a newly-established link.
     let mut last_roster_push = Instant::now();
@@ -18451,6 +18452,19 @@ async fn recv_cmd(
             let lapsed = devices_sweep_lapsed(crate::identity::now_secs());
             if lapsed > 0 {
                 ui::say(&format!("{} {lapsed} device(s) lapsed (offline past their budget)", ui::paint(ui::Tone::Warn, ui::glyph_warn())));
+            }
+        }
+
+        // ROUTE RECONCILE: re-evaluate installed routes on a timer, not only on
+        // an inbound announce. The case that matters most is a peer going
+        // SILENT, and a silent peer sends no announce, so an announce-driven
+        // reconciler is deaf to exactly the event it most needs to hear. For an
+        // exit node that gap is the difference between a stale entry and a
+        // machine holding a default route into a tunnel nobody is carrying.
+        if daemon && last_route_reconcile.elapsed() >= Duration::from_secs(15) {
+            last_route_reconcile = Instant::now();
+            if let Some(l3) = l3.as_ref() {
+                l3.reconcile_routes().await;
             }
         }
 

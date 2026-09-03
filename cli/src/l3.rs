@@ -580,6 +580,38 @@ impl L3 {
         self.sync_kernel_subnets().await;
     }
 
+    /// Of the advertised default routes, those whose transport is still alive.
+    ///
+    /// A default route pointing into a dead tunnel is indistinguishable from
+    /// having lost the internet, so a peer that has gone away must stop being an
+    /// exit node immediately rather than at the next announce, which by
+    /// definition never arrives from a peer that is gone.
+    async fn live_default_routes(&self, defaults: &[(IpAddr, u8)]) -> Vec<(IpAddr, u8)> {
+        if defaults.is_empty() {
+            return Vec::new();
+        }
+        let table = self.routes.lock().await;
+        defaults
+            .iter()
+            .filter(|(n, l)| {
+                table
+                    .subnets
+                    .iter()
+                    .any(|(sn, sl, t)| sn == n && sl == l && t.is_alive())
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Re-evaluate the routes this node has installed.
+    ///
+    /// Called on a timer as well as on an inbound announce, because the event
+    /// that most needs handling is a peer going SILENT, and a silent peer sends
+    /// no announce to trigger anything.
+    pub async fn reconcile_routes(&self) {
+        self.sync_kernel_subnets().await;
+    }
+
     /// Install or withdraw an accepted DEFAULT route, using policy routing so it
     /// cannot capture the traffic that carries it. See `exit_route`.
     async fn sync_exit_route(&self, defaults: &[(IpAddr, u8)]) {
@@ -699,7 +731,15 @@ impl L3 {
             .await
             .into_iter()
             .partition(|(n, l)| crate::exit_route::is_default_route(*n, *l));
-        self.sync_exit_route(&defaults).await;
+        // LIVENESS APPLIES TO DEFAULT ROUTES ONLY, and the asymmetry is
+        // deliberate. A stale subnet route is a nuisance: packets for one prefix
+        // go nowhere until the link returns, and links drop and re-establish
+        // constantly, so evicting on every transient drop would churn the
+        // routing table for no gain. A stale DEFAULT route is a disconnected
+        // machine, because it captures everything, so it must not outlive the
+        // link that carries it even briefly.
+        let live_defaults = self.live_default_routes(&defaults).await;
+        self.sync_exit_route(&live_defaults).await;
         let desired: std::collections::HashSet<String> =
             subnets.into_iter().map(|(n, l)| format!("{n}/{l}")).collect();
         let mut installed = self.kernel_subnets.lock().await;
