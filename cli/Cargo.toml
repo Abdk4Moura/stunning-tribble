@@ -168,8 +168,8 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [profile.release]
-lto = "thin"
-codegen-units = 16
+lto = "fat"
+codegen-units = 1
 strip = true
 
 # Fast functional iteration for real-binary gates. This is not release evidence:

@@ -1,0 +1,95 @@
+# Startup cost and footprint
+
+## Why this document exists
+
+"It takes a while to start" was reported and could NOT be reproduced on the
+development box: every local command measured 40-57ms cold. Guessing from that
+position wastes the reporter's time, so the first deliverable was an instrument
+rather than a fix: `experiments/startup-bench.sh` and
+`experiments/footprint.sh`, both runnable on the machine that actually feels
+slow.
+
+## What startup was actually spending
+
+`strace -c` on `filament --version`, which does nothing but print a string:
+
+    4 clone3      227 syscalls      7.0ms of syscall time
+
+Four threads, on a four-core box, to print a version string. `#[tokio::main]`
+builds a MULTI-THREADED runtime unconditionally, spawning one worker per CPU
+before `main` runs. The cost therefore scales with core count: the bigger the
+machine, the slower the trivial commands feel, which is the opposite of what
+anyone expects and is a good candidate for the original report.
+
+The fix is to pick the runtime AFTER looking at the command
+(`is_light_command`). Trivial, local-only verbs get a current-thread runtime;
+everything else, including anything unrecognised or added later, keeps exactly
+today's multi-threaded behaviour. The polarity is deliberate: a wrong answer is
+a throughput question, never a correctness one, because a current-thread runtime
+still runs every future and still has a blocking pool. The single API that would
+panic there is `block_in_place`, and the tree contains none.
+
+    after: 0 clone3      116 syscalls      2.0ms of syscall time
+
+## Binary size
+
+`size -A` said where 28.7MB lived: `.text` 21.2MB, then 3.6MB of UNWINDING
+tables (`.eh_frame` + `.gcc_except_table`).
+
+`lto = "fat"` with `codegen-units = 1` took the binary from **28.7MB to 19.5MB**
+and, because better inlining also means less to relocate and page in, took
+startup down with it. Release build time roughly doubled (5m20s to 10m40s),
+which is paid by CI and by nobody else.
+
+`panic = "abort"` would have removed most of those 3.6MB and was REJECTED, not
+overlooked. `cli/src/tun/netstack.rs` wraps `iface.poll` in `catch_unwind`
+specifically so a packet-level panic on hostile input stays contained. With
+`panic = "abort"` a malformed packet from a peer would abort the process
+instead: a remote denial of service traded for 12% of a binary.
+
+## Measured, before and after
+
+| metric | before | after |
+|---|---|---|
+| binary | 28.7 MB | **19.5 MB** |
+| `--version`, warm | 10.5 ms | **8.4 ms** |
+| minus the 4.2ms process floor | 6.3 ms | **4.2 ms** |
+| threads spawned for `--version` | 4 | **0** |
+| one-shot peak RSS | 10.4 MB | **9.3 MB** |
+| daemon idle RSS | 25.8 MB | **22.0 MB** |
+| daemon idle CPU | 0 ticks/10s | 0 ticks/10s |
+
+## The metrics this kind of tool is judged on
+
+Throughput is the one benchmarks report and the one users notice least. For a
+tool with a daemon half, in rough order of how much they matter:
+
+1. **Idle RSS.** A daemon holds it 24/7, and it decides whether the tool belongs
+   on a small box at all.
+2. **Idle CPU / wakeups.** The battery metric. A daemon that wakes constantly is
+   worse than one using more RAM, and it never appears in a throughput
+   benchmark. Filament is at 0 ticks per 10 idle seconds, meaning it genuinely
+   waits rather than polls. This is already good and worth not regressing.
+3. **Binary size.** What you ship, and the hard limit on flash-constrained
+   targets.
+4. **Startup latency.** Paid on every single CLI invocation.
+5. **Per-peer scaling** of threads, fds and memory. Fine at one peer, decisive
+   at fifty.
+6. **Peak RSS under load**, which is where buffer sizing shows up.
+7. **CPU per byte** moved, which is what actually limits throughput on a small
+   ARM core.
+
+## Where the remaining weight is, honestly
+
+19.5MB against tmux's 1.1MB is still more than an order of magnitude, and no
+profile flag closes that. The weight is dependencies: 509 crates, including
+`webrtc`, `quinn`, `smoltcp`, `reqwest`, `portable-pty`, `zip`, `tar`,
+`qrcode` and `clap_mangen`, plus `tokio` with `features = ["full"]`.
+
+Getting genuinely small is therefore a FEATURE-GATING problem, not an
+optimisation problem: a `--no-default-features` build that drops the web shell
+(portable-pty), FUSE mount (fuser), archive support (zip/tar), QR rendering and
+man-page generation, and ideally offers a relay-free build without `webrtc`.
+That is a real piece of work with a real payoff and it has not been done. It
+should be measured with `experiments/footprint.sh` before and after, not
+estimated.
