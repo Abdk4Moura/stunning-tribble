@@ -615,21 +615,20 @@ impl L3 {
     /// Install or withdraw an accepted DEFAULT route, using policy routing so it
     /// cannot capture the traffic that carries it. See `exit_route`.
     async fn sync_exit_route(&self, defaults: &[(IpAddr, u8)]) {
-        #[cfg(not(target_os = "linux"))]
-        {
+        if !crate::platform::policy_route::supported() {
             if !defaults.is_empty() {
                 crate::ui::say(&format!(
                     "  {} ignoring an exit route: policy routing is implemented for Linux only",
                     crate::ui::paint(crate::ui::Tone::Warn, crate::ui::glyph_warn())
                 ));
             }
+            return;
         }
-        #[cfg(target_os = "linux")]
         {
             let mut installed = self.exit_route_installed.lock().await;
             if defaults.is_empty() {
                 if *installed {
-                    if let Err(e) = crate::exit_route::run_plan(&crate::exit_route::teardown_plan())
+                    if let Err(e) = crate::platform::policy_route::run_plan(&crate::exit_route::teardown_plan())
                     {
                         crate::ui::debug(&format!("  could not withdraw the exit route: {e}"));
                     }
@@ -662,9 +661,9 @@ impl L3 {
                 ));
                 return;
             }
-            let gw = crate::exit_route::default_gateway();
+            let gw = crate::platform::policy_route::default_gateway();
             let plan = crate::exit_route::install_plan(ifname(), gw.as_deref(), &underlay);
-            match crate::exit_route::run_plan(&plan) {
+            match crate::platform::policy_route::run_plan(&plan) {
                 Ok(()) => {
                     *installed = true;
                     crate::ui::say(&format!(
@@ -675,7 +674,7 @@ impl L3 {
                 }
                 Err(e) => {
                     // Do not leave a half-applied policy in place.
-                    let _ = crate::exit_route::run_plan(&crate::exit_route::teardown_plan());
+                    let _ = crate::platform::policy_route::run_plan(&crate::exit_route::teardown_plan());
                     crate::ui::say(&format!(
                         "  {} could not install the exit route ({e}); reverted",
                         crate::ui::paint(crate::ui::Tone::Warn, crate::ui::glyph_warn())

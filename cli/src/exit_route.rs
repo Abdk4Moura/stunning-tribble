@@ -33,6 +33,10 @@
 //! safe carve-out, so a default route offered over a relay is REFUSED rather
 //! than guessed at. Routing every packet you send through a TURN relay is
 //! pathological anyway; an exit node worth using is a direct link.
+//!
+//! The `ip` invocations themselves live in `platform::policy_route`, so this
+//! module carries no per-platform branching at all and the plan below can be
+//! tested anywhere without touching a routing table.
 
 use std::net::IpAddr;
 
@@ -128,27 +132,13 @@ pub fn teardown_plan() -> Vec<Vec<String>> {
     ]
 }
 
-/// The current default gateway, as `ip route show default` reports it.
-#[cfg(target_os = "linux")]
-pub fn default_gateway() -> Option<String> {
-    let out = std::process::Command::new("ip").args(["-4", "route", "show", "default"]).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut fields = text.split_whitespace();
-    while let Some(f) = fields.next() {
-        if f == "via" {
-            return fields.next().map(str::to_string);
-        }
-    }
-    None
-}
-
 /// Addresses of the signaling server, resolved now.
 ///
 /// Carved out because a node that loses its path to signaling cannot
-/// renegotiate, cannot be told to stop, and cannot recover by itself: the exact
-/// state where a bad exit route becomes unrecoverable rather than merely wrong.
-/// Every resolved address is taken, since the host may be multi-homed and the
-/// one we happen to connect to next is not knowable here.
+/// renegotiate, cannot be told to stop, and cannot recover by itself: exactly
+/// the state where a bad exit route becomes unrecoverable rather than merely
+/// wrong. Every resolved address is taken, since the host may be multi-homed and
+/// which one the next connection uses is not knowable here.
 pub fn signaling_addrs() -> Vec<IpAddr> {
     use std::net::ToSocketAddrs;
     let server = crate::settings::get_str("server", None)
@@ -168,29 +158,6 @@ pub fn signaling_addrs() -> Vec<IpAddr> {
         .to_socket_addrs()
         .map(|it| it.map(|sa| sa.ip()).collect())
         .unwrap_or_default()
-}
-
-/// Run one plan. Each step is attempted; a step that fails is reported and the
-/// rest still run, because a partially-applied plan whose carve-outs succeeded
-/// is strictly safer than one abandoned after the default route went in.
-#[cfg(target_os = "linux")]
-pub fn run_plan(plan: &[Vec<String>]) -> Result<(), String> {
-    let mut failures = Vec::new();
-    for step in plan {
-        let out = std::process::Command::new("ip").args(step).output();
-        match out {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => {
-                let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                // Deleting something already gone is success, not failure.
-                if !err.contains("No such process") && !err.contains("not found") {
-                    failures.push(format!("ip {}: {err}", step.join(" ")));
-                }
-            }
-            Err(e) => failures.push(format!("ip {}: {e}", step.join(" "))),
-        }
-    }
-    if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) }
 }
 
 #[cfg(test)]
