@@ -122,6 +122,62 @@ reqwest duplication is roughly 200KB and would need `rust_socketio` to move.
 | daemon idle RSS | 25.8 MB | **21.5 MB** |
 | daemon idle CPU | 0 ticks/10s | 0 ticks/10s |
 
+
+## Calibration: is 15.6MB actually big?
+
+The earlier comparison in this document was against tmux (1.1MB) and it was
+MISLEADING, in a way worth spelling out because it is a common mistake. tmux is
+a dynamically-linked C binary: the 1.1MB is the part that is not libc, ncurses,
+libssl and so on. Its real closure, binary plus the shared libraries it loads,
+is 8.1MB. Measured the same way on the same machine:
+
+| tool | binary | + its shared libs |
+|---|---|---|
+| curl | 0.3 MB | **19.4 MB** |
+| tcpdump | 1.2 MB | 13.3 MB |
+| ssh | 0.8 MB | 10.4 MB |
+| nginx | 1.3 MB | 10.1 MB |
+| openssl | 1.0 MB | 8.9 MB |
+| tmux | 1.1 MB | 8.1 MB |
+
+So curl, the canonical "small" tool, actually pulls in MORE than filament does.
+
+Against tools in filament's own class, which carry their own TLS, crypto and
+protocol stacks rather than borrowing the system's:
+
+| tool | size | what it does |
+|---|---|---|
+| node | 118.9 MB | JS runtime |
+| dockerd | 99.0 MB | container daemon |
+| containerd | 45.9 MB | container runtime |
+| docker (CLI) | 43.5 MB | client only |
+| **tailscaled** | **40.9 MB** | mesh VPN daemon |
+| cc1 (GCC's actual compiler) | 32.6 MB | C compiler backend |
+| **tailscale (CLI)** | **31.6 MB** | mesh VPN client |
+| rustc / cargo | 19.9 MB | compiler / build tool |
+| **filament** | **15.6 MB** | mesh + transfer + mount + shell |
+| croc | 14.9 MB | file transfer only |
+
+filament is **half the size of the Tailscale CLI and 2.6x smaller than
+tailscaled**, while doing more than either: the mesh, plus file transfer, plus a
+FUSE mount, plus a web shell. It is within a megabyte of croc, which only
+transfers files. `gcc` is a 1MB driver that execs `cc1`, and `cc1` is 32.6MB, so
+"as big as a C compiler" would in fact be twice filament's size.
+
+The conclusion is not that size stopped mattering. It is that the target should
+be croc's ~15MB rather than tmux's apparent 1.1MB, and filament is already there.
+
+## The last dependency that keeps it from being self-contained
+
+filament links the system `libssl`/`libcrypto` (its closure is 24.7MB), which
+`croc` and `tailscale` do not. The cause is recorded in `cli/Cargo.toml`:
+`rust_socketio` hard-depends on `native-tls`, so a rustls-only tree needs that
+crate forked or replaced (ledger C16). The same crate is also the one pinning the
+duplicate `reqwest` 0.12. Removing that single dependency would drop the system
+TLS libraries AND the duplicate HTTP stack, and make the binary genuinely
+portable in the way the Go competitors are. That is the highest-value remaining
+item and it is a dependency decision, not a build flag.
+
 ## Where the remaining weight is, honestly
 
 15.6MB against tmux's 1.1MB is still an order of magnitude, and no
