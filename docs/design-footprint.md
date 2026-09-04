@@ -167,16 +167,50 @@ transfers files. `gcc` is a 1MB driver that execs `cc1`, and `cc1` is 32.6MB, so
 The conclusion is not that size stopped mattering. It is that the target should
 be croc's ~15MB rather than tmux's apparent 1.1MB, and filament is already there.
 
-## The last dependency that keeps it from being self-contained
+## Ledger C16 closed: rust_socketio replaced
 
-filament links the system `libssl`/`libcrypto` (its closure is 24.7MB), which
-`croc` and `tailscale` do not. The cause is recorded in `cli/Cargo.toml`:
-`rust_socketio` hard-depends on `native-tls`, so a rustls-only tree needs that
-crate forked or replaced (ledger C16). The same crate is also the one pinning the
-duplicate `reqwest` 0.12. Removing that single dependency would drop the system
-TLS libraries AND the duplicate HTTP stack, and make the binary genuinely
-portable in the way the Go competitors are. That is the highest-value remaining
-item and it is a dependency decision, not a build flag.
+filament used to link the system `libssl`/`libcrypto` because `rust_engineio`
+(under `rust_socketio`) depends on `native-tls` UNCONDITIONALLY, not behind a
+feature. That was recorded as ledger C16 and treated as unfixable without
+forking upstream.
+
+It did not need a fork, because filament used almost none of that crate. The
+client already forced `TransportType::Websocket` (polling behind Cloudflare
+caused a documented reconnect storm) with `reconnect(false)`, every handler only
+pulled the first JSON value out of a payload and forwarded it to one channel,
+and the only methods called were `emit`, `emit_with_ack`, `disconnect` and
+`clone`. What was actually needed was a websocket, Engine.IO's framing digits,
+and Socket.IO's `42["name",data]` and `43<id>[...]`.
+
+`crates/filament-signal` is that, on rustls, in about 300 lines with 7 protocol
+tests. Scope is deliberately narrow and anything outside it is an error rather
+than a silent no-op: websocket only, no polling upgrade, no binary attachments,
+no library-level reconnect (filament's outer loop must re-run join/subscribe/sync,
+which a silent reconnect would skip).
+
+Acks were the part that mattered. Two callers depend on them and both fixed real
+bugs: the liveness heartbeat, whose ack is the only proof a quiet socket is alive
+(without it the watchdog false-reconnects idle links), and the subscribe roster,
+whose ack replaced a lossy one-shot push that stalled ~40% of establishment
+attempts. A timeout returns `Ok(None)` rather than an error, because not hearing
+back is ordinary and the callers already retry.
+
+What it bought:
+
+| | before | after |
+|---|---|---|
+| linked libraries | libc, libssl, libcrypto, libgcc, libm | **libc, libgcc, libm** |
+| closure (binary + libs) | 24.7 MB | **18.4 MB** |
+| binary | 15.6 MB | **15.1 MB** |
+| crates in the tree | 503 | **483** |
+| `reqwest` versions | 0.12 and 0.13 | **0.13 only** |
+| `native-tls` / `openssl` | present | **absent** |
+
+Verified against the real signaling server, not just compiled: a 3MB transfer to
+a remote peer completed and verified (which exercises connect, the subscribe ack
+roster, peer discovery and the data path), and a daemon held a connection for
+200s with zero `SignalingDown` and zero reconnects. The silence watchdog fires at
+30s, so surviving 200s is direct evidence the heartbeat acks are arriving.
 
 ## Where the remaining weight is, honestly
 

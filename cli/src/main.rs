@@ -9311,7 +9311,7 @@ fn active_binding_matches(
 
 struct Conn {
     server: String,
-    sio: rust_socketio::asynchronous::Client,
+    sio: filament_signal::Client,
     tx: mpsc::UnboundedSender<Ev>,
     my_uid: String,
     my_id: String,
@@ -9578,7 +9578,7 @@ impl Conn {
     /// own literal on purpose, it is a different (non-command) session.
     fn for_command(
         server: &str,
-        sio: rust_socketio::asynchronous::Client,
+        sio: filament_signal::Client,
         tx: mpsc::UnboundedSender<Ev>,
         my_uid: String,
         relay_only: bool,
@@ -17080,7 +17080,7 @@ async fn apply_reconfigure(
     shell_user: &mut Option<String>,
     l2_enabled: bool,
     sess: &mut session::Session,
-    sio: &rust_socketio::asynchronous::Client,
+    sio: &filament_signal::Client,
     my_uid: &str,
 ) -> bool {
     match key {
