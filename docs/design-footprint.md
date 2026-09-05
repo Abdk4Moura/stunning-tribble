@@ -226,3 +226,26 @@ man-page generation, and ideally offers a relay-free build without `webrtc`.
 That is a real piece of work with a real payoff and it has not been done. It
 should be measured with `experiments/footprint.sh` before and after, not
 estimated.
+
+## Where startup stands, and what did not help
+
+After the runtime and size work, `--version` measures 6.7ms against a 3.7ms
+process floor on this box: about **3ms is filament**. The profile says there is
+not much left to take:
+
+- 94 syscalls, 1.55ms of syscall time, of which `execve` alone is 0.59ms. That
+  is the kernel loading the image and is bounded by binary size, which is why
+  the size work moved startup at all.
+- The dynamic loader costs 239k cycles total, ~0.1ms, with 322 relocations.
+  Static linking would target that 0.1ms and is not worth the musl trade.
+
+**A hypothesis that measured zero.** Installing the rustls crypto provider runs
+on every invocation, including `--version`, which never opens a socket. Skipping
+it for local-only commands looked like obvious waste. Measured: 6.7ms with and
+without, no difference. The change was reverted rather than kept, because it put
+a branch in front of crypto initialisation and bought nothing. Recorded here so
+nobody re-derives it and assumes it works.
+
+What remains is genuinely small and would need evidence from a machine where
+startup is actually slow, since none of the profiling here reproduces the
+original report. `experiments/startup-bench.sh` exists for exactly that.

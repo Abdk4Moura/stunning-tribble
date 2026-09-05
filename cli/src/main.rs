@@ -13040,9 +13040,12 @@ fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
-    // F2: both ring (webrtc) and aws-lc (reqwest) end up in the dep tree;
-    // rustls refuses to guess between two providers, so pick ring explicitly
-    // BEFORE anything touches TLS.
+    // Pick ring explicitly before anything touches TLS. Kept UNCONDITIONAL on
+    // purpose: skipping it for local-only commands was tried and measured at
+    // exactly zero (6.7ms either way), so the conditional bought nothing and
+    // would have put a branch in front of crypto initialisation for free.
+    // `filament_signal::connect` also installs it, idempotently, so no call
+    // site has to remember.
     rustls::crypto::ring::default_provider().install_default().ok();
     // Tell the transport how to reach this host. It no longer reaches sideways
     // into the CLI for terminal output, settings, config paths or interface

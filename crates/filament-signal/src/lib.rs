@@ -202,6 +202,10 @@ pub fn parse_ack(body: &str) -> Option<(u64, Vec<Value>)> {
 /// Returns once the Socket.IO namespace is joined, so a caller that immediately
 /// emits cannot race the CONNECT packet.
 pub async fn connect(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> Result<Client> {
+    // Idempotent, and the reason the CLI can skip this for local-only commands:
+    // whoever opens TLS first installs the provider, so no call site has to
+    // remember to. `.ok()` because "already installed" is the normal case.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let url = ws_url(base_url)?;
     let (stream, _resp) = tokio_tungstenite::connect_async(&url)
         .await
