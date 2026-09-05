@@ -197,11 +197,27 @@ pub fn parse_ack(body: &str) -> Option<(u64, Vec<Value>)> {
     }
 }
 
+/// How long the whole connect sequence may take.
+///
+/// A TCP connection that is accepted and then goes silent is the dangerous case:
+/// without a bound, `connect` waits forever on a handshake that will never
+/// arrive, and every caller inherits that hang. rust_socketio bounded this; the
+/// replacement has to as well, or a dead server turns into a stuck process
+/// instead of an error the caller can retry.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Connect, complete both handshakes, and start the read loop.
 ///
 /// Returns once the Socket.IO namespace is joined, so a caller that immediately
-/// emits cannot race the CONNECT packet.
+/// emits cannot race the CONNECT packet. Bounded by `CONNECT_TIMEOUT` end to
+/// end, including the TCP/TLS dial.
 pub async fn connect(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> Result<Client> {
+    tokio::time::timeout(CONNECT_TIMEOUT, connect_inner(base_url, tx))
+        .await
+        .map_err(|_| anyhow!("signaling handshake timed out after {CONNECT_TIMEOUT:?}"))?
+}
+
+async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> Result<Client> {
     // Idempotent, and the reason the CLI can skip this for local-only commands:
     // whoever opens TLS first installs the provider, so no call site has to
     // remember to. `.ok()` because "already installed" is the normal case.
