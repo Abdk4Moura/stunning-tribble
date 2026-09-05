@@ -5482,6 +5482,9 @@ async fn add_for_cmd(
     // because owner-equivalent access to a stranger should stay a deliberate
     // flag rather than a menu item one keypress away.
     let mut interactive_shell = false;
+    // Prefixes pulled out of `--allow route:<cidr>`; empty for every other kind
+    // of invitation, which keeps those tokens byte-identical v2.
+    let mut route_prefixes: Vec<String> = Vec::new();
     if allow.is_empty() && kind == "device" && caps.interactive {
         let choices = vec![
             "Send files, and mount my folders".to_string(),
@@ -5508,7 +5511,24 @@ async fn add_for_cmd(
             vec!["transfer".to_string()]
         }
     } else {
-        allow.into_iter().map(|capability| mint_capability(&capability)).collect::<Result<Vec<_>>>()?
+        // `route:10.0.0.0/24` carries its scope in the flag. Split the prefixes
+        // out here so they can travel in the SIGNED ceiling: a bare `route` is
+        // refused at mint, because a ceiling that cannot say which prefix is not
+        // a scope at all, and it previously authorised every prefix a member
+        // chose to advertise, 0.0.0.0/0 included.
+        let mut caps = Vec::new();
+        for entry in allow {
+            match entry.split_once(':') {
+                Some((name, cidr)) if mint_capability(name).ok().as_deref() == Some(crate::capability::CAP_ROUTE) => {
+                    caps.push(crate::capability::CAP_ROUTE.to_string());
+                    for one in cidr.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+                        route_prefixes.push(one.to_string());
+                    }
+                }
+                _ => caps.push(mint_capability(&entry)?),
+            }
+        }
+        caps
     };
     ceiling.sort();
     ceiling.dedup();
@@ -5573,6 +5593,7 @@ async fn add_for_cmd(
         crate::ephemeral::Reuse::Once,
         ephemeral,
         display_name(),
+        route_prefixes.clone(),
     )?;
     enroll_seed.fill(0);
     let token = Zeroizing::new(format!(
@@ -6660,6 +6681,9 @@ async fn handle_auth_key_enroll_response(
                         return;
                     }
                 };
+            // `ak.caps` already carries the route scope as `route:<cidr>`:
+            // Invitation::to_auth_key does that conversion once, so nothing here
+            // has to reassemble it.
             let stored_name = if persistent {
                 match devices_upsert_atomic(
                     &requested_name,
@@ -20177,21 +20201,6 @@ async fn recv_cmd(
                                                 // that is a fleet member could never
                                                 // be authorized by any route at all.
                                                 //
-                                                // KNOWN COARSENESS, deliberately
-                                                // recorded rather than hidden: a
-                                                // ceiling carries an ACTION and no
-                                                // resource, so `route` in a ceiling
-                                                // authorizes ANY prefix that member
-                                                // advertises, including 0.0.0.0/0.
-                                                // It is bounded by accept-routes
-                                                // being off by default and settable
-                                                // per peer, so nothing installs
-                                                // without the receiver opting in.
-                                                // Narrowing it to a per-prefix
-                                                // ceiling needs a v3 invitation
-                                                // token, since v2 encodes caps as an
-                                                // 8-bit mask with nowhere to put a
-                                                // CIDR. See docs/design-subnet-routes.md.
                                                 // Read the ceiling from the PERSISTED
                                                 // record, not from the link's
                                                 // principal. Which admission path ran
@@ -20208,18 +20217,35 @@ async fn recv_cmd(
                                                 // same source `devices` renders and
                                                 // `grant` consults, so all three agree
                                                 // by construction.
-                                                let delegated_route = principal_ceiling_for(&who)
-                                                    .map(|c| {
-                                                        c.iter().any(|x| {
-                                                            x.as_str() == crate::capability::CAP_ROUTE
+                                                //
+                                                // SCOPED, not a bare yes. The ceiling
+                                                // entries are `route:<cidr>`, taken
+                                                // from the signed invitation, so this
+                                                // asks whether the advertised prefix
+                                                // is INSIDE one the owner allowed. A
+                                                // bare `route` used to authorise every
+                                                // prefix a member cared to advertise,
+                                                // 0.0.0.0/0 included, which is an exit
+                                                // node the owner never agreed to.
+                                                let ceiling_routes: Vec<String> =
+                                                    principal_ceiling_for(&who)
+                                                        .unwrap_or_default()
+                                                        .iter()
+                                                        .filter_map(|c| {
+                                                            c.strip_prefix("route:")
+                                                                .map(str::to_string)
                                                         })
-                                                    })
-                                                    .unwrap_or(false);
+                                                        .collect();
                                                 let ok = crate::l3::installable_routes(
                                                     &advertised,
                                                     accept,
                                                     |cidr| {
-                                                        if delegated_route { return true; }
+                                                        if crate::capability::cidr_within_any(
+                                                            cidr,
+                                                            &ceiling_routes,
+                                                        ) {
+                                                            return true;
+                                                        }
                                                         let Some(pk) = owner_pk else { return false };
                                                         let Ok(res) =
                                                             crate::capability::route_resource_id(
@@ -25874,6 +25900,7 @@ mod tests {
             Reuse::Once,
             false,
             "alice".into(),
+            Vec::new(),
         )
         .unwrap();
         let token = format!(
