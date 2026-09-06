@@ -193,3 +193,38 @@ WireGuard is still the admin-mode default for non-browser users.
    the portfolio's path selection.
 4. Make WireGuard the default; demote the QUIC-datagram plane to the
    browser/no-WG/migration bridge.
+
+## Status 2026-09-06: wired, opt-in, and NOT yet proven to carry traffic
+
+`wg.rs` sat in the tree with `mod wg;` declared and ZERO callers, while the
+build order described it as ready. It is now reachable:
+
+- `filament set wireguard on` (off by default: this changes the DATA PLANE, and
+  the QUIC datagram path is what every gate measures and what works without
+  privilege).
+- `wg::usable()` is a RUNTIME probe, not a compile-time one, because a Linux box
+  without wireguard-tools, without the module or without CAP_NET_ADMIN cannot do
+  this either.
+- The key exchange rides the QUIC connection filament already authenticated
+  (`Transport::quic_connection`), so it inherits that identity rather than
+  inventing a second trust story. A relay link has no such connection and is
+  declined.
+- Teardown removes the interface with the daemon, so it cannot outlive it and
+  keep routing a peer's address into an empty tunnel.
+- Every failure path keeps the QUIC plane, so a machine that cannot do WireGuard
+  keeps its overlay instead of losing it.
+
+The dead-code warning count dropped from 115 to 95 when this landed, which is the
+mechanical confirmation that the module is genuinely called now.
+
+**What is NOT proven, stated plainly.** `experiments/wireguard-e2e.sh` brings up
+two namespaces, pairs them, and enables the setting. The pair connects, the
+overlay works, and the WireGuard hook RUNS and declines. It declines for a real
+reason found by running it: the hook fires when a peer joins the L3 plane, which
+is when the ANNOUNCE arrives, and a link that starts relayed and upgrades to
+direct upgrades AFTER that. The log shows `DIRECT-CONNECT ok (route: direct-quic)`
+and the hook still skipped, because at hook time the transport was the relay.
+
+So no WireGuard tunnel has yet carried a packet. Moving the hook to the
+relay-to-direct upgrade event is the fix, and the rig is committed so the claim
+can be checked rather than believed.

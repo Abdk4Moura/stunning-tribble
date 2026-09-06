@@ -16,6 +16,30 @@ use std::net::IpAddr;
 use std::process::{Command, Stdio};
 
 /// Generate a WireGuard keypair, returned as (private_b64, public_b64), via `wg`.
+/// Can this machine actually run kernel WireGuard right now?
+///
+/// A RUNTIME check, not a compile-time one. The platform surface gate keeps
+/// per-platform branching out of files like this, and it would be the wrong tool
+/// anyway: a Linux box without wireguard-tools, without the module, or without
+/// CAP_NET_ADMIN cannot do this either. Asking the system is the only answer
+/// that is true on the machine it runs on.
+///
+/// Deliberately quiet and cheap: it creates and immediately removes a probe
+/// interface, which is the only way to learn whether the module and the
+/// capability are both present without waiting for a real failure mid-session.
+pub fn usable() -> bool {
+    if Command::new("wg").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
+        return false;
+    }
+    const PROBE: &str = "filament-wgprobe";
+    let _ = ip(&["link", "del", PROBE]);
+    if ip(&["link", "add", PROBE, "type", "wireguard"]).is_err() {
+        return false;
+    }
+    let _ = ip(&["link", "del", PROBE]);
+    true
+}
+
 pub fn gen_keypair() -> Result<(String, String)> {
     let out = Command::new("wg")
         .arg("genkey")
@@ -170,4 +194,62 @@ pub async fn exchange(
         bail!("empty peer wg public key");
     }
     Ok((pk.to_string(), port))
+}
+
+/// The interface filament manages. One device carries every peer, as WireGuard
+/// intends: peers are distinguished by public key and allowed-ips, not by device.
+pub const WG_DEV: &str = "filament-wg";
+
+/// Bring up a WireGuard tunnel to one direct peer, over the connection filament
+/// has already authenticated.
+///
+/// WHY THIS IS SAFE TO ATTEMPT AND SAFE TO FAIL. The key exchange rides the
+/// EXISTING QUIC connection (`exchange`), so it inherits filament's identity and
+/// adds no new trust story. Every failure path returns `Err` and the caller
+/// keeps using the QUIC datagram plane, so a machine without the module, the
+/// tools or the capability simply does not get WireGuard: it never gets a
+/// half-configured interface instead of a working one.
+///
+/// `our_overlay` and `peer_overlay` are the overlay addresses already assigned
+/// by the mesh, so WireGuard carries exactly the same addressing and nothing
+/// downstream (MagicDNS, routes, the capability gate) has to know which plane a
+/// packet took.
+pub async fn establish(
+    conn: &quinn::Connection,
+    initiator: bool,
+    our_overlay: &str,
+    peer_overlay: &str,
+    peer_underlay: std::net::IpAddr,
+    mtu: u32,
+) -> Result<()> {
+    let (privkey, pubkey) = gen_keypair()?;
+    // Create ours FIRST so we have a listen port to advertise. Idempotent: a
+    // second peer reuses the interface rather than replacing it.
+    let port = match existing_listen_port() {
+        Some(p) => p,
+        None => create_iface(WG_DEV, &privkey)?,
+    };
+    let (peer_pub, peer_port) = exchange(conn, &pubkey, port, initiator).await?;
+    let allowed = format!("{peer_overlay}/128");
+    configure_peer(
+        WG_DEV,
+        &peer_pub,
+        &allowed,
+        &endpoint(peer_underlay, peer_port),
+        &format!("{our_overlay}/128"),
+        mtu,
+    )?;
+    // Route THIS peer's overlay address down the tunnel. Host-scoped, so a
+    // WireGuard peer never captures traffic for a peer that is not on it.
+    let _ = ip(&["route", "replace", &allowed, "dev", WG_DEV]);
+    Ok(())
+}
+
+/// The listen port of an interface we already created, if any.
+fn existing_listen_port() -> Option<u16> {
+    let out = Command::new("wg").args(["show", WG_DEV, "listen-port"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
