@@ -79,6 +79,9 @@ grep -q userspace "$W/a.log" && { echo "SETUP: A fell back to userspace (no kern
 rm -f "$W/inv.txt"
 env $A "$BIN" add --for wg-b --allow transfer,mount --out "$W/inv.txt" --yes >/dev/null 2>&1
 [ -s "$W/inv.txt" ] || { echo "SETUP: no invitation"; exit 2; }
+# No --name-as on the JOIN: adding it stopped the enrolment dead at "invitation
+# loaded". The device enrols under the machine hostname, which is why the
+# assertion below counts a device rather than matching a name.
 ip netns exec wgb env $B setsid nohup bash -c "\"$BIN\" join '$W/inv.txt' --yes; FILAMENT_LOG=debug \"$BIN\" up --name-as wg-b" >"$W/b.log" 2>&1 &
 J=0
 for i in $(seq 1 30); do
@@ -88,19 +91,34 @@ done
 # Assert on what the OWNER sees, not on a string in B's log: the log check
 # passed once while B had not joined at all, because a substring matched in an
 # error path. The device list is the fact.
-if env $A "$BIN" devices 2>/dev/null | grep -q "wg-b"; then
+# Count a device rather than match a name: the name depends on how the join was
+# invoked, the FACT under test is that A gained a fleet member.
+if [ "$(env $A "$BIN" devices 2>/dev/null | grep -cE '^\s+●')" -ge 1 ]; then
   ok "B joined A's fleet"
 else
   bad "B never joined"; tail -8 "$W/b.log" | sed 's/^/    /'; exit 1
 fi
-sleep 40
+# The reconcile runs on a 10s tick and both ends must rendezvous, so give it
+# several ticks rather than one. Waiting is not the same as hoping: if it is not
+# up after this, the check below says so.
+sleep 70
 
 say "3. did a WireGuard tunnel come up?"
+for i in $(seq 1 10); do wg show filament-wg >/dev/null 2>&1 && break; sleep 6; done
 grep -E "WireGuard" "$W/a.log" "$W/b.log" | tail -4 | sed 's/^/    /'
 if wg show filament-wg >/dev/null 2>&1; then
   ok "filament-wg exists"
-  echo "  peers configured: $(wg show filament-wg peers 2>/dev/null | wc -l)"
-  wg show filament-wg 2>/dev/null | grep -E "peer|endpoint|allowed ips" | head -4 | sed 's/^/    /'
+  PEERS=$(wg show filament-wg peers 2>/dev/null | wc -l)
+  echo "  peers configured: $PEERS"
+  wg show filament-wg 2>/dev/null | grep -E "peer|endpoint|allowed ips|transfer|handshake" | head -6 | sed "s/^/    /"
+  [ "${PEERS:-0}" -ge 1 ] && ok "a peer is configured on the tunnel" || bad "interface exists but has no peer"
+  # A tunnel with no handshake has carried nothing; this is the difference
+  # between "configured" and "working".
+  if wg show filament-wg latest-handshakes 2>/dev/null | awk '{exit ($2>0)?0:1}'; then
+    ok "the tunnel completed a handshake (it is carrying traffic)"
+  else
+    bad "no WireGuard handshake: the interface is configured but dead"
+  fi
 else
   bad "no filament-wg interface; the plane did not come up"
 fi

@@ -18010,6 +18010,7 @@ async fn recv_cmd(
     let mut last_sweep = Instant::now();
     let mut last_renewal_check = Instant::now();
     let mut last_route_reconcile = Instant::now();
+    let mut last_wg_check = Instant::now();
     // Owner-only roster push: mint + push the mesh roster on membership change,
     // validity refresh, or a newly-established link.
     let mut last_roster_push = Instant::now();
@@ -18523,6 +18524,70 @@ async fn recv_cmd(
             let lapsed = devices_sweep_lapsed(crate::identity::now_secs());
             if lapsed > 0 {
                 ui::say(&format!("{} {lapsed} device(s) lapsed (offline past their budget)", ui::paint(ui::Tone::Warn, ui::glyph_warn())));
+            }
+        }
+
+        // WIREGUARD RECONCILE. On a timer, and deliberately NOT on an event.
+        //
+        // The first version hooked the moment a peer joined the L3 plane, which
+        // is when its ANNOUNCE arrives. A link that starts relayed and upgrades
+        // to direct upgrades AFTER that, so the hook saw the relay transport and
+        // declined forever: the rig showed "DIRECT-CONNECT ok (route:
+        // direct-quic)" in the same log as "WireGuard skipped". Reconciling on a
+        // tick is order-independent, picks up a link that goes direct later, and
+        // is idempotent, which an event hook can only approximate.
+        //
+        // Each attempt is spawned rather than awaited: the two ends rendezvous
+        // on a QUIC bi-stream, so whichever side ticks first waits for the
+        // other, and blocking the daemon loop on that would stall everything.
+        if daemon
+            && last_wg_check.elapsed() >= Duration::from_secs(10)
+            && crate::settings::get_str("wireguard", None)
+                .map(|v| v == "on" || v == "true")
+                .unwrap_or(false)
+        {
+            last_wg_check = Instant::now();
+            if let Some(l3) = l3.as_ref() {
+                if crate::wg::usable() {
+                    let ours = l3.my_addr().map(|a| a.to_string()).unwrap_or_default();
+                    for (who, addr, t) in l3.peers_with_transport().await {
+                        // Direct links only: the key exchange rides the QUIC
+                        // connection filament already authenticated, and a relay
+                        // link has none to ride.
+                        let (Some(qc), Some(sa)) = (t.quic_connection(), t.remote_addr()) else {
+                            continue;
+                        };
+                        if !crate::wg::claim_attempt(&addr.to_string()) {
+                            continue; // already established or in flight
+                        }
+                        // Derived from the two overlay addresses so the two ends
+                        // are guaranteed to disagree; the transport's answerer
+                        // flag is not, and when both chose "accept" the exchange
+                        // hung forever with no log either way.
+                        let initiator = crate::wg::is_initiator(&ours, &addr.to_string());
+                        let (ours, peer_s) = (ours.clone(), addr.to_string());
+                        tokio::spawn(async move {
+                            match crate::wg::establish(
+                                &qc, initiator, &ours, &peer_s, sa.ip(), 1380,
+                            )
+                            .await
+                            {
+                                Ok(()) => ui::say(&format!(
+                                    "  {} WireGuard tunnel to {who}",
+                                    ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                                )),
+                                Err(e) => {
+                                    // Release the claim so the next tick retries:
+                                    // the peer may simply not have ticked yet.
+                                    crate::wg::release_attempt(&peer_s);
+                                    ui::debug(&format!(
+                                        "  WireGuard to {who} not established ({e}); staying on the QUIC plane"
+                                    ));
+                                }
+                            }
+                        });
+                    }
+                }
             }
         }
 
@@ -20128,77 +20193,6 @@ async fn recv_cmd(
                                             l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t.clone()).await;
                                             ui::say(&format!("  {} L3 peer {who}.mesh ({ip} / {v4})", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                                             devices_touch(&who, Some(ip), Some(v4));
-
-                                            // WireGuard, opt-in and per peer.
-                                            //
-                                            // Only for a DIRECT link: the key
-                                            // exchange rides the QUIC connection
-                                            // filament already authenticated, so
-                                            // it inherits that identity instead
-                                            // of inventing a second trust story,
-                                            // and a relay link has no such
-                                            // connection to ride. Every failure
-                                            // leaves the QUIC datagram plane in
-                                            // place, so a machine missing the
-                                            // module, the tools or CAP_NET_ADMIN
-                                            // keeps working rather than losing
-                                            // its overlay.
-                                            if crate::settings::get_str("wireguard", None)
-                                                .map(|v| v == "on" || v == "true")
-                                                .unwrap_or(false)
-                                            {
-                                                match (t.quic_connection(), t.remote_addr()) {
-                                                    (Some(qc), Some(sa)) if crate::wg::usable() => {
-                                                        // The dialer is the
-                                                        // initiator, so exactly
-                                                        // one side opens the
-                                                        // stream and the two
-                                                        // cannot deadlock both
-                                                        // accepting.
-                                                        let initiator = !t.sid_answerer();
-                                                        let ours = l3.my_addr().map(|a| a.to_string()).unwrap_or_default();
-                                                        match crate::wg::establish(
-                                                            &qc, initiator, &ours,
-                                                            &ip.to_string(), sa.ip(), 1380,
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok(()) => ui::say(&format!(
-                                                                "  {} WireGuard tunnel to {who}",
-                                                                ui::paint(ui::Tone::Ok, ui::glyph_ok())
-                                                            )),
-                                                            Err(e) => ui::debug(&format!(
-                                                                "  WireGuard to {who} not established ({e}); staying on the QUIC plane"
-                                                            )),
-                                                        }
-                                                    }
-                                                    // KNOWN LIMITATION, measured
-                                                    // rather than assumed: this
-                                                    // hook runs when the peer
-                                                    // joins the L3 plane, which
-                                                    // is when the ANNOUNCE
-                                                    // arrives. A link that starts
-                                                    // relayed and upgrades to
-                                                    // direct upgrades AFTER that,
-                                                    // so this sees the relay
-                                                    // transport and declines even
-                                                    // though the pair ends up
-                                                    // direct. Observed in
-                                                    // experiments/wireguard-e2e.sh:
-                                                    // the log says
-                                                    // "DIRECT-CONNECT ok (route:
-                                                    // direct-quic)" and this still
-                                                    // skipped. Moving the hook to
-                                                    // the upgrade event is the
-                                                    // fix; declining is safe in
-                                                    // the meantime because the
-                                                    // QUIC plane keeps carrying
-                                                    // the traffic.
-                                                    _ => ui::debug(&format!(
-                                                        "  WireGuard skipped for {who}: needs a direct link on a machine that supports it"
-                                                    )),
-                                                }
-                                            }
 
                                             // Subnet routes, after the peer is on
                                             // the overlay. Three conditions, in

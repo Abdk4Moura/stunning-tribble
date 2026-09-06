@@ -28,10 +28,18 @@ use std::process::{Command, Stdio};
 /// interface, which is the only way to learn whether the module and the
 /// capability are both present without waiting for a real failure mid-session.
 pub fn usable() -> bool {
+    debug_assert!(WG_DEV.len() <= MAX_IFNAME, "wg device name too long for Linux");
     if Command::new("wg").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
         return false;
     }
-    const PROBE: &str = "filament-wgprobe";
+    // SHORT ON PURPOSE. Linux caps an interface name at 15 characters, and
+    // "filament-wgprobe" is 16, so the probe failed with "Attribute failed
+    // policy validation" on every machine and usable() always returned false.
+    // That silently disabled the entire feature: no error, no log, just a
+    // capability check that could never say yes. The device itself,
+    // "filament-wg", is 11 and was always fine, which is why this only showed up
+    // when the probe was added.
+    const PROBE: &str = "fil-wgprobe";
     let _ = ip(&["link", "del", PROBE]);
     if ip(&["link", "add", PROBE, "type", "wireguard"]).is_err() {
         return false;
@@ -171,17 +179,31 @@ pub fn endpoint(ip: IpAddr, port: u16) -> String {
 /// Swap {public key, WG listen-port} with the peer over the authenticated
 /// connection. The initiator opens the bi stream; the responder accepts it. Both
 /// sides write their line, finish, and read the peer's, so it is symmetric.
+/// A key exchange must not wait forever.
+///
+/// `exchange` rendezvouses on a QUIC bi-stream: one side opens, the other
+/// accepts. If both ends ever decide to accept, both block indefinitely, the
+/// interface exists with no peer, and nothing is logged because neither side
+/// reached success or failure. That is precisely what happened before the role
+/// was made deterministic, and a bound turns it into a retryable error instead
+/// of a silent hang.
+const EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub async fn exchange(
     conn: &quinn::Connection,
     our_pub: &str,
     our_port: u16,
     initiator: bool,
 ) -> Result<(String, u16)> {
-    let (mut send, mut recv) = if initiator {
-        conn.open_bi().await.context("open wg key-exchange stream")?
-    } else {
-        conn.accept_bi().await.context("accept wg key-exchange stream")?
-    };
+    let (mut send, mut recv) = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+        if initiator {
+            conn.open_bi().await.context("open wg key-exchange stream")
+        } else {
+            conn.accept_bi().await.context("accept wg key-exchange stream")
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("wg key exchange timed out after {EXCHANGE_TIMEOUT:?}"))??;
     send.write_all(format!("{our_pub} {our_port}\n").as_bytes()).await.context("send wg key-exchange")?;
     send.finish().context("finish wg key-exchange")?;
 
@@ -200,6 +222,10 @@ pub async fn exchange(
 /// intends: peers are distinguished by public key and allowed-ips, not by device.
 pub const WG_DEV: &str = "filament-wg";
 
+/// Linux refuses an interface name longer than this, and does it with a message
+/// that names neither the length nor the field.
+const MAX_IFNAME: usize = 15;
+
 /// Bring up a WireGuard tunnel to one direct peer, over the connection filament
 /// has already authenticated.
 ///
@@ -214,6 +240,17 @@ pub const WG_DEV: &str = "filament-wg";
 /// by the mesh, so WireGuard carries exactly the same addressing and nothing
 /// downstream (MagicDNS, routes, the capability gate) has to know which plane a
 /// packet took.
+/// Which end opens the key-exchange stream.
+///
+/// Derived from the two overlay addresses, which both ends know and agree on, so
+/// the answers are GUARANTEED opposite. The previous version used the
+/// transport's answerer flag, which is not guaranteed to differ between the two
+/// ends: when both computed "accept", each waited for the other to open and the
+/// tunnel silently never formed.
+pub fn is_initiator(ours: &str, theirs: &str) -> bool {
+    ours < theirs
+}
+
 pub async fn establish(
     conn: &quinn::Connection,
     initiator: bool,
@@ -252,4 +289,57 @@ fn existing_listen_port() -> Option<u16> {
         return None;
     }
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Peers this process has a tunnel to, or is currently building one for.
+///
+/// The reconcile runs on a timer, so without this a slow rendezvous would be
+/// re-attempted every tick and the two ends would pile up half-open bi-streams
+/// against each other. Claim before spawning, release on failure so the next
+/// tick retries, keep it on success.
+static WG_ATTEMPTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn attempted() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    WG_ATTEMPTED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// True if this call took the claim for `peer`; false if someone already has it.
+pub fn claim_attempt(peer: &str) -> bool {
+    attempted()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(peer.to_string())
+}
+
+/// Give the claim back so a later tick can retry.
+pub fn release_attempt(peer: &str) {
+    attempted().lock().unwrap_or_else(|e| e.into_inner()).remove(peer);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both ends must not choose the same role, or they deadlock waiting for
+    /// each other and the tunnel forms without a peer.
+    #[test]
+    fn exactly_one_end_initiates() {
+        let a = "fdf1::a";
+        let b = "fdf1::b";
+        assert!(is_initiator(a, b) != is_initiator(b, a), "roles must be opposite");
+        assert!(is_initiator(a, b), "the lower address opens the stream");
+    }
+
+    /// The probe name being one character over the Linux limit made usable()
+    /// return false on every machine, which disabled WireGuard silently: no
+    /// error, no log, just a capability check that could never say yes.
+    #[test]
+    fn interface_names_fit_within_the_kernel_limit() {
+        assert!(WG_DEV.len() <= MAX_IFNAME, "{WG_DEV} is {} chars", WG_DEV.len());
+        assert!(
+            "fil-wgprobe".len() <= MAX_IFNAME,
+            "the probe name must fit too, or usable() silently answers no"
+        );
+    }
 }
