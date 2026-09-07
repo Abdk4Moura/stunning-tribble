@@ -194,6 +194,57 @@ WireGuard is still the admin-mode default for non-browser users.
 4. Make WireGuard the default; demote the QUIC-datagram plane to the
    browser/no-WG/migration bridge.
 
+## Status 2026-09-07: WORKING. Kernel WireGuard over filament's transport.
+
+A kernel WireGuard tunnel between two machines, keyed over filament's own
+authenticated connection, with a completed handshake, verified by
+`experiments/wireguard-2machine.sh`:
+
+    peers: 1
+    endpoint: 127.0.0.1:57333
+    allowed ips: fdf1:1af7:c30d:a2:a7e7:1a0d:e2e1:40e8/128
+    latest handshake: 1 second ago
+    transfer: 124 B received, 180 B sent
+
+### The design, and why it is decision 2 of this ADR rather than a workaround
+
+Kernel WireGuard owns its UDP socket, so it does its own NAT traversal, and it
+has none: both ends announced their INTERNAL listen port, the NAT had no inbound
+mapping, and every handshake was dropped. The answer is not to teach WireGuard
+about NAT. It is to stop WireGuard touching the network at all.
+
+Each side points its peer's endpoint at a filament-owned UDP socket on LOOPBACK,
+and filament carries the frames over the path it has already punched:
+
+    kernel WG --UDP--> 127.0.0.1:relay --filament transport--> peer's relay --> its WG
+
+That is exactly "WireGuard rides on top of whichever underlay path won": filament
+keeps identity, discovery, NAT traversal and relay fallback; WireGuard gets the
+data plane. The `endpoint: 127.0.0.1` in the output above is the whole point.
+
+**The demux needs no format change.** Datagrams already carry raw IP packets and
+the receiver reads the version nibble. A WireGuard frame's first byte is its
+message type, 1..=4, which cannot collide with 0x4_ (IPv4) or 0x6_ (IPv6), so a
+WireGuard frame is self-identifying on the existing datagram channel. The L3
+pump splits them: WireGuard frames go to the peer's relay, everything else to the
+TUN, where a WireGuard frame would have been a malformed IP packet.
+
+**It is not slower than the plane it joins.** The hot path was
+`TUN read -> transport`; it is now `UDP read -> transport`, the same number of
+userspace copies, with the crypto moved into the kernel and onto WireGuard's
+multi-threaded data path instead of the single-threaded QUIC-datagram loop this
+ADR was written to replace.
+
+### Still to do before it is the default
+
+- It is opt-in (`filament set wireguard on`) and stays that way until the
+  throughput case is measured against the QUIC plane on the two-machine rig.
+- The relay socket binds `127.0.0.1:0` per peer. Anything that could reach it
+  could inject frames the peer never sent, which is why it is loopback-only;
+  a shared socket with per-peer demux would be tidier and is not required.
+- macOS and Windows are untouched: `usable()` answers no there, and the QUIC
+  plane carries everything as before.
+
 ## Status 2026-09-07: keys exchange and peers configure; the handshake is blocked by NAT
 
 The module had `mod wg;` and ZERO callers. It is now wired, reconciling, and both

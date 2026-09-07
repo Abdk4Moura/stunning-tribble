@@ -20443,14 +20443,28 @@ async fn recv_cmd(
                             (Some(sa), Some(po)) if !peer_pub.is_empty() && peer_port != 0 => {
                                 match crate::wg::local_offer() {
                                     Ok((our_pub, our_port)) => {
+                                        // The peer's real endpoint and port are
+                                        // no longer needed: WireGuard talks to a
+                                        // loopback stand-in and filament carries
+                                        // the frames, so NAT never sees a
+                                        // WireGuard packet.
+                                        let _ = (sa, peer_port);
+                                        let tr = match conn.transport_of(&pid) {
+                                            Some(t) => t,
+                                            None => {
+                                                ui::debug("  wg: no transport for this peer");
+                                                continue;
+                                            }
+                                        };
                                         if let Err(e) = crate::wg::adopt_peer(
                                             &peer_pub,
                                             &po.to_string(),
-                                            sa.ip(),
-                                            peer_port,
                                             &ours,
                                             1380,
-                                        ) {
+                                            tr,
+                                        )
+                                        .await
+                                        {
                                             ui::debug(&format!("  wg: could not adopt peer ({e})"));
                                         } else {
                                             ui::say(&format!(

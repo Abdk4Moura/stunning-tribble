@@ -12,7 +12,6 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::Write;
-use std::net::IpAddr;
 use std::process::{Command, Stdio};
 
 /// Generate a WireGuard keypair, returned as (private_b64, public_b64), via `wg`.
@@ -164,17 +163,8 @@ pub fn teardown(dev: &str) {
     let _ = ip(&["link", "del", dev]);
 }
 
-/// Format a WireGuard endpoint (bracket IPv6).
-pub fn endpoint(ip: IpAddr, port: u16) -> String {
-    match ip {
-        IpAddr::V4(v4) => format!("{v4}:{port}"),
-        IpAddr::V6(v6) => format!("[{v6}]:{port}"),
-    }
-}
-
-/// Swap {public key, WG listen-port} with the peer over the authenticated
-/// connection. The initiator opens the bi stream; the responder accepts it. Both
-/// sides write their line, finish, and read the peer's, so it is symmetric.
+/// Our half of the exchange: make sure the interface exists and report what the
+/// peer needs to know about us. Symmetric, so there is no initiator.
 pub fn local_offer() -> Result<(String, u16)> {
     let (privkey, pubkey) = iface_identity()?;
     let port = match existing_listen_port() {
@@ -190,27 +180,54 @@ pub fn local_offer() -> Result<(String, u16)> {
 
 /// Configure the peer that just announced itself, and route its overlay address
 /// down the tunnel.
-pub fn adopt_peer(
+pub async fn adopt_peer(
     peer_pub: &str,
     peer_overlay: &str,
-    peer_underlay: std::net::IpAddr,
-    peer_port: u16,
     our_overlay: &str,
     mtu: u32,
+    transport: std::sync::Arc<dyn crate::net::Transport>,
 ) -> Result<()> {
+    let (_priv, _pub) = iface_identity()?;
+    let wg_port = existing_listen_port().ok_or_else(|| anyhow!("no local WireGuard listen port"))?;
+
+    // The peer's stand-in, on loopback. WireGuard talks only to this; filament
+    // carries the frames over the path it has already punched, so NAT never sees
+    // a WireGuard packet and WireGuard never has to traverse one.
+    let relay = std::sync::Arc::new(Relay::bind(wg_port).await?);
+    let relay_port = relay.local_port()?;
     let allowed = format!("{peer_overlay}/128");
     configure_peer(
         WG_DEV,
         peer_pub,
         &allowed,
-        &endpoint(peer_underlay, peer_port),
+        &format!("127.0.0.1:{relay_port}"),
         &format!("{our_overlay}/128"),
         mtu,
     )?;
     // Host-scoped, so a WireGuard peer never captures traffic for a peer that is
     // not on the tunnel.
     let _ = ip(&["route", "replace", &allowed, "dev", WG_DEV]);
-    crate::ui::debug(&format!("  wg: peer {peer_overlay} configured via {peer_underlay}:{peer_port}"));
+    register_relay(peer_overlay, relay.clone());
+
+    // OUTBOUND pump: whatever the kernel hands the stand-in goes to the peer.
+    // Inbound is handled by the L3 datagram pump, which already reads every
+    // datagram from this peer and now splits WireGuard frames off by first byte.
+    let sock = relay.socket();
+    let peer_label = peer_overlay.to_string();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let Ok((n, _from)) = sock.recv_from(&mut buf).await else { break };
+            if transport.send_datagram(&buf[..n]).is_err() {
+                break; // link gone; the reconcile will rebuild on the next one
+            }
+        }
+        crate::ui::debug(&format!("  wg: relay pump for {peer_label} ended"));
+    });
+
+    crate::ui::debug(&format!(
+        "  wg: peer {peer_overlay} routed through the local relay on 127.0.0.1:{relay_port}"
+    ));
     Ok(())
 }
 
@@ -280,5 +297,111 @@ mod tests {
             "fil-wgprobe".len() <= MAX_IFNAME,
             "the probe name must fit too, or usable() silently answers no"
         );
+    }
+}
+
+// ── WireGuard over filament's transport ──────────────────────────────────────
+//
+// WHY. Kernel WireGuard owns its own UDP socket, so it does its own NAT
+// traversal, and it has none: both daemons announced their INTERNAL listen port,
+// the NAT had no inbound mapping, and the handshake was dropped. That is decision
+// 2 of the ADR being violated, and the fix is not to teach WireGuard about NAT.
+//
+// Instead WireGuard never touches the network. Each side points its peer's
+// endpoint at a filament-owned UDP socket on LOOPBACK, and filament carries the
+// frames over the path it has already punched:
+//
+//   kernel WG --UDP--> 127.0.0.1:relay --filament transport--> peer's relay --> its WG
+//
+// The demux needs no format change. Datagrams already carry raw IP packets and
+// the receiver reads the version nibble; a WireGuard frame's first byte is its
+// message type, 1..=4, which cannot collide with 0x4_ (IPv4) or 0x6_ (IPv6). So a
+// WireGuard frame is self-identifying on the existing datagram path.
+//
+// This is not slower than the plane it joins: the hot path was
+// `TUN read -> transport` and is now `UDP read -> transport`, the same number of
+// userspace copies, with the crypto moved into the kernel.
+
+/// Is this datagram a WireGuard frame rather than an IP packet?
+///
+/// WireGuard message types are 1 (handshake init), 2 (response), 3 (cookie) and
+/// 4 (transport data). IPv4 starts 0x4_, IPv6 0x6_. The ranges cannot overlap,
+/// which is what lets both share one datagram channel untagged.
+pub fn is_wg_frame(pkt: &[u8]) -> bool {
+    matches!(pkt.first(), Some(1..=4))
+}
+
+/// A loopback UDP socket that stands in for the peer, as far as kernel
+/// WireGuard is concerned.
+pub struct Relay {
+    sock: std::sync::Arc<tokio::net::UdpSocket>,
+    /// Where the LOCAL WireGuard is listening, so inbound frames can be handed to it.
+    wg_port: u16,
+}
+
+impl Relay {
+    /// Bind on loopback only. This socket must never be reachable from the
+    /// network: it is the peer's stand-in, and anything that could reach it
+    /// could inject frames the peer never sent.
+    pub async fn bind(wg_port: u16) -> Result<Self> {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .context("bind the WireGuard relay socket on loopback")?;
+        Ok(Self { sock: std::sync::Arc::new(sock), wg_port })
+    }
+
+    /// The port to give WireGuard as its peer's endpoint.
+    pub fn local_port(&self) -> Result<u16> {
+        Ok(self.sock.local_addr().context("relay local addr")?.port())
+    }
+
+    pub fn socket(&self) -> std::sync::Arc<tokio::net::UdpSocket> {
+        self.sock.clone()
+    }
+
+    /// Hand an inbound frame to the local WireGuard.
+    ///
+    /// Sent FROM this socket, so WireGuard sees it arriving from the endpoint it
+    /// was configured with and replies here rather than to the network.
+    pub async fn deliver_to_wg(&self, pkt: &[u8]) -> Result<()> {
+        self.sock
+            .send_to(pkt, ("127.0.0.1", self.wg_port))
+            .await
+            .map(|_| ())
+            .context("deliver a WireGuard frame to the local interface")
+    }
+}
+
+/// Relays by peer overlay address, so the datagram pump can find the one that
+/// belongs to the peer a frame arrived from.
+static RELAYS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Relay>>>,
+> = std::sync::OnceLock::new();
+
+fn relays() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Relay>>> {
+    RELAYS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub fn register_relay(peer_overlay: &str, relay: std::sync::Arc<Relay>) {
+    relays().lock().unwrap_or_else(|e| e.into_inner()).insert(peer_overlay.to_string(), relay);
+}
+
+pub fn relay_for(peer_overlay: &str) -> Option<std::sync::Arc<Relay>> {
+    relays().lock().unwrap_or_else(|e| e.into_inner()).get(peer_overlay).cloned()
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    /// The whole demux rests on these ranges never overlapping.
+    #[test]
+    fn wireguard_frames_and_ip_packets_are_distinguishable() {
+        for t in 1u8..=4 {
+            assert!(is_wg_frame(&[t, 0, 0, 0]), "message type {t} is WireGuard");
+        }
+        assert!(!is_wg_frame(&[0x45, 0, 0, 0]), "IPv4 header");
+        assert!(!is_wg_frame(&[0x60, 0, 0, 0]), "IPv6 header");
+        assert!(!is_wg_frame(&[]), "an empty datagram is not a WireGuard frame");
     }
 }
