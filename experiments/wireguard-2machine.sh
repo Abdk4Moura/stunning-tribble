@@ -183,6 +183,15 @@ if ip netns exec srr wg show filament-wg >/dev/null 2>&1; then
   echo "  peers: $P"
   ip netns exec srr wg show filament-wg 2>/dev/null | grep -E "endpoint|allowed ips|handshake|transfer" | sed 's/^/    /'
   [ "${P:-0}" -ge 1 ] && ok "a peer is configured" || bad "no peer on the interface"
+  # WHICH PATH won matters as much as whether one did: a 127.0.0.1 endpoint means
+  # frames are taking a userspace hop through filament, which is the thing kernel
+  # WireGuard is meant to avoid.
+  EP=$(ip netns exec srr wg show filament-wg endpoints 2>/dev/null | awk '{print $2}' | head -1)
+  case "$EP" in
+    127.0.0.1:*) echo "  path: RELAY (via filament transport, one userspace hop)" ;;
+    "")          echo "  path: unknown (no endpoint)" ;;
+    *)           echo "  path: DIRECT kernel-to-kernel ($EP)" ;;
+  esac
   # The difference between configured and WORKING.
   # Require a line AND a non-zero timestamp: with no peers this command prints
   # nothing, awk sees no input and exits 0, so the old check PASSED on an empty

@@ -20448,7 +20448,6 @@ async fn recv_cmd(
                                         // loopback stand-in and filament carries
                                         // the frames, so NAT never sees a
                                         // WireGuard packet.
-                                        let _ = (sa, peer_port);
                                         let tr = match conn.transport_of(&pid) {
                                             Some(t) => t,
                                             None => {
@@ -20462,6 +20461,8 @@ async fn recv_cmd(
                                             &ours,
                                             1380,
                                             tr,
+                                            sa.ip(),
+                                            peer_port,
                                         )
                                         .await
                                         {

@@ -194,6 +194,60 @@ WireGuard is still the admin-mode default for non-browser users.
 4. Make WireGuard the default; demote the QUIC-datagram plane to the
    browser/no-WG/migration bridge.
 
+## 2026-09-07, correction: kernel-direct works, and my rig said otherwise
+
+Plain kernel WireGuard between do-vm and the KVM VPS, no filament involved:
+
+    endpoint: 162.35.114.254:51999
+    latest handshake: 11 seconds ago
+    3 packets transmitted, 3 received, rtt avg 76.345 ms
+
+So the earlier conclusion that kernel-to-kernel could not handshake was WRONG,
+and it was wrong because of the test rig, not the code. Each daemon runs in a
+network namespace (l3::ifname() is a const, so two daemons on one host cannot
+both hold filament0), and those namespaces reach the internet through a
+MASQUERADE I wrote. That self-inflicted NAT is what had no inbound mapping for
+WireGuard's port. Both machines have PUBLIC IPs; in the real topology the NAT
+does not exist. An artificial constraint in the harness was read as a property of
+the system.
+
+### What this changes
+
+**Kernel-direct is the default, not a rung.** For any peer whose WireGuard port
+is reachable (a public IP, a port-forward), there is no userspace in the data
+path at all, which is the entire reason to use kernel WireGuard. That covers
+servers, which is where throughput matters most.
+
+**Reachability, not privilege, is the only thing that can force a fallback.**
+Privilege decides whether kernel WireGuard is available; NAT decides whether its
+socket can be reached. They are independent, and the second is the harder one:
+filament punches holes with its OWN socket, and kernel WireGuard cannot share it.
+
+### On the fallback, and what Tailscale actually does
+
+Tailscale does not use kernel WireGuard for this. It ships **wireguard-go**, a
+USERSPACE implementation, precisely so it owns the UDP socket and can do its own
+endpoint discovery and DERP relaying. Owning the socket is what makes NAT
+traversal possible at all, and they pay userspace crypto to get it.
+
+That is the lesson, and it says the loopback relay currently in the tree is the
+wrong fallback. It costs kernel WireGuard -> userspace relay -> transport, two
+extra context switches per packet, to get what an in-process userspace WireGuard
+gets in one: encrypt in process, hand straight to the transport.
+
+So the shape should be:
+
+1. **Kernel WireGuard, direct** when the peer's endpoint is reachable. Default.
+   No userspace in the path. Proven above.
+2. **boringtun** (an audited Rust WireGuard) over filament's transport when it is
+   not. This is Tailscale's model and strictly cheaper than the loopback relay.
+3. **Delete the loopback relay** once 2 exists; it is dominated by it.
+
+And explicitly NOT: reimplementing the WireGuard protocol over QUIC. The protocol
+is the valuable part and it is already implemented well; a rewrite would inherit
+the risk of hand-rolled crypto for none of the benefit. Using boringtun is the
+same idea done with a library.
+
 ## Status 2026-09-07: WORKING. Kernel WireGuard over filament's transport.
 
 A kernel WireGuard tunnel between two machines, keyed over filament's own

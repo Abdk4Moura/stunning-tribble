@@ -186,13 +186,109 @@ pub async fn adopt_peer(
     our_overlay: &str,
     mtu: u32,
     transport: std::sync::Arc<dyn crate::net::Transport>,
+    peer_underlay: std::net::IpAddr,
+    peer_wg_port: u16,
 ) -> Result<()> {
     let (_priv, _pub) = iface_identity()?;
     let wg_port = existing_listen_port().ok_or_else(|| anyhow!("no local WireGuard listen port"))?;
+    let allowed = format!("{peer_overlay}/128");
 
-    // The peer's stand-in, on loopback. WireGuard talks only to this; filament
-    // carries the frames over the path it has already punched, so NAT never sees
-    // a WireGuard packet and WireGuard never has to traverse one.
+    // DIRECT FIRST: kernel to kernel, no userspace in the data path at all.
+    //
+    // This is the point of using kernel WireGuard. Routing frames through
+    // filament's transport keeps the crypto in the kernel but puts a userspace
+    // hop back in the path, which inherits the very thing WireGuard is here to
+    // escape. So the peer's real endpoint is tried first, and the relay exists
+    // only for the case where it cannot work.
+    //
+    // The address is the one the QUIC connection is actually pinned to, so it is
+    // the peer's post-hole-punch external address rather than anything it
+    // claimed about itself.
+    configure_peer(
+        WG_DEV,
+        peer_pub,
+        &allowed,
+        &format!("{}:{peer_wg_port}", wrap_v6(peer_underlay)),
+        &format!("{our_overlay}/128"),
+        mtu,
+    )?;
+    let _ = ip(&["route", "replace", &allowed, "dev", WG_DEV]);
+    crate::ui::debug(&format!(
+        "  wg: trying direct kernel path to {peer_underlay}:{peer_wg_port}"
+    ));
+
+    // Give the direct path a chance, then check whether it actually carried a
+    // handshake. "Configured" is not "working": the endpoint may be a NAT with
+    // no inbound mapping for WireGuard's port, which is silent.
+    let peer_pub_owned = peer_pub.to_string();
+    let peer_overlay_owned = peer_overlay.to_string();
+    let our_overlay_owned = our_overlay.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        if handshook(&peer_pub_owned) {
+            crate::ui::say(&format!(
+                "  {} WireGuard direct to {peer_overlay_owned} (kernel to kernel)",
+                crate::ui::paint(crate::ui::Tone::Ok, crate::ui::glyph_ok())
+            ));
+            return;
+        }
+        crate::ui::debug(
+            "  wg: no direct handshake; falling back to the relay over filament's transport",
+        );
+        if let Err(e) = use_relay(
+            &peer_pub_owned,
+            &peer_overlay_owned,
+            &our_overlay_owned,
+            mtu,
+            wg_port,
+            transport,
+        )
+        .await
+        {
+            crate::ui::debug(&format!("  wg: relay fallback failed ({e})"));
+        }
+    });
+    Ok(())
+}
+
+/// Bracket an IPv6 literal so `ADDR:PORT` parses.
+fn wrap_v6(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v) => v.to_string(),
+        std::net::IpAddr::V6(v) => format!("[{v}]"),
+    }
+}
+
+/// Has this peer completed a handshake?
+///
+/// The only honest test of a WireGuard path. An endpoint can be configured, look
+/// perfectly correct, and carry nothing, which is exactly what a NAT with no
+/// inbound mapping produces.
+fn handshook(peer_pub: &str) -> bool {
+    let Ok(out) = Command::new("wg").args(["show", WG_DEV, "latest-handshakes"]).output() else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout).lines().any(|l| {
+        let mut f = l.split_whitespace();
+        f.next() == Some(peer_pub) && f.next().and_then(|t| t.parse::<u64>().ok()).unwrap_or(0) > 0
+    })
+}
+
+/// FALLBACK: point WireGuard at a loopback stand-in and carry its frames over
+/// filament's transport.
+///
+/// Used only when the direct kernel path did not handshake, which means the
+/// peer's WireGuard port is not reachable (typically a NAT with no inbound
+/// mapping for it). This costs one userspace hop, the same one the QUIC plane
+/// already pays, and keeps the tunnel working where kernel-to-kernel cannot.
+async fn use_relay(
+    peer_pub: &str,
+    peer_overlay: &str,
+    our_overlay: &str,
+    mtu: u32,
+    wg_port: u16,
+    transport: std::sync::Arc<dyn crate::net::Transport>,
+) -> Result<()> {
     let relay = std::sync::Arc::new(Relay::bind(wg_port).await?);
     let relay_port = relay.local_port()?;
     let allowed = format!("{peer_overlay}/128");
@@ -204,29 +300,24 @@ pub async fn adopt_peer(
         &format!("{our_overlay}/128"),
         mtu,
     )?;
-    // Host-scoped, so a WireGuard peer never captures traffic for a peer that is
-    // not on the tunnel.
     let _ = ip(&["route", "replace", &allowed, "dev", WG_DEV]);
     register_relay(peer_overlay, relay.clone());
 
-    // OUTBOUND pump: whatever the kernel hands the stand-in goes to the peer.
-    // Inbound is handled by the L3 datagram pump, which already reads every
-    // datagram from this peer and now splits WireGuard frames off by first byte.
     let sock = relay.socket();
-    let peer_label = peer_overlay.to_string();
+    let label = peer_overlay.to_string();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
             let Ok((n, _from)) = sock.recv_from(&mut buf).await else { break };
             if transport.send_datagram(&buf[..n]).is_err() {
-                break; // link gone; the reconcile will rebuild on the next one
+                break;
             }
         }
-        crate::ui::debug(&format!("  wg: relay pump for {peer_label} ended"));
+        crate::ui::debug(&format!("  wg: relay pump for {label} ended"));
     });
-
-    crate::ui::debug(&format!(
-        "  wg: peer {peer_overlay} routed through the local relay on 127.0.0.1:{relay_port}"
+    crate::ui::say(&format!(
+        "  {} WireGuard to {peer_overlay} via filament's transport (direct path unavailable)",
+        crate::ui::paint(crate::ui::Tone::Ok, crate::ui::glyph_ok())
     ));
     Ok(())
 }
