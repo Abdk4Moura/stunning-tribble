@@ -101,7 +101,11 @@ pub fn create_iface(dev: &str, privkey: &str) -> Result<u16> {
     // `wg set <dev> private-key <path>`: feed the key on stdin via /dev/stdin so it
     // never lands on disk.
     let mut child = Command::new("wg")
-        .args(["set", dev, "private-key", "/dev/stdin", "listen-port", "0"])
+        // WireGuard's registered port, not an ephemeral one. A port that
+        // changes every start cannot be port-forwarded, and a forwardable port
+        // is the difference between a peer being directly reachable and having
+        // to fall back. Falls back to ephemeral if it is already taken.
+        .args(["set", dev, "private-key", "/dev/stdin", "listen-port", "51820"])
         .stdin(Stdio::piped())
         .spawn()
         .context("spawn `wg set private-key`")?;
@@ -119,6 +123,20 @@ pub fn create_iface(dev: &str, privkey: &str) -> Result<u16> {
     // port the kernel actually assigned (down interfaces always report 0).
     ip(&["link", "set", "dev", dev, "up"]).with_context(|| format!("bring {dev} up"))?;
 
+    // If 51820 was taken the set above failed; retry on an ephemeral port so a
+    // second filament on the same host still works, just unforwardably.
+    if Command::new("wg").args(["show", dev, "listen-port"]).output().map(|o| !o.status.success()).unwrap_or(true) {
+        let mut child = Command::new("wg")
+            .args(["set", dev, "private-key", "/dev/stdin", "listen-port", "0"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .context("spawn wg set (ephemeral port)")?;
+        if let Some(mut si) = child.stdin.take() {
+            use std::io::Write as _;
+            let _ = si.write_all(privkey.as_bytes());
+        }
+        let _ = child.wait();
+    }
     let out = Command::new("wg").args(["show", dev, "listen-port"]).output().context("wg show listen-port")?;
     if !out.status.success() {
         bail!("wg show listen-port failed: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -238,8 +256,13 @@ pub async fn adopt_peer(
             // So an unreachable WireGuard endpoint simply means this peer stays
             // on the plane it was already on.
             let _ = remove_peer(&peer_pub_owned);
+            // Release the claim so a later tick RETRIES. A peer can become
+            // reachable after the fact (a port-forward appears, a NAT mapping
+            // opens), and without this the first failure was permanent for the
+            // life of the process.
+            release_attempt(&peer_overlay_owned);
             crate::ui::debug(&format!(
-                "  wg: {peer_overlay_owned} is not reachable for a direct tunnel; staying on the QUIC plane"
+                "  wg: {peer_overlay_owned} is not reachable for a direct tunnel; staying on the QUIC plane, will retry"
             ));
         }
     });
