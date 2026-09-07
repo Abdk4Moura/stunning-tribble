@@ -194,6 +194,44 @@ WireGuard is still the admin-mode default for non-browser users.
 4. Make WireGuard the default; demote the QUIC-datagram plane to the
    browser/no-WG/migration bridge.
 
+## 2026-09-07: the relay is deleted, and boringtun is NOT the answer here
+
+The loopback relay is gone. It was dominated, as recorded below. But the
+replacement it was supposed to make way for, boringtun over filament's transport,
+should NOT be built, and the reason is specific to filament rather than a
+judgement about boringtun.
+
+**filament's transport is already an authenticated encrypted channel.** A direct
+link is QUIC with rustls/TLS 1.3; a relayed link is a WebRTC DataChannel over
+DTLS. Running WireGuard inside either encrypts the same bytes twice and
+authenticates a peer that the transport has already authenticated. It costs CPU
+and buys nothing.
+
+**That is exactly where filament differs from Tailscale.** Tailscale needs
+wireguard-go because DERP is a dumb packet forwarder with no per-peer crypto of
+its own: WireGuard IS its security layer, so it must run somewhere, and userspace
+is the only place they can own the socket. filament's relay is not DERP. It is a
+mutually authenticated tunnel in its own right, so the security layer already
+exists and the QUIC-datagram plane already carries a NATed peer over the same
+punched path.
+
+So the honest shape is two planes, not three:
+
+1. **Kernel WireGuard, direct**, when the peer's endpoint is reachable. Kernel
+   crypto, kernel data path, no userspace at all. This is the whole reason to use
+   kernel WireGuard, and it is the case that is worth having.
+2. **The existing QUIC-datagram plane** for everyone else. Already written,
+   already measured, already encrypted and authenticated.
+
+A peer whose direct WireGuard path does not handshake within 8s has its peer
+entry REMOVED rather than re-pointed at a tunnel-inside-a-tunnel, so it stays on
+the plane it was already using and no route is left pointing into something that
+carries nothing.
+
+What would change this: if filament ever gains a transport that forwards
+ciphertext without authenticating peers (a true DERP equivalent), WireGuard would
+become the security layer for that path and boringtun would earn its place.
+
 ## 2026-09-07, correction: kernel-direct works, and my rig said otherwise
 
 Plain kernel WireGuard between do-vm and the KVM VPS, no filament involved:

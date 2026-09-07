@@ -479,27 +479,11 @@ impl L3 {
         // the pump just forwards each packet to the TUN, which demuxes by dest).
         let tun = self.tun.clone();
         let t_reader = t.clone();
-        // The peer's overlay address keys its WireGuard relay, if it has one.
-        let peer_key = peer_ip.to_string();
         let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     r = t_reader.recv_datagram() => match r {
-                        Ok(pkt) => {
-                            // Split WireGuard frames off before the TUN sees
-                            // them. Both share this datagram channel untagged
-                            // because a WireGuard message type (1..=4) cannot
-                            // collide with an IP version nibble (0x4_/0x6_), so
-                            // the frame identifies itself. A WireGuard frame
-                            // handed to the TUN would be a malformed IP packet.
-                            if crate::wg::is_wg_frame(&pkt) {
-                                if let Some(relay) = crate::wg::relay_for(&peer_key) {
-                                    let _ = relay.deliver_to_wg(&pkt).await;
-                                }
-                            } else {
-                                let _ = tun.send(&pkt).await;
-                            }
-                        }
+                        Ok(pkt) => { let _ = tun.send(&pkt).await; }
                         Err(_) => break, // link closed
                     },
                     // Wake periodically so a zombie link (alive at QUIC but dead

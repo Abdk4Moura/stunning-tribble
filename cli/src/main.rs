@@ -20448,19 +20448,11 @@ async fn recv_cmd(
                                         // loopback stand-in and filament carries
                                         // the frames, so NAT never sees a
                                         // WireGuard packet.
-                                        let tr = match conn.transport_of(&pid) {
-                                            Some(t) => t,
-                                            None => {
-                                                ui::debug("  wg: no transport for this peer");
-                                                continue;
-                                            }
-                                        };
                                         if let Err(e) = crate::wg::adopt_peer(
                                             &peer_pub,
                                             &po.to_string(),
                                             &ours,
                                             1380,
-                                            tr,
                                             sa.ip(),
                                             peer_port,
                                         )
