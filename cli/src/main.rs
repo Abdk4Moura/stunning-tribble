@@ -18551,41 +18551,34 @@ async fn recv_cmd(
                 if crate::wg::usable() {
                     let ours = l3.my_addr().map(|a| a.to_string()).unwrap_or_default();
                     for (who, addr, t) in l3.peers_with_transport().await {
-                        // Direct links only: the key exchange rides the QUIC
-                        // connection filament already authenticated, and a relay
-                        // link has none to ride.
-                        let (Some(qc), Some(sa)) = (t.quic_connection(), t.remote_addr()) else {
+                        // Direct links only: WireGuard needs a real UDP endpoint
+                        // to send to, and a relay link has none to name.
+                        let Some(sa) = t.remote_addr() else { continue };
+                        if t.quic_connection().is_none() {
                             continue;
-                        };
-                        if !crate::wg::claim_attempt(&addr.to_string()) {
-                            continue; // already established or in flight
                         }
-                        // Derived from the two overlay addresses so the two ends
-                        // are guaranteed to disagree; the transport's answerer
-                        // flag is not, and when both chose "accept" the exchange
-                        // hung forever with no log either way.
-                        let initiator = crate::wg::is_initiator(&ours, &addr.to_string());
-                        let (ours, peer_s) = (ours.clone(), addr.to_string());
-                        tokio::spawn(async move {
-                            match crate::wg::establish(
-                                &qc, initiator, &ours, &peer_s, sa.ip(), 1380,
-                            )
-                            .await
-                            {
-                                Ok(()) => ui::say(&format!(
-                                    "  {} WireGuard tunnel to {who}",
-                                    ui::paint(ui::Tone::Ok, ui::glyph_ok())
-                                )),
-                                Err(e) => {
-                                    // Release the claim so the next tick retries:
-                                    // the peer may simply not have ticked yet.
-                                    crate::wg::release_attempt(&peer_s);
-                                    ui::debug(&format!(
-                                        "  WireGuard to {who} not established ({e}); staying on the QUIC plane"
-                                    ));
-                                }
+                        if !crate::wg::claim_attempt(&addr.to_string()) {
+                            continue; // already announced to this peer
+                        }
+                        let (pubkey, port) = match crate::wg::local_offer() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                crate::wg::release_attempt(&addr.to_string());
+                                ui::debug(&format!("  wg: cannot bring up the interface ({e})"));
+                                continue;
                             }
-                        });
+                        };
+                        let _ = sa;
+                        // Straight down the peer's own transport: the control
+                        // channel every other filament message uses.
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "wg-key",
+                                "pubkey": pubkey,
+                                "port": port,
+                            }))
+                            .await;
+                        ui::debug(&format!("  wg: announced our key to {who}"));
                     }
                 }
             }
@@ -20420,6 +20413,74 @@ async fn recv_cmd(
                             })
                             .unwrap_or_default();
                         let _ = tx.send(ports);
+                    }
+                }
+                // WireGuard key announcement. Symmetric: whoever hears one
+                // configures that peer and answers with its own if it has not
+                // already, so two messages converge and neither end waits for
+                // the other to move first. This rides the control channel
+                // because an out-of-band QUIC stream races with filament's own
+                // stream acceptor: the first version opened one and both ends
+                // hung after creating their interface.
+                Some("wg-key") => {
+                    let enabled = crate::settings::get_str("wireguard", None)
+                        .map(|x| x == "on" || x == "true")
+                        .unwrap_or(false);
+                    if enabled && crate::wg::usable() {
+                        let peer_pub = v["pubkey"].as_str().unwrap_or_default().to_string();
+                        let peer_port = v["port"].as_u64().unwrap_or(0) as u16;
+                        let underlay = conn.transport_of(&pid).and_then(|t| t.remote_addr());
+                        let peer_overlay = l3
+                            .as_ref()
+                            .map(|l| l.peer_overlay_of(&pid))
+                            .unwrap_or(None);
+                        let ours = l3
+                            .as_ref()
+                            .and_then(|l| l.my_addr())
+                            .map(|a| a.to_string())
+                            .unwrap_or_default();
+                        match (underlay, peer_overlay) {
+                            (Some(sa), Some(po)) if !peer_pub.is_empty() && peer_port != 0 => {
+                                match crate::wg::local_offer() {
+                                    Ok((our_pub, our_port)) => {
+                                        if let Err(e) = crate::wg::adopt_peer(
+                                            &peer_pub,
+                                            &po.to_string(),
+                                            sa.ip(),
+                                            peer_port,
+                                            &ours,
+                                            1380,
+                                        ) {
+                                            ui::debug(&format!("  wg: could not adopt peer ({e})"));
+                                        } else {
+                                            ui::say(&format!(
+                                                "  {} WireGuard tunnel to {}",
+                                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                                conn.link(&pid).map(|l| l.shown()).unwrap_or_default()
+                                            ));
+                                        }
+                                        // Answer once, so the other end can
+                                        // adopt us too. claim_attempt makes this
+                                        // idempotent across repeats.
+                                        if crate::wg::claim_attempt(&po.to_string()) {
+                                            if let Some(t) = conn.transport_of(&pid) {
+                                                let _ = t
+                                                    .send_control(&json!({
+                                                        "type": "wg-key",
+                                                        "pubkey": our_pub,
+                                                        "port": our_port,
+                                                    }))
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        ui::debug(&format!("  wg: no local interface ({e})"))
+                                    }
+                                }
+                            }
+                            _ => ui::debug("  wg: key announcement ignored (no direct endpoint or overlay address yet)"),
+                        }
                     }
                 }
                 // Certificate renewal. Expiry is the only bound this system has,

@@ -194,6 +194,59 @@ WireGuard is still the admin-mode default for non-browser users.
 4. Make WireGuard the default; demote the QUIC-datagram plane to the
    browser/no-WG/migration bridge.
 
+## Status 2026-09-07: keys exchange and peers configure; the handshake is blocked by NAT
+
+The module had `mod wg;` and ZERO callers. It is now wired, reconciling, and both
+ends configure each other. What it does NOT yet do is complete a handshake, and
+the reason is architectural rather than a bug.
+
+### What works
+
+`filament set wireguard on` (off by default: this changes the DATA PLANE).
+Reconciliation runs on a 10s TICK, not an event, because a link that starts
+relayed upgrades to direct AFTER the announce and an event hook missed it.
+
+The key exchange rides the CONTROL CHANNEL, the same path certificate renewal
+uses. The first version opened a raw QUIC bi-stream and both ends hung forever
+after creating their interface: filament multiplexes its own protocol over that
+connection and runs its own stream acceptor, so an out-of-band stream races with
+it. The exchange is now symmetric with no initiator: each side announces its key,
+each configures the other on receipt, and two messages converge.
+
+Measured between two machines over the real internet: both logged
+`WireGuard tunnel to <peer>`, `wg show` reported **1 peer** with the right
+endpoint and allowed-ips, and 148 B was sent.
+
+### What does not, and why it is not a bug to fix in wg.rs
+
+**0 B received, no handshake.** The endpoint each side announces is its own
+WireGuard listen port, and both daemons sit behind NAT. The announced port is the
+INTERNAL one; the NAT has no inbound mapping for it, so handshake packets are
+dropped. WireGuard opened its own UDP socket instead of using the path filament
+had already punched.
+
+That is exactly what decision point 2 of this ADR says must not happen:
+"WireGuard rides on top of whichever underlay path won... The direct-TCP arm
+stops being a competing L3 plane and becomes a path option *under* WireGuard."
+A WireGuard peer with its own socket is a SECOND connectivity story, and it
+inherits none of filament's NAT traversal.
+
+### The next step, concretely
+
+Two options, and they are not equivalent:
+
+1. **Userspace WireGuard over filament's transport** (boringtun-style): WG frames
+   ride filament's existing punched path as datagrams. Keeps every property
+   filament already has, is the ADR's stated design, and is the larger job.
+2. **Kernel WireGuard with a punched endpoint**: teach the exchange to announce
+   the EXTERNAL mapped address, which means either reusing filament's ICE result
+   for the WG socket or port-forwarding. Cheaper, but it re-implements NAT
+   traversal that filament already owns, which is what the ADR warns against.
+
+Option 1 is the right one. `experiments/wireguard-2machine.sh` reproduces the
+current state end to end and fails on the handshake assertion, which is the
+correct place for it to fail.
+
 ## Status 2026-09-06: wired and reconciling; the key exchange does not yet complete
 
 See the commit history for detail. The module is wired (warnings 115 -> 95),

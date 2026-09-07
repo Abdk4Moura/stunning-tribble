@@ -27,6 +27,14 @@ use std::process::{Command, Stdio};
 /// Deliberately quiet and cheap: it creates and immediately removes a probe
 /// interface, which is the only way to learn whether the module and the
 /// capability are both present without waiting for a real failure mid-session.
+/// The interface filament manages. One device carries every peer, as WireGuard
+/// intends: peers are distinguished by public key and allowed-ips, not by device.
+pub const WG_DEV: &str = "filament-wg";
+
+/// Linux refuses an interface name longer than this, and does it with a message
+/// that names neither the length nor the field.
+const MAX_IFNAME: usize = 15;
+
 pub fn usable() -> bool {
     debug_assert!(WG_DEV.len() <= MAX_IFNAME, "wg device name too long for Linux");
     if Command::new("wg").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
@@ -138,7 +146,14 @@ pub fn configure_peer(
     if !out.status.success() {
         bail!("wg set peer: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
-    ip(&["addr", "add", addr_cidr, "dev", dev]).context("ip addr add on wg dev")?;
+    // Idempotent: the address belongs to the INTERFACE, not to a peer, so the
+    // second peer would otherwise fail here with "File exists" and take the
+    // whole establish down with it.
+    if let Err(e) = ip(&["addr", "add", addr_cidr, "dev", dev]) {
+        if !e.to_string().contains("File exists") {
+            return Err(e).context("ip addr add on wg dev");
+        }
+    }
     ip(&["link", "set", "dev", dev, "mtu", &mtu.to_string()]).context("ip link set mtu")?;
     ip(&["link", "set", "dev", dev, "up"]).context("ip link set up")?;
     Ok(())
@@ -147,25 +162,6 @@ pub fn configure_peer(
 /// Remove the WG interface (best-effort; used on teardown).
 pub fn teardown(dev: &str) {
     let _ = ip(&["link", "del", dev]);
-}
-
-/// The network CIDR that `addr_cidr` (IP/PREFIX) sits in, used as the peer's
-/// allowed-ips for a point-to-point overlay (route the whole overlay to the peer).
-pub fn network_cidr(addr_cidr: &str) -> Result<String> {
-    let (ip_s, pfx_s) = addr_cidr.split_once('/').ok_or_else(|| anyhow!("tun-addr must be IP/PREFIX"))?;
-    let pfx: u8 = pfx_s.parse().context("bad prefix in tun-addr")?;
-    match ip_s.parse::<IpAddr>().context("bad ip in tun-addr")? {
-        IpAddr::V4(v4) => {
-            if pfx > 32 { bail!("v4 prefix > 32"); }
-            let mask = if pfx == 0 { 0 } else { u32::MAX << (32 - pfx as u32) };
-            Ok(format!("{}/{}", std::net::Ipv4Addr::from(u32::from(v4) & mask), pfx))
-        }
-        IpAddr::V6(v6) => {
-            if pfx > 128 { bail!("v6 prefix > 128"); }
-            let mask = if pfx == 0 { 0 } else { u128::MAX << (128 - pfx as u32) };
-            Ok(format!("{}/{}", std::net::Ipv6Addr::from(u128::from(v6) & mask), pfx))
-        }
-    }
 }
 
 /// Format a WireGuard endpoint (bracket IPv6).
@@ -179,107 +175,60 @@ pub fn endpoint(ip: IpAddr, port: u16) -> String {
 /// Swap {public key, WG listen-port} with the peer over the authenticated
 /// connection. The initiator opens the bi stream; the responder accepts it. Both
 /// sides write their line, finish, and read the peer's, so it is symmetric.
-/// A key exchange must not wait forever.
-///
-/// `exchange` rendezvouses on a QUIC bi-stream: one side opens, the other
-/// accepts. If both ends ever decide to accept, both block indefinitely, the
-/// interface exists with no peer, and nothing is logged because neither side
-/// reached success or failure. That is precisely what happened before the role
-/// was made deterministic, and a bound turns it into a retryable error instead
-/// of a silent hang.
-const EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-pub async fn exchange(
-    conn: &quinn::Connection,
-    our_pub: &str,
-    our_port: u16,
-    initiator: bool,
-) -> Result<(String, u16)> {
-    let (mut send, mut recv) = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
-        if initiator {
-            conn.open_bi().await.context("open wg key-exchange stream")
-        } else {
-            conn.accept_bi().await.context("accept wg key-exchange stream")
-        }
-    })
-    .await
-    .map_err(|_| anyhow!("wg key exchange timed out after {EXCHANGE_TIMEOUT:?}"))??;
-    send.write_all(format!("{our_pub} {our_port}\n").as_bytes()).await.context("send wg key-exchange")?;
-    send.finish().context("finish wg key-exchange")?;
-
-    let buf = recv.read_to_end(1024).await.context("read peer wg key-exchange")?;
-    let line = String::from_utf8(buf).context("wg key-exchange not utf8")?;
-    let line = line.trim();
-    let (pk, pt) = line.split_once(' ').ok_or_else(|| anyhow!("malformed wg key-exchange: {line:?}"))?;
-    let port: u16 = pt.trim().parse().context("parse peer wg listen-port")?;
-    if pk.is_empty() {
-        bail!("empty peer wg public key");
-    }
-    Ok((pk.to_string(), port))
-}
-
-/// The interface filament manages. One device carries every peer, as WireGuard
-/// intends: peers are distinguished by public key and allowed-ips, not by device.
-pub const WG_DEV: &str = "filament-wg";
-
-/// Linux refuses an interface name longer than this, and does it with a message
-/// that names neither the length nor the field.
-const MAX_IFNAME: usize = 15;
-
-/// Bring up a WireGuard tunnel to one direct peer, over the connection filament
-/// has already authenticated.
-///
-/// WHY THIS IS SAFE TO ATTEMPT AND SAFE TO FAIL. The key exchange rides the
-/// EXISTING QUIC connection (`exchange`), so it inherits filament's identity and
-/// adds no new trust story. Every failure path returns `Err` and the caller
-/// keeps using the QUIC datagram plane, so a machine without the module, the
-/// tools or the capability simply does not get WireGuard: it never gets a
-/// half-configured interface instead of a working one.
-///
-/// `our_overlay` and `peer_overlay` are the overlay addresses already assigned
-/// by the mesh, so WireGuard carries exactly the same addressing and nothing
-/// downstream (MagicDNS, routes, the capability gate) has to know which plane a
-/// packet took.
-/// Which end opens the key-exchange stream.
-///
-/// Derived from the two overlay addresses, which both ends know and agree on, so
-/// the answers are GUARANTEED opposite. The previous version used the
-/// transport's answerer flag, which is not guaranteed to differ between the two
-/// ends: when both computed "accept", each waited for the other to open and the
-/// tunnel silently never formed.
-pub fn is_initiator(ours: &str, theirs: &str) -> bool {
-    ours < theirs
-}
-
-pub async fn establish(
-    conn: &quinn::Connection,
-    initiator: bool,
-    our_overlay: &str,
-    peer_overlay: &str,
-    peer_underlay: std::net::IpAddr,
-    mtu: u32,
-) -> Result<()> {
-    let (privkey, pubkey) = gen_keypair()?;
-    // Create ours FIRST so we have a listen port to advertise. Idempotent: a
-    // second peer reuses the interface rather than replacing it.
+pub fn local_offer() -> Result<(String, u16)> {
+    let (privkey, pubkey) = iface_identity()?;
     let port = match existing_listen_port() {
         Some(p) => p,
-        None => create_iface(WG_DEV, &privkey)?,
+        None => {
+            let p = create_iface(WG_DEV, &privkey)?;
+            crate::ui::debug(&format!("  wg: created {WG_DEV} on port {p}"));
+            p
+        }
     };
-    let (peer_pub, peer_port) = exchange(conn, &pubkey, port, initiator).await?;
+    Ok((pubkey, port))
+}
+
+/// Configure the peer that just announced itself, and route its overlay address
+/// down the tunnel.
+pub fn adopt_peer(
+    peer_pub: &str,
+    peer_overlay: &str,
+    peer_underlay: std::net::IpAddr,
+    peer_port: u16,
+    our_overlay: &str,
+    mtu: u32,
+) -> Result<()> {
     let allowed = format!("{peer_overlay}/128");
     configure_peer(
         WG_DEV,
-        &peer_pub,
+        peer_pub,
         &allowed,
         &endpoint(peer_underlay, peer_port),
         &format!("{our_overlay}/128"),
         mtu,
     )?;
-    // Route THIS peer's overlay address down the tunnel. Host-scoped, so a
-    // WireGuard peer never captures traffic for a peer that is not on it.
+    // Host-scoped, so a WireGuard peer never captures traffic for a peer that is
+    // not on the tunnel.
     let _ = ip(&["route", "replace", &allowed, "dev", WG_DEV]);
+    crate::ui::debug(&format!("  wg: peer {peer_overlay} configured via {peer_underlay}:{peer_port}"));
     Ok(())
+}
+
+/// This interface's keypair, generated once per process.
+///
+/// Cached because the interface has exactly one identity: see `establish` for
+/// what regenerating it per peer breaks.
+static WG_IDENTITY: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+fn iface_identity() -> Result<(String, String)> {
+    if let Some(kp) = WG_IDENTITY.get() {
+        return Ok(kp.clone());
+    }
+    let kp = gen_keypair()?;
+    // A race here would mean two callers generated keys; the first one stored
+    // wins and both return it, so the interface and what we advertise agree.
+    let _ = WG_IDENTITY.set(kp);
+    Ok(WG_IDENTITY.get().cloned().expect("just set"))
 }
 
 /// The listen port of an interface we already created, if any.
@@ -320,16 +269,6 @@ pub fn release_attempt(peer: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Both ends must not choose the same role, or they deadlock waiting for
-    /// each other and the tunnel forms without a peer.
-    #[test]
-    fn exactly_one_end_initiates() {
-        let a = "fdf1::a";
-        let b = "fdf1::b";
-        assert!(is_initiator(a, b) != is_initiator(b, a), "roles must be opposite");
-        assert!(is_initiator(a, b), "the lower address opens the stream");
-    }
 
     /// The probe name being one character over the Linux limit made usable()
     /// return false on every machine, which disabled WireGuard silently: no

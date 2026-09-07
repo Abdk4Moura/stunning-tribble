@@ -624,6 +624,14 @@ impl L3 {
         out
     }
 
+    /// The overlay address a given link's peer holds, if it is on the plane.
+    pub fn peer_overlay_of(&self, pid: &str) -> Option<IpAddr> {
+        // Blocking lock: called from the control-message path, which is already
+        // inside the daemon's single event loop.
+        let by_pid = self.by_pid.try_lock().ok()?;
+        by_pid.get(pid)?.iter().find(|i| i.is_ipv6()).copied()
+    }
+
     /// Re-evaluate the routes this node has installed.
     ///
     /// Called on a timer as well as on an inbound announce, because the event
